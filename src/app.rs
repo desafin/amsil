@@ -12,6 +12,7 @@ use crate::lang::{self, Lang, t};
 use crate::preset::{self, Preset};
 use crate::preview::Pixels;
 use crate::project::{Config, Edit, Folder, LutRef, Project};
+use crate::recommend::{self, Guess};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -26,6 +27,8 @@ pub struct App {
     pub backend: Backend,
     /// 고를 수 있는 프리셋: 기본 프리셋 뒤에 사용자가 만든 것.
     pub presets: Vec<Preset>,
+    /// 프리셋 추천(사진 분류)을 쓸 수 없는 이유. 쓸 수 있으면 None.
+    pub recommend_problem: Option<String>,
 }
 
 /// AI 모델(노이즈 제거)의 실행 환경.
@@ -65,6 +68,8 @@ pub struct Photo {
     /// 폴더 기준 상대 경로.
     pub relative: String,
     pub thumbnail: Option<Pixels>,
+    /// 사진이 무엇을 찍은 것인지에 대한 짐작. 아직 분류하지 않았으면 None.
+    pub guess: Option<Guess>,
 }
 
 pub struct Preview {
@@ -125,6 +130,8 @@ pub enum Action {
     ApplyDenoise,
     /// 선택한 사진들의 프리셋을 정한다 (None이면 없앤다).
     SetPreset(Option<String>),
+    /// 선택한 사진마다 그 내용에 맞는 프리셋을 적용한다. 맞는 것이 없으면 프리셋을 없앤다.
+    ApplyRecommended,
     /// 프리셋의 강도. 슬라이더를 끄는 동안에는 `commit`이 거짓이고, 놓을 때 참으로 한 번 온다 (그때 저장한다).
     SetStrength {
         value: f32,
@@ -166,6 +173,8 @@ pub enum Action {
     Thumbnail {
         index: usize,
         pixels: Option<Pixels>,
+        /// 사진의 종류에 대한 짐작 (분류 모델이 있을 때).
+        guess: Option<Guess>,
     },
     PreviewReady {
         generation: u64,
@@ -175,6 +184,8 @@ pub enum Action {
     ExportProgress(Report),
     ExportFinished(std::result::Result<(Outcome, export::Warnings), String>),
     Backend(Backend),
+    /// 프리셋 추천을 쓸 수 있는지. 쓸 수 없으면 그 이유.
+    Recommender(Option<String>),
 }
 
 /// 화면 밖에서 해야 할 일.
@@ -217,6 +228,7 @@ impl App {
             notice: (!problems.is_empty()).then(|| problems.join("\n")),
             backend: Backend::Unknown,
             presets,
+            recommend_problem: None,
         }
     }
 
@@ -252,6 +264,10 @@ impl App {
                 self.backend = backend;
                 return Ok(Vec::new());
             }
+            Action::Recommender(problem) => {
+                self.recommend_problem = problem;
+                return Ok(Vec::new());
+            }
             Action::SaveScreenshot(pixels) => {
                 let path = self.save_screenshot(&pixels)?;
                 let path = path.display();
@@ -280,6 +296,7 @@ impl App {
             | Action::OpenProject(_)
             | Action::SaveScreenshot(_)
             | Action::SetLanguage(_)
+            | Action::Recommender(_)
             | Action::Backend(_) => {
                 unreachable!()
             }
@@ -358,6 +375,26 @@ impl App {
                 open.change_look(true, &self.presets, &mut effects, |edit| {
                     edit.preset = preset.clone()
                 })?;
+            }
+            Action::ApplyRecommended => {
+                for index in open.selected.clone() {
+                    // 아직 분류하지 않은 사진은 건드리지 않는다.
+                    let Some(guess) = open.photos[index].guess else {
+                        continue;
+                    };
+                    let (folder, relative) = (
+                        open.photos[index].folder,
+                        open.photos[index].relative.clone(),
+                    );
+                    let mut edit = open.edit(index);
+                    edit.preset = recommend::preset_for(&self.presets, &guess)
+                        .map(|preset| preset.id.clone());
+                    open.project.set_edit(folder, &relative, edit);
+                }
+                open.save()?;
+                if let Some(current) = open.current {
+                    effects.push(open.request_preview(current, &self.presets));
+                }
             }
             Action::SetStrength { value, commit } => {
                 open.change_look(commit, &self.presets, &mut effects, |edit| {
@@ -461,9 +498,14 @@ impl App {
                     open.export = ExportState::Idle;
                 }
             }
-            Action::Thumbnail { index, pixels } => {
+            Action::Thumbnail {
+                index,
+                pixels,
+                guess,
+            } => {
                 if let Some(photo) = open.photos.get_mut(index) {
                     photo.thumbnail = pixels;
+                    photo.guess = guess;
                 }
             }
             Action::PreviewReady {
@@ -611,6 +653,7 @@ impl Open {
             folder,
             relative: file.to_string_lossy().into_owned(),
             thumbnail: None,
+            guess: None,
         }));
         Effect::Thumbnails(
             (first..self.photos.len())
@@ -1227,12 +1270,14 @@ mod tests {
         fx.app.handle(Action::Thumbnail {
             index: 1,
             pixels: Some(pixels()),
+            guess: None,
         });
         assert!(fx.open().photos[1].thumbnail.is_some());
         assert!(fx.open().photos[0].thumbnail.is_none());
         fx.app.handle(Action::Thumbnail {
             index: 99,
             pixels: Some(pixels()),
+            guess: None,
         }); // 범위 밖은 무시
     }
 
@@ -1537,5 +1582,54 @@ mod tests {
 
         fx.app.handle(Action::SetFrame(None));
         assert_eq!(fx.open().edit(0).frame, None);
+    }
+
+    #[test]
+    fn recommended_presets_are_applied_to_the_selected_photos() {
+        use crate::recommend::{Category, Guess};
+        let mut fx = Fixture::with_photos("recommend");
+        let guesses = [
+            (0, Category::Food, 0.9),
+            (1, Category::Landscape, 0.4), // 확신이 낮다
+        ];
+        for (index, category, confidence) in guesses {
+            fx.app.handle(Action::Thumbnail {
+                index,
+                pixels: None,
+                guess: Some(Guess {
+                    category,
+                    confidence,
+                }),
+            });
+        }
+        assert_eq!(
+            fx.open().photos[0].guess.map(|guess| guess.category),
+            Some(Category::Food)
+        );
+        // 세 장 모두 흑백으로 해 두고, 추천을 적용한다. 2번 사진은 아직 분류되지 않았다.
+        fx.app.handle(Action::SelectAll);
+        fx.app.handle(Action::SetPreset(Some("mono".into())));
+        fx.app.handle(Action::ApplyRecommended);
+        let preset = |index: usize| fx.open().edit(index).preset;
+        assert_eq!(preset(0).as_deref(), Some("food"));
+        assert_eq!(preset(1), None, "확신이 낮으면 프리셋 없이 둔다");
+        assert_eq!(
+            preset(2).as_deref(),
+            Some("mono"),
+            "분류되지 않은 사진은 건드리지 않는다"
+        );
+        let saved = Project::load(&fx.open().path).unwrap();
+        assert_eq!(saved.edit(0, "a.ARW").preset.as_deref(), Some("food"));
+    }
+
+    #[test]
+    fn a_missing_classification_model_is_remembered_with_its_reason() {
+        let mut fx = Fixture::new("no-clip");
+        assert_eq!(fx.app.recommend_problem, None);
+        fx.app
+            .handle(Action::Recommender(Some("모델이 없습니다".into())));
+        assert_eq!(fx.app.recommend_problem.as_deref(), Some("모델이 없습니다"));
+        fx.app.handle(Action::Recommender(None));
+        assert_eq!(fx.app.recommend_problem, None);
     }
 }

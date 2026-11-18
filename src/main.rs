@@ -15,6 +15,7 @@ mod preset;
 mod preview;
 mod project;
 mod raw;
+mod recommend;
 mod ui;
 mod worker;
 

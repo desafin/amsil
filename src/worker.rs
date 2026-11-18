@@ -3,6 +3,7 @@
 use crate::app::{Action, Backend, Effect};
 use crate::gpu::Denoiser;
 use crate::lut::Lut;
+use crate::recommend::{self, Classifier};
 use crate::{export, preview};
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
@@ -12,6 +13,8 @@ use std::sync::{Arc, Mutex};
 
 /// 썸네일의 긴 변 (화소).
 const THUMBNAIL_SIDE: usize = 160;
+/// 사진을 분류할 때 쓰는 그림의 긴 변 (화소). 짧은 변이 모델 입력(224)보다 작아지지 않게 넉넉히 잡는다.
+const CLASSIFY_SIDE: usize = 448;
 /// 미리보기의 긴 변 (화소)의 기본값. 화면 쪽에서 GPU가 받을 수 있는 크기를 알려 주면 그 값으로 바뀐다.
 const PREVIEW_SIDE: usize = 2048;
 
@@ -47,6 +50,8 @@ pub struct Workers {
     base: Arc<Mutex<Option<Arc<Base>>>>,
     /// 마지막으로 읽은 LUT. 강도 슬라이더를 끄는 동안 파일을 다시 읽지 않게 한다.
     lut: Arc<Mutex<Option<CachedLut>>>,
+    /// 사진 분류 모델. 처음 필요할 때 읽는다.
+    classifier: Arc<Mutex<Option<Arc<Mutex<Classifier>>>>>,
 }
 
 impl Workers {
@@ -61,6 +66,7 @@ impl Workers {
             preview_side: Arc::new(AtomicU64::new(PREVIEW_SIDE as u64)),
             base: Arc::default(),
             lut: Arc::default(),
+            classifier: Arc::default(),
         };
         (workers, rx)
     }
@@ -94,6 +100,7 @@ impl Workers {
                 Err(reason) => Backend::Unavailable(reason),
             };
             workers.send(Action::Backend(backend));
+            workers.send(Action::Recommender(workers.classifier().err()));
         });
     }
 
@@ -108,6 +115,18 @@ impl Workers {
         ));
         *slot = Some(denoiser.clone());
         Ok(denoiser)
+    }
+
+    fn classifier(&self) -> std::result::Result<Arc<Mutex<Classifier>>, String> {
+        let mut slot = self.classifier.lock().unwrap();
+        if let Some(classifier) = slot.as_ref() {
+            return Ok(classifier.clone());
+        }
+        let classifier = Arc::new(Mutex::new(
+            recommend::load_classifier().map_err(|e| e.to_string())?,
+        ));
+        *slot = Some(classifier.clone());
+        Ok(classifier)
     }
 
     /// 사진을 읽는다. 방금 읽은 사진(같은 노이즈 제거 레벨)이면 다시 읽지 않는다.
@@ -154,9 +173,26 @@ impl Workers {
         match effect {
             Effect::Thumbnails(list) => {
                 std::thread::spawn(move || {
+                    // 분류 모델이 없으면 썸네일만 만든다.
+                    let classifier = workers.classifier().ok();
                     list.into_par_iter().for_each(|(index, path)| {
-                        let pixels = preview::thumbnail(&path, THUMBNAIL_SIDE).ok().flatten();
-                        workers.send(Action::Thumbnail { index, pixels });
+                        // 분류에 쓸 만큼 큰 그림을 한 번 읽어 분류하고, 썸네일 크기로 줄인다.
+                        let picture = preview::thumbnail(&path, CLASSIFY_SIDE).ok().flatten();
+                        let guess = picture.as_ref().zip(classifier.as_ref()).and_then(
+                            |(picture, classifier)| {
+                                classifier.lock().unwrap().classify(picture).ok()
+                            },
+                        );
+                        let pixels =
+                            picture.map(|picture| match picture.fit_within(THUMBNAIL_SIDE) {
+                                Some(small) => small,
+                                None => picture,
+                            });
+                        workers.send(Action::Thumbnail {
+                            index,
+                            pixels,
+                            guess,
+                        });
                     });
                 });
             }
@@ -290,11 +326,19 @@ mod tests {
         let Action::Thumbnail {
             index: 3,
             pixels: Some(thumb),
+            guess,
         } = &seen[0]
         else {
             panic!("썸네일이 아니다")
         };
         assert_eq!(thumb.height, THUMBNAIL_SIDE);
+        // 분류 모델이 있으면 사진의 종류도 함께 온다.
+        assert_eq!(
+            guess.is_some(),
+            crate::gpu::model_dir()
+                .join(crate::recommend::MODEL)
+                .exists()
+        );
 
         workers.run(Effect::Preview {
             generation: 7,

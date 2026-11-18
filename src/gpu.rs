@@ -24,6 +24,12 @@ pub fn busy_nanos() -> u64 {
     BUSY_NANOS.load(Relaxed)
 }
 
+/// CPU에서 돌리는 세션을 만든다. 작은 모델에 쓴다.
+pub fn cpu_session(model: &Path) -> Result<Session> {
+    let env = ENV.as_ref().map_err(|e| e.clone())?;
+    Ok(Session::builder(env)?.commit_from_file(model)?)
+}
+
 /// 모델이 실제로 돌아가는 곳.
 #[derive(Debug)]
 pub enum Backend {

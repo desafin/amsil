@@ -5,6 +5,7 @@ use crate::frame::{Frame, Layout as Shape};
 use crate::job::{describe_remaining, describe_resources};
 use crate::lang::{self, Lang, t};
 use crate::preview::Pixels;
+use crate::recommend;
 use eframe::egui::{self, Align, Key, Layout, Panel, RichText, TextureHandle, TextureOptions};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -475,13 +476,41 @@ fn look_panel(
         {
             actions.push(Action::SetPreset(None));
         }
+        // 지금 사진의 내용에 맞는 프리셋에는 별표를 붙인다.
+        let recommended = open.photos[current]
+            .guess
+            .and_then(|guess| recommend::preset_for(&app.presets, &guess));
         for preset in &app.presets {
             let chosen = edit.preset.as_deref() == Some(preset.id.as_str());
-            if ui.selectable_label(chosen, preset.label()).clicked() {
+            let name = if recommended.is_some_and(|best| best.id == preset.id) {
+                format!("{} ★", preset.label())
+            } else {
+                preset.label().to_owned()
+            };
+            if ui.selectable_label(chosen, name).clicked() {
                 actions.push(Action::SetPreset(Some(preset.id.clone())));
             }
         }
     });
+    if open
+        .selected
+        .iter()
+        .any(|&index| open.photos[index].guess.is_some())
+    {
+        if ui
+            .button(t("추천 프리셋 적용", "Apply recommended presets"))
+            .on_hover_text(t(
+                "선택한 사진마다 내용(음식, 인물, 풍경, 야경)에 맞는 프리셋을 적용합니다. 확실하지 않은 사진은 프리셋 없이 둡니다.",
+                "Applies the preset that suits each selected photo (food, portrait, landscape, night). Photos it is not sure about get no preset.",
+            ))
+            .clicked()
+        {
+            actions.push(Action::ApplyRecommended);
+        }
+    } else if let Some(problem) = &app.recommend_problem {
+        ui.weak(t("프리셋 추천: 모델 없음", "Preset suggestions: no model"))
+            .on_hover_text(problem);
+    }
     ui.add_enabled_ui(edit.preset.is_some(), |ui| {
         let mut strength = edit.strength;
         if let Some(commit) = slider(ui, t("강도", "Strength"), &mut strength, 0.0..=1.5) {
@@ -748,6 +777,11 @@ fn photo_list(ui: &mut egui::Ui, open: &Open, view: &mut View, actions: &mut Vec
                                 .paint_at(ui, egui::Rect::from_center_size(rect.center(), size));
                         }
                         let name = photo.relative.rsplit('/').next().unwrap_or(&photo.relative);
+                        // 무엇을 찍은 사진으로 보이는지 이름 옆에 적는다 (확실할 때만).
+                        let name = match photo.guess.filter(|guess| guess.is_confident()) {
+                            Some(guess) => format!("{name} · {}", guess.category.label()),
+                            None => name.to_owned(),
+                        };
                         let label = ui.selectable_label(open.selected.contains(&index), name);
                         image.clicked() || label.clicked()
                     })
@@ -1630,11 +1664,18 @@ mod tests {
         handle(Action::ImportFolder(photos.clone()));
         handle(Action::Backend(Backend::Gpu));
         let count = screen.app.borrow().open.as_ref().unwrap().photos.len();
+        let mut classifier = crate::recommend::load_classifier().ok();
         for index in 0..count {
             let path = screen.app.borrow().open.as_ref().unwrap().photo_path(index);
+            let picture = crate::preview::thumbnail(&path, 448).unwrap();
+            let guess = picture
+                .as_ref()
+                .zip(classifier.as_mut())
+                .map(|(picture, classifier)| classifier.classify(picture).unwrap());
             handle(Action::Thumbnail {
                 index,
-                pixels: crate::preview::thumbnail(&path, 160).unwrap(),
+                pixels: picture.map(|picture| picture.fit_within(160).unwrap()),
+                guess,
             });
         }
         handle(Action::Select {
@@ -1905,6 +1946,14 @@ mod tests {
         });
         handle(Action::SetPreset(Some("food".into())));
         handle(Action::SetLut(Some("/luts/film.cube".into())));
+        handle(Action::Thumbnail {
+            index: 0,
+            pixels: None,
+            guess: Some(crate::recommend::Guess {
+                category: crate::recommend::Category::Food,
+                confidence: 0.9,
+            }),
+        });
         handle(Action::SetFrame(Some(crate::frame::Frame {
             layout: crate::frame::Layout::Band,
             dark: false,
@@ -1936,6 +1985,8 @@ mod tests {
         check(&mut harness, "모델이 없을 때");
         handle(Action::Backend(Backend::Unknown));
         check(&mut harness, "AI 준비 중");
+        handle(Action::Recommender(Some("no model".into())));
+        check(&mut harness, "분류 모델이 없을 때");
 
         // 내보내기: 확인 창, 진행 중, 결과, 실패
         let out = screen.dir.join("out");
@@ -2015,5 +2066,69 @@ mod tests {
         harness.get_by_label("프레임 없음").click();
         harness.run_steps(3);
         assert_eq!(frame(), None);
+    }
+
+    #[test]
+    fn the_recommended_preset_is_marked_and_applied_in_one_click() {
+        use crate::recommend::{Category, Guess};
+        let screen = Screen::with_photos("recommend");
+        let handle = |action| {
+            screen.app.borrow_mut().handle(action);
+        };
+        handle(Action::Select {
+            index: 0,
+            extend: false,
+        });
+        let mut harness = screen.harness();
+        harness.run_steps(3);
+        assert!(
+            harness.query_by_label("추천 프리셋 적용").is_none(),
+            "분류된 사진이 없으면 단추도 없다"
+        );
+
+        handle(Action::Thumbnail {
+            index: 0,
+            pixels: None,
+            guess: Some(Guess {
+                category: Category::Food,
+                confidence: 0.9,
+            }),
+        });
+        harness.run_steps(3);
+        // 목록에는 사진의 종류가, 프리셋 단추에는 추천 표시가 붙는다.
+        harness.get_by_label("a.ARW · 음식");
+        harness.get_by_label("음식 ★");
+        harness.get_by_label("추천 프리셋 적용").click();
+        harness.run_steps(3);
+        let preset = screen.app.borrow().open.as_ref().unwrap().edit(0).preset;
+        assert_eq!(preset.as_deref(), Some("food"));
+    }
+
+    #[test]
+    fn a_missing_classification_model_is_explained_in_the_preset_panel() {
+        let screen = Screen::with_photos("no-clip");
+        let handle = |action| {
+            screen.app.borrow_mut().handle(action);
+        };
+        handle(Action::Select {
+            index: 0,
+            extend: false,
+        });
+        handle(Action::Recommender(Some(
+            "사진 분류 모델이 없습니다".into(),
+        )));
+        let mut harness = screen.harness();
+        harness.run_steps(3);
+        harness.get_by_label("프리셋 추천: 모델 없음");
+    }
+
+    #[test]
+    fn the_bundled_font_has_the_symbols_the_screen_uses() {
+        use ab_glyph::Font;
+        // 글꼴에 없는 글자는 화면에 네모로 나온다.
+        let font = ab_glyph::FontRef::try_from_slice(crate::frame::FONT).unwrap();
+        for symbol in ['★', '·', '…', '×', '%'] {
+            assert_ne!(font.glyph_id(symbol).0, 0, "{symbol}");
+        }
     }
 }

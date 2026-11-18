@@ -44,7 +44,8 @@ pub fn usage() -> &'static str {
         amsil [옵션] <입력 폴더> <출력 폴더>     하위 폴더까지 전부 변환
 옵션:
   --denoise[=강도]     AI 노이즈 제거 (강도 0~1, 생략하면 1)
-  --preset=이름        프리셋 적용 (food, portrait, landscape, night, mono 또는 직접 만든 것)
+  --preset=이름        프리셋 적용 (food, portrait, landscape, night, mono 또는 직접 만든 것).
+                       auto면 사진마다 내용에 맞는 것을 고른다
   --strength=강도      프리셋의 강도 (0~1.5, 기본 1)
   --lut=파일           3D LUT(.cube)을 입힌다
   --lut-strength=강도  LUT의 강도 (0~1, 기본 1)
@@ -57,7 +58,8 @@ pub fn usage() -> &'static str {
        amsil [options] <input folder> <output folder>     converts everything, subfolders included
 Options:
   --denoise[=LEVEL]    AI noise reduction (0 to 1; 1 when no level is given)
-  --preset=NAME        apply a preset (food, portrait, landscape, night, mono, or one of your own)
+  --preset=NAME        apply a preset (food, portrait, landscape, night, mono, or one of your own);
+                       auto picks the one that suits each photo
   --strength=X         preset strength (0 to 1.5, default 1)
   --lut=FILE           apply a 3D LUT (.cube)
   --lut-strength=X     LUT strength (0 to 1, default 1)
@@ -174,10 +176,51 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> std::result::Resu
     }
 }
 
-/// 명령행에서 고른 프리셋과 강도로 보정 값을 정한다.
-fn params(args: &Args) -> Result<Params> {
+/// 고를 수 있는 프리셋: 기본 프리셋 뒤에 사용자가 만든 것 (화면과 같은 목록).
+fn presets() -> Vec<preset::Preset> {
     let mut presets = preset::builtin();
     presets.extend(preset::load_dir(&crate::project::Config::path().with_file_name("presets")).0);
+    presets
+}
+
+/// `--preset`에 이 이름을 주면 사진마다 내용에 맞는 프리셋을 고른다.
+const AUTO: &str = "auto";
+
+/// 사진마다의 보정 값. `--preset=auto`면 사진을 분류해 맞는 프리셋을 고르고, 아니면 모두 같은 값이다.
+fn params_for(args: &Args, inputs: &[PathBuf]) -> Result<Vec<Params>> {
+    if args.preset.as_deref() == Some(AUTO) {
+        auto_params(args, inputs)
+    } else {
+        Ok(vec![params(args)?; inputs.len()])
+    }
+}
+
+/// 사진을 분류해 사진마다 맞는 프리셋의 보정 값을 정한다. 맞는 것이 없는 사진은 보정하지 않는다.
+fn auto_params(args: &Args, inputs: &[PathBuf]) -> Result<Vec<Params>> {
+    let presets = presets();
+    let mut classifier = crate::recommend::load_classifier()?;
+    // ponytail: 한 장씩 차례로 분류한다 (장당 0.1초쯤). 수천 장이면 여러 스레드로 나눈다.
+    inputs
+        .iter()
+        .map(|input| {
+            let guess = match crate::preview::thumbnail(input, 448)? {
+                Some(picture) => Some(classifier.classify(&picture)?),
+                None => None,
+            };
+            let preset = guess.and_then(|guess| crate::recommend::preset_for(&presets, &guess));
+            Ok(preset::resolve(
+                &presets,
+                preset.map(|preset| preset.id.as_str()),
+                args.strength,
+                &Params::default(),
+            ))
+        })
+        .collect()
+}
+
+/// 명령행에서 고른 프리셋과 강도로 보정 값을 정한다.
+fn params(args: &Args) -> Result<Params> {
+    let presets = presets();
     if let Some(id) = &args.preset
         && !presets.iter().any(|p| &p.id == id)
     {
@@ -218,10 +261,12 @@ fn run_folder(
     if files.is_empty() {
         return Err(t("RAW 파일을 찾지 못했습니다", "No RAW files found").into());
     }
-    let params = params(args)?;
+    let inputs: Vec<PathBuf> = files.iter().map(|file| args.input.join(file)).collect();
+    let params = params_for(args, &inputs)?;
     let photos: Vec<Photo> = files
         .iter()
-        .map(|file| Photo {
+        .zip(params)
+        .map(|(file, params)| Photo {
             input: args.input.join(file),
             output: job::output_path(&args.output, file),
             denoise: args.denoise,
@@ -281,7 +326,7 @@ pub fn run(args: &Args) -> Result<()> {
             export::cores(),
             denoise,
             Look {
-                params: &params(args)?,
+                params: &params_for(args, std::slice::from_ref(&args.input))?[0],
                 lut: lut.as_ref().map(|lut| (lut, args.lut_strength)),
                 frame: args.frame.as_ref(),
             },
@@ -546,5 +591,22 @@ mod tests {
             "색만 주고 모양을 주지 않으면 알린다"
         );
         assert!(usage().contains("--frame="));
+    }
+
+    #[test]
+    fn auto_preset_picks_by_what_each_photo_shows() {
+        // 분류 모델과 샘플 사진이 있을 때만 돈다.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("DCIM/10361110");
+        if !dir.exists() || crate::recommend::load_classifier().is_err() {
+            eprintln!("분류 모델이나 샘플 사진이 없어 건너뜀");
+            return;
+        }
+        let args = args(&["--preset=auto", "--strength=0.5", "in", "out"]).unwrap();
+        let inputs = [dir.join("DSC04558.ARW"), dir.join("DSC04545.ARW")];
+        let chosen = auto_params(&args, &inputs).unwrap();
+        let presets = preset::builtin();
+        let expected = |id: &str| preset::resolve(&presets, Some(id), 0.5, &Params::default());
+        assert_eq!(chosen, [expected("food"), expected("landscape")]);
+        assert!(usage().contains("auto"));
     }
 }
