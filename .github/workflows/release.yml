@@ -32,5 +32,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          cat > notes.md <<'NOTES'
+          받아서 바로 쓸 수 있는 묶음입니다 (64비트 Linux, Ubuntu 24.04 이상이나 그와 비슷한 시기의 배포판).
+
+          ```
+          tar xf amsil-*-linux-x86_64.tar.gz
+          cd amsil-*-linux-x86_64
+          ./fetch-models.sh     # AI 모델 받기 (한 번만, 약 420MB)
+          ./amsil
+          ```
+
+          무엇을 하는 프로그램인지, 어떻게 쓰는지, AI 모델의 출처는 [README](https://github.com/desafin/amsil#readme)에 있습니다.
+
+          A ready-to-run bundle for 64-bit Linux (Ubuntu 24.04 or newer, or a distribution of similar age). Unpack it, run `./fetch-models.sh` once to download the AI models, then start `./amsil`.
+          NOTES
           gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.tar.gz.sha256 \
-            --title "암실 $GITHUB_REF_NAME" --generate-notes
+            --title "암실 $GITHUB_REF_NAME" --notes-file notes.md --generate-notes
