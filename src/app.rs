@@ -32,6 +32,8 @@ pub struct App {
     pub recommend_problem: Option<String>,
     /// 마스크를 쓸 수 없는 이유. 쓸 수 있으면 None.
     pub mask_problem: Option<String>,
+    /// 피부 보정을 쓸 수 없는 이유. 쓸 수 있으면 None.
+    pub skin_problem: Option<String>,
 }
 
 /// AI 모델(노이즈 제거)의 실행 환경.
@@ -180,7 +182,12 @@ pub enum Action {
     },
     /// 고른 영역을 미리보기에 표시할지.
     ShowMask(bool),
-    /// 프리셋, 수동 조정, LUT을 지운다 (노이즈 제거, 프레임, 마스크는 그대로).
+    /// 선택한 사진들의 피부 보정 세기 (0~1).
+    SetSkin {
+        value: f32,
+        commit: bool,
+    },
+    /// 프리셋, 수동 조정, LUT, 피부 보정을 지운다 (노이즈 제거, 프레임, 마스크는 그대로).
     ResetLook,
     SetExportFolder(PathBuf),
     SetQuality(u8),
@@ -217,6 +224,8 @@ pub enum Action {
     Recommender(Option<String>),
     /// 마스크를 쓸 수 있는지. 쓸 수 없으면 그 이유.
     Segmenter(Option<String>),
+    /// 피부 보정을 쓸 수 있는지. 쓸 수 없으면 그 이유.
+    SkinModel(Option<String>),
 }
 
 /// 화면 밖에서 해야 할 일.
@@ -239,6 +248,8 @@ pub enum Effect {
         masks: Vec<Mask>,
         /// 이 번호의 마스크가 고른 영역을 붉게 표시한다.
         overlay: Option<usize>,
+        /// 피부 보정의 세기.
+        skin: f32,
     },
     Export {
         photos: Vec<export::Photo>,
@@ -265,6 +276,7 @@ impl App {
             presets,
             recommend_problem: None,
             mask_problem: None,
+            skin_problem: None,
         }
     }
 
@@ -308,6 +320,10 @@ impl App {
                 self.mask_problem = problem;
                 return Ok(Vec::new());
             }
+            Action::SkinModel(problem) => {
+                self.skin_problem = problem;
+                return Ok(Vec::new());
+            }
             Action::SaveScreenshot(pixels) => {
                 let path = self.save_screenshot(&pixels)?;
                 let path = path.display();
@@ -338,6 +354,7 @@ impl App {
             | Action::SetLanguage(_)
             | Action::Recommender(_)
             | Action::Segmenter(_)
+            | Action::SkinModel(_)
             | Action::Backend(_) => {
                 unreachable!()
             }
@@ -521,6 +538,11 @@ impl App {
                     effects.push(open.request_preview(current, &self.presets));
                 }
             }
+            Action::SetSkin { value, commit } => {
+                open.change_look(commit, &self.presets, &mut effects, |edit| {
+                    edit.skin = value.clamp(0.0, 1.0)
+                })?;
+            }
             Action::ResetLook => {
                 open.change_look(true, &self.presets, &mut effects, |edit| {
                     *edit = Edit {
@@ -567,6 +589,7 @@ impl App {
                             lut: open.lut(index),
                             frame: open.edit(index).frame,
                             masks: open.edit(index).masks,
+                            skin: open.edit(index).skin,
                         }
                     })
                     .collect();
@@ -789,6 +812,7 @@ impl Open {
             frame: edit.frame.filter(|_| editing.is_none()),
             masks: edit.masks,
             overlay: editing.filter(|_| self.show_mask),
+            skin: edit.skin,
         }
     }
 
@@ -1472,6 +1496,7 @@ mod tests {
                     lut: None,
                     frame: None,
                     masks: Vec::new(),
+                    skin: 0.0,
                 },
                 export::Photo {
                     input: src.join("c.ARW"),
@@ -1481,6 +1506,7 @@ mod tests {
                     lut: None,
                     frame: None,
                     masks: Vec::new(),
+                    skin: 0.0,
                 },
                 export::Photo {
                     input: src.join("sub/b.ARW"),
@@ -1490,6 +1516,7 @@ mod tests {
                     lut: None,
                     frame: None,
                     masks: Vec::new(),
+                    skin: 0.0,
                 },
             ]
         );
@@ -1954,5 +1981,59 @@ mod tests {
         assert_eq!(fx.app.mask_problem.as_deref(), Some("모델이 없습니다"));
         fx.app.handle(Action::Segmenter(None));
         assert_eq!(fx.app.mask_problem, None);
+    }
+
+    #[test]
+    fn skin_retouch_is_set_on_selected_photos_previewed_exported_and_reset() {
+        let mut fx = Fixture::with_photos("skin");
+        fx.app.handle(Action::Select {
+            index: 0,
+            extend: false,
+        });
+        let effects = fx.app.handle(Action::SetSkin {
+            value: 0.6,
+            commit: true,
+        });
+        let [Effect::Preview { skin, .. }] = &effects[..] else {
+            panic!("{effects:?}")
+        };
+        assert_eq!(*skin, 0.6);
+        assert_eq!((fx.open().edit(0).skin, fx.open().edit(1).skin), (0.6, 0.0));
+        assert_eq!(
+            Project::load(&fx.open().path)
+                .unwrap()
+                .edit(0, "a.ARW")
+                .skin,
+            0.6
+        );
+
+        fx.app.handle(Action::SetExportFolder(fx.dir.join("결과")));
+        let effects = fx.app.handle(Action::Export {
+            only_selected: false,
+        });
+        let [Effect::Export { photos, .. }] = &effects[..] else {
+            panic!("{effects:?}")
+        };
+        assert_eq!((photos[0].skin, photos[1].skin), (0.6, 0.0));
+        fx.app.handle(Action::CancelExport);
+
+        // 범위를 벗어난 값은 끝으로 당긴다. 보정 초기화는 피부 보정도 지운다.
+        fx.app.handle(Action::SetSkin {
+            value: 3.0,
+            commit: true,
+        });
+        assert_eq!(fx.open().edit(0).skin, 1.0);
+        fx.app.handle(Action::ResetLook);
+        assert_eq!(fx.open().edit(0).skin, 0.0);
+    }
+
+    #[test]
+    fn a_missing_skin_model_is_remembered_with_its_reason() {
+        let mut fx = Fixture::new("no-skin");
+        fx.app
+            .handle(Action::SkinModel(Some("모델이 없습니다".into())));
+        assert_eq!(fx.app.skin_problem.as_deref(), Some("모델이 없습니다"));
+        fx.app.handle(Action::SkinModel(None));
+        assert_eq!(fx.app.skin_problem, None);
     }
 }

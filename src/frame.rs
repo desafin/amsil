@@ -577,7 +577,10 @@ mod tests {
                     frame: Some(&frame),
                     ..crate::export::Look::new(&params)
                 };
-                let pixels = crate::preview::shrink(&loaded.develop(&small, look, &[]), usize::MAX);
+                let pixels = crate::preview::shrink(
+                    &loaded.develop(&small, look, &crate::export::Areas::default()),
+                    usize::MAX,
+                );
                 image::save_buffer(
                     out.join(format!("frame-{name}-{label}.png")),
                     &pixels.rgba,

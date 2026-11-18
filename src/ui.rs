@@ -426,6 +426,8 @@ fn edit_panel(
             ui.separator();
             mask_panel(ui, app, open, actions);
             ui.separator();
+            skin_panel(ui, app, open, actions);
+            ui.separator();
             frame_panel(ui, open, actions);
             ui.separator();
             denoise_panel(ui, app, open, actions);
@@ -622,8 +624,8 @@ fn look_panel(
     if ui
         .button(t("보정 초기화", "Reset adjustments"))
         .on_hover_text(t(
-            "프리셋, 세부 조정, LUT을 지웁니다 (노이즈 제거, 프레임, 마스크는 그대로)",
-            "Clears the preset, detail adjustments and LUT (noise reduction, frame and masks stay)",
+            "프리셋, 세부 조정, LUT, 피부 보정을 지웁니다 (노이즈 제거, 프레임, 마스크는 그대로)",
+            "Clears the preset, detail adjustments, LUT and skin retouch (noise reduction, frame and masks stay)",
         ))
         .clicked()
     {
@@ -641,6 +643,39 @@ fn hue_names() -> [&'static str; 8] {
             "Red", "Orange", "Yellow", "Green", "Aqua", "Blue", "Purple", "Magenta",
         ],
     )
+}
+
+/// 피부 보정 (실험 기능): 인물의 피부만 찾아 얼룩을 누그러뜨린다.
+fn skin_panel(ui: &mut egui::Ui, app: &App, open: &Open, actions: &mut Vec<Action>) {
+    ui.heading(t("피부 보정 (실험)", "Skin retouch (experimental)"));
+    let Some(current) = open.current else {
+        ui.weak(t(
+            "사진을 고르면 인물의 피부를 다듬을 수 있습니다",
+            "Pick a photo to retouch skin in portraits",
+        ));
+        return;
+    };
+    if let Some(problem) = &app.skin_problem {
+        ui.weak(t("피부 보정: 모델 없음", "Skin retouch: no model"))
+            .on_hover_text(problem);
+        return;
+    }
+    let mut amount = open.edit(current).skin;
+    if let Some(commit) = slider(
+        ui,
+        t("피부 보정 세기", "Skin amount"),
+        &mut amount,
+        0.0..=1.0,
+    ) {
+        actions.push(Action::SetSkin {
+            value: amount,
+            commit,
+        });
+    }
+    ui.weak(t(
+        "피부를 자동으로 찾아 얼룩과 고르지 않은 톤만 줄입니다. 가까이서 찍은 인물에 잘 듣습니다.",
+        "Finds skin automatically and evens out blotches. Works best on people photographed up close.",
+    ));
 }
 
 /// 마스크: 사진의 일부분을 골라 그곳에만 보정을 더한다.
@@ -1841,6 +1876,8 @@ mod tests {
                 masks: &[],
                 segmenter: None,
                 overlay: None,
+                skin: 0.0,
+                skin_finder: None,
             },
             &|_| {},
         )
@@ -1898,6 +1935,8 @@ mod tests {
                 masks: &[],
                 segmenter: None,
                 overlay: None,
+                skin: 0.0,
+                skin_finder: None,
             },
             &|_| {},
         )
@@ -1949,6 +1988,8 @@ mod tests {
                 masks: &[],
                 segmenter: None,
                 overlay: None,
+                skin: 0.0,
+                skin_finder: None,
             },
             &|_| {},
         )
@@ -2177,8 +2218,10 @@ mod tests {
         check(&mut harness, "마스크를 고치는 중");
         handle(Action::SelectMask(None));
         handle(Action::Segmenter(Some("no model".into())));
-        check(&mut harness, "마스크 모델이 없을 때");
+        handle(Action::SkinModel(Some("no model".into())));
+        check(&mut harness, "마스크와 피부 모델이 없을 때");
         handle(Action::Segmenter(None));
+        handle(Action::SkinModel(None));
         harness.get_by_label("CPU (slow)").click();
         check(&mut harness, "CPU 안내");
         handle(Action::Backend(Backend::Unavailable("no model".into())));
@@ -2462,5 +2505,25 @@ mod tests {
         harness.run_steps(3);
         harness.get_by_label("마스크: 모델 없음");
         assert!(harness.query_by_label("새 마스크").is_none());
+    }
+
+    #[test]
+    fn the_skin_panel_offers_an_amount_or_explains_the_missing_model() {
+        let screen = Screen::with_photos("skin");
+        let handle = |action| {
+            screen.app.borrow_mut().handle(action);
+        };
+        handle(Action::Select {
+            index: 0,
+            extend: false,
+        });
+        let mut harness = screen.harness();
+        harness.run_steps(3);
+        // 슬라이더는 이름표와 조절 막대 두 군데에 같은 이름이 붙는다.
+        assert!(harness.query_all_by_label("피부 보정 세기").count() > 0);
+        handle(Action::SkinModel(Some("피부 보정 모델이 없습니다".into())));
+        harness.run_steps(3);
+        harness.get_by_label("피부 보정: 모델 없음");
+        assert_eq!(harness.query_all_by_label("피부 보정 세기").count(), 0);
     }
 }

@@ -35,6 +35,8 @@ pub struct Args {
     lut_strength: f32,
     /// 사진에 두를 프레임.
     frame: Option<Frame>,
+    /// 피부 보정의 세기 (0~1). 0이면 끈다.
+    skin: f32,
 }
 
 /// 사용법 안내.
@@ -51,6 +53,7 @@ pub fn usage() -> &'static str {
   --lut-strength=강도  LUT의 강도 (0~1, 기본 1)
   --frame=모양         촬영 정보를 적은 프레임: band(아래 띠), border(테두리), 4:5 같은 비율
   --frame-black        프레임을 검은색으로 (기본은 흰색)
+  --skin[=세기]        인물의 피부를 고르게 다듬는다 (실험 기능. 세기 0~1, 생략하면 0.5)
   --overwrite          이미 있는 출력 파일도 다시 만든다 (기본은 건너뜀)
   --jobs=N             동시에 처리할 장수 (기본: CPU 코어 수)
   --memory=GB          사용할 메모리 한도 (기본: 남은 메모리의 70%)",
@@ -65,6 +68,7 @@ Options:
   --lut-strength=X     LUT strength (0 to 1, default 1)
   --frame=LAYOUT       frame with the shooting info: band (strip below), border, or a ratio such as 4:5
   --frame-black        black frame (white by default)
+  --skin[=AMOUNT]      even out skin in portraits (experimental; 0 to 1, 0.5 when no amount is given)
   --overwrite          redo output files that already exist (skipped by default)
   --jobs=N             photos to process at once (default: number of CPU cores)
   --memory=GB          memory limit (default: 70% of the available memory)",
@@ -76,6 +80,7 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> std::result::Resu
     let (mut preset, mut strength) = (None, 1.0);
     let (mut lut, mut lut_strength) = (None, 1.0);
     let (mut layout, mut frame_black) = (None::<Layout>, false);
+    let mut skin = 0.0;
     let mut paths = Vec::new();
     for arg in args {
         let Some(option) = arg.to_str().filter(|text| text.starts_with("--")) else {
@@ -135,6 +140,17 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> std::result::Resu
             }
             ("--frame", Some(value)) => layout = Some(value.parse()?),
             ("--frame-black", None) => frame_black = true,
+            ("--skin", None) => skin = 0.5,
+            ("--skin", Some(value)) => {
+                skin = value
+                    .parse()
+                    .ok()
+                    .filter(|amount| (0.0..=1.0).contains(amount))
+                    .ok_or(t(
+                        "피부 보정의 세기는 0에서 1 사이의 숫자여야 합니다",
+                        "The skin amount must be a number from 0 to 1",
+                    ))?;
+            }
             _ => {
                 return Err(t(
                     format!("모르는 옵션: {option}"),
@@ -167,6 +183,7 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> std::result::Resu
             lut,
             lut_strength,
             frame,
+            skin,
         }),
         Err(_) => Err(t(
             "입력과 출력을 하나씩 지정해야 합니다",
@@ -252,6 +269,14 @@ fn load_denoiser(needed: bool) -> Result<Option<Mutex<crate::gpu::Denoiser>>> {
     Ok(Some(Mutex::new(denoiser)))
 }
 
+/// 피부 보정을 쓸 때만 피부를 찾는 모델을 읽는다.
+fn load_skin_finder(needed: bool) -> Result<Option<Mutex<crate::skin::SkinFinder>>> {
+    if !needed {
+        return Ok(None);
+    }
+    Ok(Some(Mutex::new(crate::skin::load_finder()?)))
+}
+
 /// 폴더 전체를 변환한다. 진행 상황은 `report`로 알린다.
 fn run_folder(
     args: &Args,
@@ -274,9 +299,11 @@ fn run_folder(
             lut: args.lut.clone().map(|file| (file, args.lut_strength)),
             frame: args.frame,
             masks: Vec::new(),
+            skin: args.skin,
         })
         .collect();
     let denoiser = load_denoiser(args.denoise > 0.0)?;
+    let skin_finder = load_skin_finder(args.skin > 0.0)?;
     let settings = Settings {
         overwrite: args.overwrite,
         jobs: args.jobs,
@@ -288,6 +315,7 @@ fn run_folder(
         &settings,
         denoiser.as_ref(),
         None,
+        skin_finder.as_ref(),
         &AtomicBool::new(false),
         report,
     )
@@ -321,6 +349,7 @@ pub fn run(args: &Args) -> Result<()> {
         let denoiser = load_denoiser(args.denoise > 0.0)?;
         let denoise = denoiser.as_ref().map(|model| (model, args.denoise));
         let lut = args.lut.as_deref().map(crate::lut::Lut::load).transpose()?;
+        let skin_finder = load_skin_finder(args.skin > 0.0)?;
         let warning = export::convert(
             &args.input,
             &args.output,
@@ -330,6 +359,8 @@ pub fn run(args: &Args) -> Result<()> {
             Look {
                 lut: lut.as_ref().map(|lut| (lut, args.lut_strength)),
                 frame: args.frame.as_ref(),
+                skin: args.skin,
+                skin_finder: skin_finder.as_ref(),
                 ..Look::new(&params_for(args, std::slice::from_ref(&args.input))?[0])
             },
             &|_| {},
@@ -498,6 +529,7 @@ mod tests {
             lut: None,
             lut_strength: 1.0,
             frame: None,
+            skin: 0.0,
         };
 
         let mut last = None;
@@ -610,5 +642,14 @@ mod tests {
         let expected = |id: &str| preset::resolve(&presets, Some(id), 0.5, &Params::default());
         assert_eq!(chosen, [expected("food"), expected("landscape")]);
         assert!(usage().contains("auto"));
+    }
+
+    #[test]
+    fn parses_the_skin_retouch_amount() {
+        assert_eq!(args(&["in", "out"]).unwrap().skin, 0.0);
+        assert_eq!(args(&["--skin", "in", "out"]).unwrap().skin, 0.5);
+        assert_eq!(args(&["--skin=0.8", "in", "out"]).unwrap().skin, 0.8);
+        assert!(args(&["--skin=2", "in", "out"]).is_err());
+        assert!(usage().contains("--skin"));
     }
 }

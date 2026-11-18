@@ -140,7 +140,7 @@ fn spatial_filters(l: &mut [f32], w: usize, h: usize, p: &Params) {
 }
 
 /// 상자 흐림. 가장자리에서는 창을 이미지 안으로 줄인다. `passes`번 되풀이하면 가우시안에 가까워진다.
-fn box_blur(src: &[f32], w: usize, h: usize, radius: usize, passes: usize) -> Vec<f32> {
+pub fn box_blur(src: &[f32], w: usize, h: usize, radius: usize, passes: usize) -> Vec<f32> {
     let mut current = src.to_vec();
     let mut tmp = vec![0f32; src.len()];
     for _ in 0..passes {

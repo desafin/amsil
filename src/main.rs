@@ -17,6 +17,7 @@ mod preview;
 mod project;
 mod raw;
 mod recommend;
+mod skin;
 mod ui;
 mod worker;
 

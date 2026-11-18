@@ -5,6 +5,7 @@ use crate::gpu::Denoiser;
 use crate::lut::Lut;
 use crate::mask::{self, Low, Mask, Point, Segmenter};
 use crate::recommend::{self, Classifier};
+use crate::skin::{self, SkinFinder};
 use crate::{export, preview};
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
@@ -37,6 +38,8 @@ struct Base {
     embedding: Mutex<Option<Arc<mask::Embedding>>>,
     /// 누른 자리들로 이미 구해 둔 영역. 보정 슬라이더를 끄는 동안 다시 계산하지 않게 한다.
     areas: Mutex<Vec<(Vec<Point>, Low)>>,
+    /// 피부인 곳. 이 사진에 피부 보정을 처음 쓸 때 구한다.
+    skin: Mutex<Option<Low>>,
 }
 
 #[derive(Clone)]
@@ -59,6 +62,8 @@ pub struct Workers {
     classifier: Arc<Mutex<Option<Arc<Mutex<Classifier>>>>>,
     /// 마스크 모델. 처음 필요할 때 읽는다.
     segmenter: Arc<Mutex<Option<Arc<Mutex<Segmenter>>>>>,
+    /// 피부를 찾는 모델. 처음 필요할 때 읽는다.
+    skin_finder: Arc<Mutex<Option<Arc<Mutex<SkinFinder>>>>>,
 }
 
 impl Workers {
@@ -75,6 +80,7 @@ impl Workers {
             lut: Arc::default(),
             classifier: Arc::default(),
             segmenter: Arc::default(),
+            skin_finder: Arc::default(),
         };
         (workers, rx)
     }
@@ -111,6 +117,7 @@ impl Workers {
             workers.send(Action::Recommender(workers.classifier().err()));
             // 마스크 모델은 크고, 쓰지 않는 사람도 많다. 여기서는 파일이 있는지만 본다.
             workers.send(Action::Segmenter(mask::missing()));
+            workers.send(Action::SkinModel(skin::missing()));
         });
     }
 
@@ -151,36 +158,49 @@ impl Workers {
         Ok(segmenter)
     }
 
-    /// 미리보기에서 마스크마다 고른 영역을 구한다. 인코더 출력과 이미 구한 영역은 사진에 붙여 두고 다시 쓴다.
-    fn areas(&self, base: &Base, masks: &[Mask]) -> std::result::Result<Vec<Low>, String> {
-        /// 사진 한 장에 기억해 두는 영역의 수.
-        const REMEMBERED: usize = 16;
-        if masks.is_empty() {
-            return Ok(Vec::new());
+    fn skin_finder(&self) -> std::result::Result<Arc<Mutex<SkinFinder>>, String> {
+        let mut slot = self.skin_finder.lock().unwrap();
+        if let Some(finder) = slot.as_ref() {
+            return Ok(finder.clone());
         }
-        let segmenter = self.segmenter()?;
-        let mut segmenter = segmenter.lock().unwrap();
-        let embedding = {
-            let mut slot = base.embedding.lock().unwrap();
-            match slot.as_ref() {
-                Some(embedding) => embedding.clone(),
-                None => {
-                    let embedding = Arc::new(
-                        segmenter
-                            .embed(&base.loaded.mask_picture())
-                            .map_err(|e| e.to_string())?,
-                    );
-                    *slot = Some(embedding.clone());
-                    embedding
+        let finder = Arc::new(Mutex::new(skin::load_finder().map_err(|e| e.to_string())?));
+        *slot = Some(finder.clone());
+        Ok(finder)
+    }
+
+    /// 미리보기에 쓸 영역(마스크가 고른 곳, 피부)을 구한다. 모델의 결과는 사진에 붙여 두고 다시 쓴다.
+    fn areas(
+        &self,
+        base: &Base,
+        masks: &[Mask],
+        skin: f32,
+    ) -> std::result::Result<export::Areas, String> {
+        /// 사진 한 장에 기억해 두는 마스크 영역의 수.
+        const REMEMBERED: usize = 16;
+        let mut areas = export::Areas::default();
+        if !masks.is_empty() {
+            let segmenter = self.segmenter()?;
+            let mut segmenter = segmenter.lock().unwrap();
+            let embedding = {
+                let mut slot = base.embedding.lock().unwrap();
+                match slot.as_ref() {
+                    Some(embedding) => embedding.clone(),
+                    None => {
+                        let embedding = Arc::new(
+                            segmenter
+                                .embed(&base.loaded.model_picture())
+                                .map_err(|e| e.to_string())?,
+                        );
+                        *slot = Some(embedding.clone());
+                        embedding
+                    }
                 }
-            }
-        };
-        let mut known = base.areas.lock().unwrap();
-        masks
-            .iter()
-            .map(|mask| {
+            };
+            let mut known = base.areas.lock().unwrap();
+            for mask in masks {
                 if let Some((_, area)) = known.iter().find(|(points, _)| *points == mask.points) {
-                    return Ok(area.clone());
+                    areas.masks.push(area.clone());
+                    continue;
                 }
                 let area = segmenter
                     .select(&embedding, &mask.points)
@@ -189,9 +209,23 @@ impl Workers {
                     known.remove(0);
                 }
                 known.push((mask.points.clone(), area.clone()));
-                Ok(area)
-            })
-            .collect()
+                areas.masks.push(area);
+            }
+        }
+        if skin > 0.0 {
+            let mut slot = base.skin.lock().unwrap();
+            if slot.is_none() {
+                let finder = self.skin_finder()?;
+                let found = finder
+                    .lock()
+                    .unwrap()
+                    .find(&base.loaded.model_picture())
+                    .map_err(|e| e.to_string())?;
+                *slot = Some(found);
+            }
+            areas.skin = slot.clone();
+        }
+        Ok(areas)
     }
 
     /// 사진을 읽는다. 방금 읽은 사진(같은 노이즈 제거 레벨)이면 다시 읽지 않는다.
@@ -219,6 +253,7 @@ impl Workers {
             small,
             embedding: Mutex::default(),
             areas: Mutex::default(),
+            skin: Mutex::default(),
         });
         *slot = Some(base.clone());
         Ok(base)
@@ -273,6 +308,7 @@ impl Workers {
                 frame,
                 masks,
                 overlay,
+                skin,
             } => {
                 self.latest_preview.store(generation, SeqCst);
                 std::thread::spawn(move || {
@@ -295,13 +331,14 @@ impl Workers {
                             frame: frame.as_ref(),
                             masks: &masks,
                             overlay,
+                            skin,
                             ..export::Look::new(&params)
                         };
                         let base = workers.base(&path, denoise)?;
                         if stale() {
                             return Ok(());
                         }
-                        let areas = workers.areas(&base, &masks)?;
+                        let areas = workers.areas(&base, &masks, skin)?;
                         if stale() {
                             return Ok(());
                         }
@@ -345,9 +382,14 @@ impl Workers {
                         } else {
                             None
                         };
-                        // 마스크 모델을 읽지 못하면, 마스크가 있는 사진만 그 이유와 함께 실패로 남는다.
+                        // 마스크나 피부 모델을 읽지 못하면, 그것을 쓰는 사진만 그 이유와 함께 실패로 남는다.
                         let segmenter = if photos.iter().any(|photo| !photo.masks.is_empty()) {
                             workers.segmenter().ok()
+                        } else {
+                            None
+                        };
+                        let skin_finder = if photos.iter().any(|photo| photo.skin > 0.0) {
+                            workers.skin_finder().ok()
                         } else {
                             None
                         };
@@ -356,6 +398,7 @@ impl Workers {
                             &settings,
                             denoiser.as_deref(),
                             segmenter.as_deref(),
+                            skin_finder.as_deref(),
                             &workers.cancel,
                             |report| {
                                 workers.send(Action::ExportProgress(*report));
@@ -433,6 +476,7 @@ mod tests {
             frame: None,
             masks: Vec::new(),
             overlay: None,
+            skin: 0.0,
         });
         // 빠른 작은 미리보기가 먼저 오고, 원본 크기에 가까운 것이 뒤따른다.
         let mut seen = wait_for(&rx, |action| {
@@ -477,6 +521,7 @@ mod tests {
             frame: None,
             masks: Vec::new(),
             overlay: None,
+            skin: 0.0,
         });
         let seen = wait_for(&rx, |action| {
             matches!(action, Action::PreviewReady { generation: 8, .. })
@@ -512,6 +557,7 @@ mod tests {
             lut: None,
             frame: None,
             masks: Vec::new(),
+            skin: 0.0,
         }];
         workers.run(Effect::Export {
             photos,
@@ -548,6 +594,7 @@ mod tests {
             frame: None,
             masks: Vec::new(),
             overlay: None,
+            skin: 0.0,
         });
         workers.run(Effect::Preview {
             generation: 2,
@@ -559,6 +606,7 @@ mod tests {
             frame: None,
             masks: Vec::new(),
             overlay: None,
+            skin: 0.0,
         });
         let seen = wait_for(&rx, |action| {
             matches!(action, Action::PreviewReady { generation: 2, .. })
@@ -601,6 +649,7 @@ mod tests {
                     ..Mask::default()
                 }],
                 overlay,
+                skin: 0.0,
             });
             let seen = wait_for(
                 &rx,

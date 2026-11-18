@@ -58,3 +58,9 @@ fetch_dtmodel mask-object-sam21-small 06a629ac1adf40daec47d2191cbdbdac609d937695
 fetch_file clip-vit-b32 vision_model_fp16.onnx \
     "https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/6b7c523703ae26e39be4b03774966f8571c7f523/onnx/vision_model_fp16.onnx" \
     35c4e0fb0aeee527dcde1693520b214a34424a786babd530f35366bad5844efd
+
+# 피부 찾기(피부 보정): MediaPipe selfie multiclass 256×256을 ONNX로 바꾼 것 (Apache-2.0, 16MB).
+# Google의 원본 TFLite와 같은 결과를 내는 것을 확인했다.
+fetch_file selfie-multiclass model.onnx \
+    "https://huggingface.co/senty-au/selfie_multiclass_256x256-ONNX/resolve/6db8421a7150ac20558f2c24675078eb3a1a04d0/onnx/model.onnx" \
+    35ec1ecd9ee7f85073c99c00020b7f6751b69506eeacf683bc8665f6117f85b0

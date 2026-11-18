@@ -65,6 +65,9 @@ pub struct Edit {
     /// 부분 보정 마스크.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub masks: Vec<Mask>,
+    /// 피부 보정의 세기 (0~1).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub skin: f32,
 }
 
 /// 사진에 입힐 LUT 파일과 강도.
@@ -90,6 +93,7 @@ impl Default for Edit {
             lut: None,
             frame: None,
             masks: Vec::new(),
+            skin: 0.0,
         }
     }
 }
@@ -589,5 +593,27 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
         assert_eq!(loaded.edit(0, "a.ARW").masks, masks, "{text}");
         assert!(!toml::to_string(&Edit::default()).unwrap().contains("masks"));
+    }
+
+    #[test]
+    fn the_skin_retouch_strength_is_saved_per_photo() {
+        let dir = temp("skin");
+        let path = dir.join("p.amsil");
+        let mut project = sample();
+        project.set_edit(
+            0,
+            "a.ARW",
+            Edit {
+                skin: 0.5,
+                ..Edit::default()
+            },
+        );
+        project.save(&path).unwrap();
+        let loaded = Project::load(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(text.contains("skin = 0.5"), "{text}");
+        assert_eq!(loaded.edit(0, "a.ARW").skin, 0.5);
+        assert!(!toml::to_string(&Edit::default()).unwrap().contains("skin"));
     }
 }
