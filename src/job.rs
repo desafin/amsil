@@ -1,6 +1,7 @@
 //! 일괄 처리: 폴더 탐색, 메모리 예산 안에서의 동시 실행, 진행률과 남은 시간.
 
 use crate::Result;
+use crate::lang::t;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::SeqCst;
@@ -130,14 +131,63 @@ impl Eta {
 /// 진행 막대 옆에 쓰는 문구. 30초 넘게 진행이 없으면 남은 시간 대신 그 사실을 알린다.
 pub fn describe_remaining(remaining: Option<f64>, idle: f64) -> String {
     if idle > STALL_AFTER {
-        return format!("응답 대기 중 (마지막 진행 {idle:.0}초 전)");
+        return t(
+            format!("응답 대기 중 (마지막 진행 {idle:.0}초 전)"),
+            format!("waiting for a response (last progress {idle:.0} s ago)"),
+        );
     }
     match remaining {
-        None => "남은 시간 계산 중".into(),
-        Some(s) if s < 60.0 => format!("약 {:.0}초 남음", (s / 10.0).ceil() * 10.0),
-        Some(s) if s < 3600.0 => format!("약 {:.0}분 남음", s / 60.0),
-        Some(s) => format!("약 {}시간 {}분 남음", s as u64 / 3600, s as u64 % 3600 / 60),
+        None => t("남은 시간 계산 중", "estimating time left").into(),
+        Some(s) if s < 60.0 => {
+            let seconds = (s / 10.0).ceil() * 10.0;
+            t(
+                format!("약 {seconds:.0}초 남음"),
+                format!("about {seconds:.0} s left"),
+            )
+        }
+        Some(s) if s < 3600.0 => {
+            let minutes = s / 60.0;
+            t(
+                format!("약 {minutes:.0}분 남음"),
+                format!("about {minutes:.0} min left"),
+            )
+        }
+        Some(s) => {
+            let (hours, minutes) = (s as u64 / 3600, s as u64 % 3600 / 60);
+            t(
+                format!("약 {hours}시간 {minutes}분 남음"),
+                format!("about {hours} h {minutes} min left"),
+            )
+        }
     }
+}
+
+/// 자원 사용량 한 줄. 메모리는 바이트로 받는다.
+pub fn describe_resources(
+    cpu: f32,
+    memory: u64,
+    memory_limit: u64,
+    gpu: f32,
+    running: usize,
+    low_memory: bool,
+) -> String {
+    const GB: f64 = (1u64 << 30) as f64;
+    let (used, limit) = (memory as f64 / GB, memory_limit as f64 / GB);
+    let mut text = t(
+        format!(
+            "CPU {cpu:.0}% · 메모리 {used:.1}/{limit:.1}GB · GPU {gpu:.0}% · 처리 중 {running}장"
+        ),
+        format!(
+            "CPU {cpu:.0}% · Memory {used:.1}/{limit:.1} GB · GPU {gpu:.0}% · Working on {running}"
+        ),
+    );
+    if low_memory {
+        text.push_str(t(
+            " · 메모리가 부족해 동시 처리 수를 줄였습니다",
+            " · Low on memory, so fewer photos run at once",
+        ));
+    }
+    text
 }
 
 /// 이만큼(초) 진행 신호가 없으면 멈춘 것일 수 있다고 알린다.
@@ -235,7 +285,9 @@ pub fn run_batch(batch: &Batch, mut tick: impl FnMut(&Status)) -> Outcome {
                             Err(error) => {
                                 if is_disk_full(error.as_ref()) {
                                     stop.store(true, SeqCst);
-                                    outcome.stopped = Some("디스크가 가득 찼습니다".into());
+                                    outcome.stopped = Some(
+                                        t("디스크가 가득 찼습니다", "The disk is full").into(),
+                                    );
                                 }
                                 outcome.failed.push((task.input.clone(), error.to_string()));
                             }
@@ -257,7 +309,7 @@ pub fn run_batch(batch: &Batch, mut tick: impl FnMut(&Status)) -> Outcome {
         && batch.cancel.load(SeqCst)
         && outcome.done + outcome.skipped + outcome.failed.len() < total
     {
-        outcome.stopped = Some("취소했습니다".into());
+        outcome.stopped = Some(t("취소했습니다", "Cancelled").into());
     }
     tick(&Status {
         total,
@@ -291,10 +343,10 @@ fn run_one(batch: &Batch, task: &Task, stop: &AtomicBool, partial: &AtomicU32) -
     let available = (batch.available)();
     if cost > batch.budget.limit && cost > available {
         const GB: f64 = (1u64 << 30) as f64;
-        return Err(format!(
-            "메모리 부족 (필요 {:.1}GB, 사용 가능 {:.1}GB)",
-            cost as f64 / GB,
-            available as f64 / GB
+        let (needed, free) = (cost as f64 / GB, available as f64 / GB);
+        return Err(t(
+            format!("메모리 부족 (필요 {needed:.1}GB, 사용 가능 {free:.1}GB)"),
+            format!("Not enough memory (needs {needed:.1} GB, {free:.1} GB available)"),
         )
         .into());
     }
@@ -761,6 +813,22 @@ mod tests {
         assert!(
             reason.contains("메모리") && reason.contains("40.0") && reason.contains("16.0"),
             "{reason}"
+        );
+    }
+
+    #[test]
+    fn remaining_time_is_described_in_english_too() {
+        crate::lang::set(crate::lang::Lang::En);
+        assert_eq!(describe_remaining(Some(40.0), 0.0), "about 40 s left");
+        assert_eq!(describe_remaining(Some(372.0), 0.0), "about 6 min left");
+        assert_eq!(
+            describe_remaining(Some(3900.0), 0.0),
+            "about 1 h 5 min left"
+        );
+        assert_eq!(describe_remaining(None, 2.0), "estimating time left");
+        assert_eq!(
+            describe_remaining(Some(372.0), 45.0),
+            "waiting for a response (last progress 45 s ago)"
         );
     }
 }

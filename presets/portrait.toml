@@ -1,4 +1,5 @@
 name = "인물"
+name_en = "Portrait"
 category = "portrait"
 
 [params]

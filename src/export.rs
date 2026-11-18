@@ -3,6 +3,7 @@
 
 use crate::edit::Params;
 use crate::gpu::{self, Denoiser};
+use crate::lang::t;
 use crate::lut::Lut;
 use crate::{Result, denoise, develop, heif, job, raw};
 use std::collections::HashMap;
@@ -102,7 +103,7 @@ pub fn load(
 ) -> Result<Loaded> {
     let timing = Timing::start();
     let raw = raw::decode(input)?;
-    timing.mark("읽기");
+    timing.mark(t("읽기", "read"));
     progress(0.15);
     let cam = match denoise {
         Some((model, strength)) if strength > 0.0 => {
@@ -128,7 +129,7 @@ pub fn load(
         }
         _ => raw.demosaic()?,
     };
-    timing.mark("디모자익/노이즈 제거");
+    timing.mark(t("디모자익/노이즈 제거", "demosaic/denoise"));
     progress(0.6);
     Ok(Loaded {
         cam,
@@ -150,7 +151,7 @@ pub fn render(
     let timing = Timing::start();
     let loaded = load(input, denoise, progress)?;
     let image = loaded.develop(&loaded.cam, params, lut);
-    timing.mark("현상");
+    timing.mark(t("현상", "develop"));
     progress(0.75);
     Ok(Rendered {
         image,
@@ -174,7 +175,7 @@ pub fn convert(
     let timing = Timing::start();
     let Rendered { image, exif } = render(input, denoise, params, lut, progress)?;
     let encoded = heif::encode(&image, quality, Some(&exif), encoder_threads)?;
-    timing.mark("인코딩");
+    timing.mark(t("인코딩", "encode"));
     progress(0.98);
 
     // 임시 파일에 쓰고 이름을 바꾼다. 도중에 꺼져도 반쯤 쓰인 출력 파일이 남지 않는다.
@@ -183,9 +184,10 @@ pub fn convert(
     std::fs::write(&tmp, encoded.bytes)?;
     std::fs::rename(&tmp, output)?;
     Ok((encoded.quality < quality).then(|| {
-        format!(
-            "파일이 너무 커져서 품질을 {quality}에서 {}(으)로 낮췄습니다",
-            encoded.quality
+        let lowered = encoded.quality;
+        t(
+            format!("파일이 너무 커져서 품질을 {quality}에서 {lowered}(으)로 낮췄습니다"),
+            format!("The file got too large, so quality was lowered from {quality} to {lowered}"),
         )
     }))
 }
@@ -206,8 +208,9 @@ impl Timing {
     fn mark(&self, stage: &str) {
         if let Some(last) = &self.0 {
             eprintln!(
-                "  {stage}: {:.2}초",
-                last.replace(Instant::now()).elapsed().as_secs_f32()
+                "  {stage}: {:.2}{}",
+                last.replace(Instant::now()).elapsed().as_secs_f32(),
+                t("초", " s")
             );
         }
     }
@@ -217,9 +220,14 @@ impl Timing {
 pub fn load_denoiser() -> Result<Denoiser> {
     let path = gpu::model_dir().join(gpu::DENOISE_MODEL);
     if !path.exists() {
-        return Err(format!(
-            "노이즈 제거 모델이 없습니다: {}\nscripts/fetch-models.sh 를 실행해 받으세요.",
-            path.display()
+        let path = path.display();
+        return Err(t(
+            format!(
+                "노이즈 제거 모델이 없습니다: {path}\nscripts/fetch-models.sh 를 실행해 받으세요."
+            ),
+            format!(
+                "The denoise model is missing: {path}\nRun scripts/fetch-models.sh to download it."
+            ),
         )
         .into());
     }
@@ -232,12 +240,20 @@ pub fn cpu_notice(denoiser: &Denoiser) -> Option<String> {
         return None;
     };
     // 2,400만 화소 사진 한 장이 48타일이다.
-    Some(format!(
-        "GPU 가속을 쓸 수 없어 CPU로 실행합니다. 노이즈 제거가 느립니다 \
-         (2,400만 화소 사진 한 장에 약 {:.0}초).\n\
-         해결: Vulkan 드라이버를 설치하세요 (NVIDIA는 전용 드라이버, AMD·Intel은 mesa-vulkan-drivers). \
-         `vulkaninfo`로 확인할 수 있습니다.\n원인: {reason}",
-        denoiser.tile_seconds * 48.0
+    let seconds = denoiser.tile_seconds * 48.0;
+    Some(t(
+        format!(
+            "GPU 가속을 쓸 수 없어 CPU로 실행합니다. 노이즈 제거가 느립니다 \
+             (2,400만 화소 사진 한 장에 약 {seconds:.0}초).\n\
+             해결: Vulkan 드라이버를 설치하세요 (NVIDIA는 전용 드라이버, AMD·Intel은 mesa-vulkan-drivers). \
+             `vulkaninfo`로 확인할 수 있습니다.\n원인: {reason}"
+        ),
+        format!(
+            "GPU acceleration is not available, so the AI runs on the CPU. Noise reduction is slow \
+             (about {seconds:.0} s for one 24-megapixel photo).\n\
+             Fix: install a Vulkan driver (the vendor driver for NVIDIA, mesa-vulkan-drivers for AMD and Intel). \
+             You can check with `vulkaninfo`.\nCause: {reason}"
+        ),
     ))
 }
 
@@ -359,10 +375,14 @@ pub fn run(
     mut report: impl FnMut(&Report),
 ) -> Result<(job::Outcome, Warnings)> {
     if photos.is_empty() {
-        return Err("변환할 사진이 없습니다".into());
+        return Err(t("변환할 사진이 없습니다", "No photos to convert").into());
     }
     if denoiser.is_none() && photos.iter().any(|photo| photo.denoise > 0.0) {
-        return Err("노이즈 제거 모델이 준비되지 않았습니다".into());
+        return Err(t(
+            "노이즈 제거 모델이 준비되지 않았습니다",
+            "The denoise model is not loaded",
+        )
+        .into());
     }
     let tasks: Vec<job::Task> = photos
         .iter()

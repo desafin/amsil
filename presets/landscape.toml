@@ -1,4 +1,5 @@
 name = "풍경"
+name_en = "Landscape"
 category = "landscape"
 
 [params]

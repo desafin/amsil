@@ -7,6 +7,7 @@
 use crate::edit::Params;
 use crate::export::{self, Report};
 use crate::job::Outcome;
+use crate::lang::{self, Lang, t};
 use crate::preset::{self, Preset};
 use crate::preview::Pixels;
 use crate::project::{Config, Edit, Folder, LutRef, Project};
@@ -156,6 +157,8 @@ pub enum Action {
     DismissExport,
     /// 화면 갈무리를 저장한다.
     SaveScreenshot(Pixels),
+    /// 화면과 메시지의 언어를 바꾼다.
+    SetLanguage(Lang),
 
     Thumbnail {
         index: usize,
@@ -191,6 +194,8 @@ pub enum Effect {
         settings: export::Settings,
     },
     CancelExport,
+    /// AI를 GPU로 돌릴 수 있는지 (다시) 알아본다. 결과는 `Action::Backend`로 온다.
+    ProbeBackend,
 }
 
 impl App {
@@ -227,7 +232,9 @@ impl App {
                 let path = path.with_extension("amsil");
                 let name = path
                     .file_stem()
-                    .map_or("이름 없음".into(), |n| n.to_string_lossy().into_owned());
+                    .map_or(t("이름 없음", "Untitled").into(), |n| {
+                        n.to_string_lossy().into_owned()
+                    });
                 let project = Project::new(&name);
                 project.save(&path)?;
                 return self.enter(path, project);
@@ -242,8 +249,19 @@ impl App {
             }
             Action::SaveScreenshot(pixels) => {
                 let path = self.save_screenshot(&pixels)?;
-                self.notice = Some(format!("스크린샷을 저장했습니다: {}", path.display()));
+                let path = path.display();
+                self.notice = Some(t(
+                    format!("스크린샷을 저장했습니다: {path}"),
+                    format!("Screenshot saved: {path}"),
+                ));
                 return Ok(Vec::new());
+            }
+            Action::SetLanguage(chosen) => {
+                lang::set(chosen);
+                self.config.lang = Some(chosen);
+                self.config.save(&self.config_path)?;
+                // 앞서 받아 둔 AI 안내 문구는 옛 언어로 되어 있다. 새 언어로 다시 받는다.
+                return Ok(vec![Effect::ProbeBackend]);
             }
             _ => {}
         }
@@ -256,14 +274,17 @@ impl App {
             Action::NewProject(_)
             | Action::OpenProject(_)
             | Action::SaveScreenshot(_)
+            | Action::SetLanguage(_)
             | Action::Backend(_) => {
                 unreachable!()
             }
             Action::CloseProject => {
                 if matches!(open.export, ExportState::Running { .. }) {
-                    return Err(
-                        "내보내는 중에는 프로젝트를 닫을 수 없습니다. 먼저 취소하세요.".into(),
-                    );
+                    return Err(t(
+                        "내보내는 중에는 프로젝트를 닫을 수 없습니다. 먼저 취소하세요.",
+                        "The project cannot be closed while exporting. Cancel the export first.",
+                    )
+                    .into());
                 }
                 open.save()?;
                 self.open = None;
@@ -275,13 +296,20 @@ impl App {
                     .iter()
                     .any(|folder| folder.path == path)
                 {
-                    return Err("이미 가져온 폴더입니다".into());
+                    return Err(t(
+                        "이미 가져온 폴더입니다",
+                        "This folder has already been imported",
+                    )
+                    .into());
                 }
                 let files = crate::job::scan(&path)?;
                 if files.is_empty() {
-                    return Err(
-                        format!("이 폴더에는 RAW 파일이 없습니다: {}", path.display()).into(),
-                    );
+                    let path = path.display();
+                    return Err(t(
+                        format!("이 폴더에는 RAW 파일이 없습니다: {path}"),
+                        format!("No RAW files in this folder: {path}"),
+                    )
+                    .into());
                 }
                 let folder = open.project.folders.len();
                 open.project.folders.push(Folder {
@@ -375,7 +403,9 @@ impl App {
                     return Ok(effects);
                 }
                 let Some(out) = open.project.export.folder.clone() else {
-                    return Err("출력 폴더를 먼저 정하세요".into());
+                    return Err(
+                        t("출력 폴더를 먼저 정하세요", "Choose an output folder first").into(),
+                    );
                 };
                 let names = open.project.export_names();
                 let photos: Vec<export::Photo> = (0..open.photos.len())
@@ -395,7 +425,7 @@ impl App {
                     })
                     .collect();
                 if photos.is_empty() {
-                    return Err("내보낼 사진이 없습니다".into());
+                    return Err(t("내보낼 사진이 없습니다", "No photos to export").into());
                 }
                 let existing = photos.iter().filter(|photo| photo.output.exists()).count();
                 if existing > 0 {
@@ -497,8 +527,13 @@ impl App {
         self.open = Some(open);
         self.config.remember(&path);
         self.config.save(&self.config_path)?;
-        self.notice = (!missing.is_empty())
-            .then(|| format!("폴더를 찾을 수 없습니다: {}", missing.join(", ")));
+        self.notice = (!missing.is_empty()).then(|| {
+            let missing = missing.join(", ");
+            t(
+                format!("폴더를 찾을 수 없습니다: {missing}"),
+                format!("Folder not found: {missing}"),
+            )
+        });
         Ok(if wanted.is_empty() {
             Vec::new()
         } else {
@@ -516,7 +551,7 @@ impl App {
                 .unwrap_or(Path::new("."))
                 .to_owned(),
         };
-        let dir = base.join("스크린샷");
+        let dir = base.join(t("스크린샷", "screenshots"));
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(
             chrono::Local::now()
@@ -1410,5 +1445,37 @@ mod tests {
         assert_eq!((image.width(), image.height()), (2, 1));
         assert_eq!(image.into_raw(), [255, 0, 0, 255, 0, 0, 255, 255]);
         assert!(fx.app.notice.as_ref().unwrap().contains("스크린샷"));
+    }
+
+    #[test]
+    fn choosing_a_language_saves_it_and_later_messages_use_it() {
+        use crate::lang::{self, Lang};
+        let mut fx = Fixture::new("lang");
+        // 프로젝트를 열기 전(시작 화면)에도 바꿀 수 있다.
+        let effects = fx.app.handle(Action::SetLanguage(Lang::En));
+        assert_eq!(
+            effects,
+            [Effect::ProbeBackend],
+            "받아 둔 AI 안내 문구도 새 언어로 다시 만든다"
+        );
+        assert_eq!(lang::current(), Lang::En);
+        assert_eq!(
+            Config::load(&fx.dir.join("config/config.toml")).lang,
+            Some(Lang::En)
+        );
+
+        fx.app.handle(Action::NewProject(fx.dir.join("trip.amsil")));
+        fx.app.handle(Action::Export {
+            only_selected: false,
+        });
+        assert_eq!(
+            fx.app.notice.as_deref(),
+            Some("Choose an output folder first")
+        );
+        fx.app.handle(Action::SetLanguage(Lang::Ko));
+        fx.app.handle(Action::Export {
+            only_selected: false,
+        });
+        assert_eq!(fx.app.notice.as_deref(), Some("출력 폴더를 먼저 정하세요"));
     }
 }

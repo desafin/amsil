@@ -1,4 +1,5 @@
 name = "야경"
+name_en = "Night"
 category = "night"
 
 [params]

@@ -37,7 +37,7 @@ pub struct Workers {
     /// 결과가 도착했으니 화면을 다시 그리라고 알린다.
     wake: Arc<dyn Fn() + Send + Sync>,
     /// 노이즈 제거 모델. 처음 필요할 때 읽고 미리보기와 내보내기가 함께 쓴다.
-    denoiser: Arc<Mutex<Option<std::result::Result<SharedDenoiser, String>>>>,
+    denoiser: Arc<Mutex<Option<SharedDenoiser>>>,
     cancel: Arc<AtomicBool>,
     /// 가장 최근의 미리보기 요청 번호.
     latest_preview: Arc<AtomicU64>,
@@ -82,8 +82,8 @@ impl Workers {
         self.preview_side.store(side as u64, SeqCst);
     }
 
-    /// 모델을 읽어 GPU를 쓸 수 있는지 알아본다. 프로그램을 켤 때 한 번 부른다.
-    pub fn probe_backend(&self) {
+    /// 모델을 읽어 GPU를 쓸 수 있는지 알아본다. 프로그램을 켤 때와 언어를 바꿀 때 한다.
+    fn probe_backend(&self) {
         let workers = self.clone();
         std::thread::spawn(move || {
             let backend = match workers.denoiser() {
@@ -98,15 +98,16 @@ impl Workers {
     }
 
     fn denoiser(&self) -> std::result::Result<SharedDenoiser, String> {
-        self.denoiser
-            .lock()
-            .unwrap()
-            .get_or_insert_with(|| {
-                export::load_denoiser()
-                    .map(|denoiser| Arc::new(Mutex::new(denoiser)))
-                    .map_err(|e| e.to_string())
-            })
-            .clone()
+        let mut slot = self.denoiser.lock().unwrap();
+        if let Some(denoiser) = slot.as_ref() {
+            return Ok(denoiser.clone());
+        }
+        // 실패는 기억해 두지 않는다. 모델 파일을 받아 놓으면 다음에는 읽힌다.
+        let denoiser = Arc::new(Mutex::new(
+            export::load_denoiser().map_err(|e| e.to_string())?,
+        ));
+        *slot = Some(denoiser.clone());
+        Ok(denoiser)
     }
 
     /// 사진을 읽는다. 방금 읽은 사진(같은 노이즈 제거 레벨)이면 다시 읽지 않는다.
@@ -243,6 +244,7 @@ impl Workers {
                 });
             }
             Effect::CancelExport => self.cancel.store(true, SeqCst),
+            Effect::ProbeBackend => self.probe_backend(),
         }
     }
 }

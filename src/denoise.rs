@@ -2,6 +2,7 @@
 //!
 //! 규칙은 darktable-ai의 `rawdenoise-nind` 데모와 같다. 모델 실행 자체는 `infer` 함수로 받는다.
 
+use crate::lang::t;
 use crate::{Image, Result};
 use rayon::prelude::*;
 
@@ -93,7 +94,11 @@ pub fn run_tiled(
 
             let out = infer(&tile)?;
             if out.len() != 3 * out_side * out_side {
-                return Err(format!("모델 출력 크기가 예상과 다릅니다 ({})", out.len()).into());
+                return Err(t(
+                    format!("모델 출력 크기가 예상과 다릅니다 ({})", out.len()),
+                    format!("Unexpected model output size ({})", out.len()),
+                )
+                .into());
             }
             for (c, plane) in planes.iter_mut().enumerate() {
                 for y in 0..core_h * SCALE {

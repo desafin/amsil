@@ -2,6 +2,7 @@
 
 use crate::Result;
 use crate::edit::Params;
+use crate::lang::t;
 use serde::Deserialize;
 use std::path::Path;
 
@@ -13,11 +14,21 @@ pub struct Preset {
     pub id: String,
     /// 화면에 보이는 이름.
     pub name: String,
+    /// 영어 화면에 보이는 이름. 없으면 `name`을 쓴다.
+    #[serde(default)]
+    pub name_en: Option<String>,
     /// 자동 추천에 쓰는 분류 (food, portrait, landscape, night 등).
     #[serde(default)]
     pub category: Option<String>,
     #[serde(default)]
     pub params: Params,
+}
+
+impl Preset {
+    /// 지금 언어로 된 이름.
+    pub fn label(&self) -> &str {
+        t(&self.name, self.name_en.as_ref().unwrap_or(&self.name))
+    }
 }
 
 /// 프로그램에 들어 있는 기본 프리셋.
@@ -61,8 +72,12 @@ pub fn load_dir(dir: &Path) -> (Vec<Preset>, Vec<String>) {
 
 /// TOML 글에서 프리셋 하나를 읽는다.
 pub fn parse(id: &str, text: &str) -> Result<Preset> {
-    let mut preset: Preset =
-        toml::from_str(text).map_err(|e| format!("프리셋 {id}을(를) 읽을 수 없습니다: {e}"))?;
+    let mut preset: Preset = toml::from_str(text).map_err(|e| {
+        t(
+            format!("프리셋 {id}을(를) 읽을 수 없습니다: {e}"),
+            format!("Cannot read preset {id}: {e}"),
+        )
+    })?;
     preset.id = id.to_owned();
     Ok(preset)
 }
@@ -162,5 +177,31 @@ mod tests {
             resolve(&presets, Some("지워진 프리셋"), 1.0, &manual),
             manual
         );
+    }
+
+    #[test]
+    fn presets_are_labelled_in_the_current_language() {
+        let builtin = builtin();
+        let labels = |presets: &[Preset]| -> Vec<String> {
+            presets
+                .iter()
+                .map(|preset| preset.label().to_owned())
+                .collect()
+        };
+        assert_eq!(labels(&builtin), ["음식", "인물", "풍경", "야경", "흑백"]);
+        // 영어 이름이 없는 사용자 프리셋은 원래 이름을 그대로 쓴다.
+        let mine = parse("mine", "name = \"따뜻한 오후\"").unwrap();
+        let named = parse(
+            "named",
+            "name = \"따뜻한 오후\"\nname_en = \"Warm afternoon\"",
+        )
+        .unwrap();
+        crate::lang::set(crate::lang::Lang::En);
+        assert_eq!(
+            labels(&builtin),
+            ["Food", "Portrait", "Landscape", "Night", "Black & white"]
+        );
+        assert_eq!(mine.label(), "따뜻한 오후");
+        assert_eq!(named.label(), "Warm afternoon");
     }
 }

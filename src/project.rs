@@ -4,6 +4,7 @@
 
 use crate::Result;
 use crate::edit::Params;
+use crate::lang::t;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -117,16 +118,30 @@ impl Project {
         struct Header {
             version: u32,
         }
-        let header: Header =
-            toml::from_str(&text).map_err(|e| format!("프로젝트 파일이 아닙니다 ({e})"))?;
+        let header: Header = toml::from_str(&text).map_err(|e| {
+            t(
+                format!("프로젝트 파일이 아닙니다 ({e})"),
+                format!("Not a project file ({e})"),
+            )
+        })?;
         if header.version != VERSION {
-            return Err(format!(
-                "이 프로젝트 파일은 버전 {}이고, 이 프로그램은 버전 {VERSION}만 읽을 수 있습니다",
-                header.version
+            let found = header.version;
+            return Err(t(
+                format!(
+                    "이 프로젝트 파일은 버전 {found}이고, 이 프로그램은 버전 {VERSION}만 읽을 수 있습니다"
+                ),
+                format!(
+                    "This project file is version {found}, and this program can only read version {VERSION}"
+                ),
             )
             .into());
         }
-        Ok(toml::from_str(&text).map_err(|e| format!("프로젝트 파일을 읽을 수 없습니다 ({e})"))?)
+        Ok(toml::from_str(&text).map_err(|e| {
+            t(
+                format!("프로젝트 파일을 읽을 수 없습니다 ({e})"),
+                format!("Cannot read the project file ({e})"),
+            )
+        })?)
     }
 
     /// 임시 파일에 쓴 뒤 이름을 바꾼다. 저장 도중 꺼져도 기존 파일이 깨지지 않는다.
@@ -164,7 +179,9 @@ impl Project {
                 let name = folder
                     .path
                     .file_name()
-                    .map_or("사진".into(), |n| n.to_string_lossy().into_owned());
+                    .map_or(t("사진", "photos").into(), |n| {
+                        n.to_string_lossy().into_owned()
+                    });
                 let count = seen.entry(name.clone()).or_insert(0);
                 *count += 1;
                 if *count == 1 {
@@ -191,6 +208,9 @@ fn write_atomically(path: &Path, text: &str) -> Result<()> {
 /// 프로그램 설정 (`~/.config/amsil/config.toml`).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Config {
+    /// 화면에서 고른 언어. 고른 적이 없으면 시스템 언어를 따른다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lang: Option<crate::lang::Lang>,
     /// 최근에 연 프로젝트. 최신이 맨 앞.
     #[serde(default)]
     pub recent: Vec<PathBuf>,
@@ -465,5 +485,20 @@ mod tests {
         config.save(&path).unwrap();
         assert_eq!(Config::load(&path), config);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_chosen_language_is_saved_and_absent_until_chosen() {
+        let dir = std::env::temp_dir().join(format!("amsil-config-lang-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        let mut config = Config::load(&path);
+        assert_eq!(config.lang, None, "고르기 전에는 시스템 언어를 따른다");
+        config.lang = Some(crate::lang::Lang::En);
+        config.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let loaded = Config::load(&path);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(text.contains("lang = \"en\""), "{text}");
+        assert_eq!(loaded.lang, Some(crate::lang::Lang::En));
     }
 }

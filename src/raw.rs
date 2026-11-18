@@ -1,6 +1,7 @@
 //! RAW 파일을 읽어 카메라 RGB와 현상에 필요한 값들을 꺼낸다.
 
 use crate::denoise::{Packed, pack_rggb};
+use crate::lang::t;
 use crate::{Image, Result};
 use rawler::RawImage;
 use rawler::cfa::{CFA, CFAColor};
@@ -41,7 +42,11 @@ impl Raw {
         let Intermediate::ThreeColor(rgb) =
             RawDevelop::new_with(&steps).develop_intermediate(&self.image)?
         else {
-            return Err("RGB 컬러 센서만 지원합니다".into());
+            return Err(t(
+                "RGB 컬러 센서만 지원합니다",
+                "Only RGB colour sensors are supported",
+            )
+            .into());
         };
         let planes = [0, 1, 2].map(|c| rgb.data.iter().map(|px| px[c]).collect());
         Ok(Image {
@@ -78,7 +83,11 @@ impl Raw {
         // 모델 출력의 (0, 0)은 센서의 첫 R 화소 자리다.
         let (ox, oy) = self.rggb_offset;
         if x < ox || y < oy || x - ox + w > full.width || y - oy + h > full.height {
-            return Err("모델 출력이 출력 영역을 다 덮지 못합니다".into());
+            return Err(t(
+                "모델 출력이 출력 영역을 다 덮지 못합니다",
+                "The model output does not cover the whole picture",
+            )
+            .into());
         }
         let (x, y) = (x - ox, y - oy);
         let planes = [0, 1, 2].map(|c| {
@@ -145,8 +154,13 @@ pub fn pixel_count(path: &Path) -> Result<u64> {
 
 /// 파일 형식에 맞는 디코더를 찾는다.
 fn decoder(source: &RawSource) -> Result<Box<dyn rawler::decoders::Decoder>> {
-    rawler::get_decoder(source)
-        .map_err(|e| format!("지원하지 않거나 손상된 RAW 파일입니다 ({e})").into())
+    rawler::get_decoder(source).map_err(|e| {
+        t(
+            format!("지원하지 않거나 손상된 RAW 파일입니다 ({e})"),
+            format!("Unsupported or damaged RAW file ({e})"),
+        )
+        .into()
+    })
 }
 
 pub fn decode(path: &Path) -> Result<Raw> {
@@ -160,7 +174,10 @@ pub fn decode(path: &Path) -> Result<Raw> {
         RawPhotometricInterpretation::Cfa(config) => rggb_offset(&config.cfa),
         _ => None,
     }
-    .ok_or("RGB Bayer 센서만 지원합니다")?;
+    .ok_or(t(
+        "RGB Bayer 센서만 지원합니다",
+        "Only RGB Bayer sensors are supported",
+    ))?;
     image.apply_scaling()?;
 
     let wb = image.wb_coeffs;
@@ -175,7 +192,10 @@ pub fn decode(path: &Path) -> Result<Raw> {
         .color_matrix
         .get(&Illuminant::D65)
         .filter(|m| m.len() >= 9)
-        .ok_or("이 카메라의 D65 색행렬이 없습니다")?;
+        .ok_or(t(
+            "이 카메라의 D65 색행렬이 없습니다",
+            "No D65 colour matrix for this camera",
+        ))?;
     let xyz_to_cam = [0, 1, 2].map(|i| [m[i * 3], m[i * 3 + 1], m[i * 3 + 2]]);
 
     // rawler의 `RawImage::orientation`은 항상 Normal이다. 실제 방향은 EXIF에 있다.

@@ -1,7 +1,8 @@
 //! 명령행 도구.
 
 use crate::edit::Params;
-use crate::export::{self, GB, Photo, Report, Settings};
+use crate::export::{self, Photo, Report, Settings};
+use crate::lang::t;
 use crate::{Result, job, preset};
 use std::ffi::OsString;
 use std::io::IsTerminal;
@@ -33,17 +34,33 @@ pub struct Args {
     lut_strength: f32,
 }
 
-pub const USAGE: &str = "사용법: amsil [옵션] <입력 RAW> <출력.heic>
+/// 사용법 안내.
+pub fn usage() -> &'static str {
+    t(
+        "사용법: amsil [옵션] <입력 RAW> <출력.heic>
         amsil [옵션] <입력 폴더> <출력 폴더>     하위 폴더까지 전부 변환
 옵션:
-  --denoise[=강도]  AI 노이즈 제거 (강도 0~1, 생략하면 1)
-  --preset=이름     프리셋 적용 (food, portrait, landscape, night, mono 또는 직접 만든 것)
-  --strength=강도   프리셋의 강도 (0~1.5, 기본 1)
-  --lut=파일        3D LUT(.cube)을 입힌다
+  --denoise[=강도]     AI 노이즈 제거 (강도 0~1, 생략하면 1)
+  --preset=이름        프리셋 적용 (food, portrait, landscape, night, mono 또는 직접 만든 것)
+  --strength=강도      프리셋의 강도 (0~1.5, 기본 1)
+  --lut=파일           3D LUT(.cube)을 입힌다
   --lut-strength=강도  LUT의 강도 (0~1, 기본 1)
-  --overwrite       이미 있는 출력 파일도 다시 만든다 (기본은 건너뜀)
-  --jobs=N          동시에 처리할 장수 (기본: CPU 코어 수)
-  --memory=GB       사용할 메모리 한도 (기본: 남은 메모리의 70%)";
+  --overwrite          이미 있는 출력 파일도 다시 만든다 (기본은 건너뜀)
+  --jobs=N             동시에 처리할 장수 (기본: CPU 코어 수)
+  --memory=GB          사용할 메모리 한도 (기본: 남은 메모리의 70%)",
+        "Usage: amsil [options] <input RAW> <output.heic>
+       amsil [options] <input folder> <output folder>     converts everything, subfolders included
+Options:
+  --denoise[=LEVEL]    AI noise reduction (0 to 1; 1 when no level is given)
+  --preset=NAME        apply a preset (food, portrait, landscape, night, mono, or one of your own)
+  --strength=X         preset strength (0 to 1.5, default 1)
+  --lut=FILE           apply a 3D LUT (.cube)
+  --lut-strength=X     LUT strength (0 to 1, default 1)
+  --overwrite          redo output files that already exist (skipped by default)
+  --jobs=N             photos to process at once (default: number of CPU cores)
+  --memory=GB          memory limit (default: 70% of the available memory)",
+    )
+}
 
 pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> std::result::Result<Args, String> {
     let (mut denoise, mut overwrite, mut jobs, mut memory_gb) = (0.0, false, None, None);
@@ -66,26 +83,23 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> std::result::Resu
                     .parse()
                     .ok()
                     .filter(|strength| (0.0..=1.0).contains(strength))
-                    .ok_or("노이즈 제거 강도는 0에서 1 사이의 숫자여야 합니다")?;
+                    .ok_or(t(
+                        "노이즈 제거 강도는 0에서 1 사이의 숫자여야 합니다",
+                        "The denoise level must be a number from 0 to 1",
+                    ))?;
             }
             ("--overwrite", None) => overwrite = true,
             ("--jobs", Some(value)) => {
-                jobs = Some(
-                    value
-                        .parse()
-                        .ok()
-                        .filter(|&n| n >= 1)
-                        .ok_or("--jobs에는 1 이상의 정수를 줘야 합니다")?,
-                );
+                jobs = Some(value.parse().ok().filter(|&n| n >= 1).ok_or(t(
+                    "--jobs에는 1 이상의 정수를 줘야 합니다",
+                    "--jobs needs a whole number, 1 or more",
+                ))?);
             }
             ("--memory", Some(value)) => {
-                memory_gb = Some(
-                    value
-                        .parse()
-                        .ok()
-                        .filter(|&gb| gb > 0.0)
-                        .ok_or("--memory에는 0보다 큰 숫자(GB)를 줘야 합니다")?,
-                );
+                memory_gb = Some(value.parse().ok().filter(|&gb| gb > 0.0).ok_or(t(
+                    "--memory에는 0보다 큰 숫자(GB)를 줘야 합니다",
+                    "--memory needs a number above 0 (in GB)",
+                ))?);
             }
             ("--preset", Some(value)) => preset = Some(value.to_owned()),
             ("--strength", Some(value)) => {
@@ -93,7 +107,10 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> std::result::Resu
                     .parse()
                     .ok()
                     .filter(|strength| (0.0..=1.5).contains(strength))
-                    .ok_or("프리셋 강도는 0에서 1.5 사이의 숫자여야 합니다")?;
+                    .ok_or(t(
+                        "프리셋 강도는 0에서 1.5 사이의 숫자여야 합니다",
+                        "The preset strength must be a number from 0 to 1.5",
+                    ))?;
             }
             ("--lut", Some(value)) => lut = Some(PathBuf::from(value)),
             ("--lut-strength", Some(value)) => {
@@ -101,9 +118,17 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> std::result::Resu
                     .parse()
                     .ok()
                     .filter(|strength| (0.0..=1.0).contains(strength))
-                    .ok_or("LUT 강도는 0에서 1 사이의 숫자여야 합니다")?;
+                    .ok_or(t(
+                        "LUT 강도는 0에서 1 사이의 숫자여야 합니다",
+                        "The LUT strength must be a number from 0 to 1",
+                    ))?;
             }
-            _ => return Err(format!("모르는 옵션: {option}")),
+            _ => {
+                return Err(t(
+                    format!("모르는 옵션: {option}"),
+                    format!("Unknown option: {option}"),
+                ));
+            }
         }
     }
     match <[PathBuf; 2]>::try_from(paths) {
@@ -119,7 +144,11 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> std::result::Resu
             lut,
             lut_strength,
         }),
-        Err(_) => Err("입력과 출력을 하나씩 지정해야 합니다".into()),
+        Err(_) => Err(t(
+            "입력과 출력을 하나씩 지정해야 합니다",
+            "Give exactly one input and one output",
+        )
+        .into()),
     }
 }
 
@@ -131,9 +160,10 @@ fn look(args: &Args) -> Result<Params> {
         && !presets.iter().any(|p| &p.id == id)
     {
         let known: Vec<&str> = presets.iter().map(|p| p.id.as_str()).collect();
-        return Err(format!(
-            "모르는 프리셋: {id}\n쓸 수 있는 프리셋: {}",
-            known.join(", ")
+        let known = known.join(", ");
+        return Err(t(
+            format!("모르는 프리셋: {id}\n쓸 수 있는 프리셋: {known}"),
+            format!("Unknown preset: {id}\nAvailable presets: {known}"),
         )
         .into());
     }
@@ -152,7 +182,7 @@ fn load_denoiser(needed: bool) -> Result<Option<Mutex<crate::gpu::Denoiser>>> {
     }
     let denoiser = export::load_denoiser()?;
     if let Some(notice) = export::cpu_notice(&denoiser) {
-        eprintln!("경고: {notice}");
+        eprintln!("{}: {notice}", t("경고", "Warning"));
     }
     Ok(Some(Mutex::new(denoiser)))
 }
@@ -164,7 +194,7 @@ fn run_folder(
 ) -> Result<(job::Outcome, export::Warnings)> {
     let files = job::scan(&args.input)?;
     if files.is_empty() {
-        return Err("RAW 파일을 찾지 못했습니다".into());
+        return Err(t("RAW 파일을 찾지 못했습니다", "No RAW files found").into());
     }
     let params = look(args)?;
     let photos: Vec<Photo> = files
@@ -197,24 +227,23 @@ fn run_folder(
 fn status_line(r: &Report) -> String {
     let total = r.status.total.max(1) as f64;
     let filled = (r.status.progress / total * 20.0) as usize;
-    let mut line = format!(
-        "[{}{}] {}/{} · {:.0}% · {} · CPU {:.0}% · 메모리 {:.1}/{:.1}GB · GPU {:.0}% · 처리 중 {}장",
+    format!(
+        "[{}{}] {}/{} · {:.0}% · {} · {}",
         "#".repeat(filled.min(20)),
         ".".repeat(20 - filled.min(20)),
         r.status.finished,
         r.status.total,
         r.status.progress / total * 100.0,
         job::describe_remaining(r.remaining, r.idle),
-        r.cpu,
-        r.memory as f64 / GB,
-        r.memory_limit as f64 / GB,
-        r.gpu,
-        r.status.running,
-    );
-    if r.low_memory {
-        line.push_str(" · 메모리가 부족해 동시 처리 수를 줄였습니다");
-    }
-    line
+        job::describe_resources(
+            r.cpu,
+            r.memory,
+            r.memory_limit,
+            r.gpu,
+            r.status.running,
+            r.low_memory
+        ),
+    )
 }
 
 pub fn run(args: &Args) -> Result<()> {
@@ -233,9 +262,9 @@ pub fn run(args: &Args) -> Result<()> {
             &|_| {},
         )?;
         if let Some(warning) = warning {
-            eprintln!("경고: {warning}");
+            eprintln!("{}: {warning}", t("경고", "Warning"));
         }
-        eprintln!("완료: {}", args.output.display());
+        eprintln!("{}: {}", t("완료", "Done"), args.output.display());
         return Ok(());
     }
 
@@ -256,21 +285,31 @@ pub fn run(args: &Args) -> Result<()> {
     if terminal {
         eprintln!();
     }
+    let (done, skipped, failed) = (outcome.done, outcome.skipped, outcome.failed.len());
     eprintln!(
-        "완료 {}장, 건너뜀 {}장, 실패 {}장",
-        outcome.done,
-        outcome.skipped,
-        outcome.failed.len()
+        "{}",
+        t(
+            format!("완료 {done}장, 건너뜀 {skipped}장, 실패 {failed}장"),
+            format!("Done {done}, skipped {skipped}, failed {failed}"),
+        )
     );
     for (file, warning) in &warnings {
-        eprintln!("  경고: {}: {warning}", file.display());
+        eprintln!("  {}: {}: {warning}", t("경고", "Warning"), file.display());
     }
     for (file, reason) in &outcome.failed {
-        eprintln!("  실패: {}: {reason}", file.display());
+        eprintln!("  {}: {}: {reason}", t("실패", "Failed"), file.display());
     }
     match outcome.stopped {
-        Some(reason) => Err(format!("끝까지 처리하지 못했습니다: {reason}").into()),
-        None if !outcome.failed.is_empty() => Err("일부 사진을 변환하지 못했습니다".into()),
+        Some(reason) => Err(t(
+            format!("끝까지 처리하지 못했습니다: {reason}"),
+            format!("Stopped before finishing: {reason}"),
+        )
+        .into()),
+        None if !outcome.failed.is_empty() => Err(t(
+            "일부 사진을 변환하지 못했습니다",
+            "Some photos could not be converted",
+        )
+        .into()),
         None => Ok(()),
     }
 }
@@ -426,6 +465,26 @@ mod tests {
         assert_eq!(
             status_line(&report),
             "[##########..........] 142/309 · 50% · 약 6분 남음 · CPU 87% · 메모리 18.0/24.0GB · GPU 96% · 처리 중 12장"
+        );
+    }
+
+    #[test]
+    fn usage_and_errors_follow_the_language() {
+        assert!(usage().starts_with("사용법"));
+        assert_eq!(
+            args(&["--nope", "in", "out"]).unwrap_err(),
+            "모르는 옵션: --nope"
+        );
+        crate::lang::set(crate::lang::Lang::En);
+        assert!(usage().starts_with("Usage"));
+        assert!(usage().contains("--lut-strength"));
+        assert_eq!(
+            args(&["--nope", "in", "out"]).unwrap_err(),
+            "Unknown option: --nope"
+        );
+        assert_eq!(
+            args(&["in"]).unwrap_err(),
+            "Give exactly one input and one output"
         );
     }
 }

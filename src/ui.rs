@@ -1,7 +1,8 @@
 //! 화면 그리기. 상태(`App`)를 읽어 그리고, 사용자가 한 일을 `Action`으로 돌려준다. 로직은 여기에 두지 않는다.
 
 use crate::app::{Action, App, Backend, ExportState, Open, ReportView};
-use crate::job::describe_remaining;
+use crate::job::{describe_remaining, describe_resources};
+use crate::lang::{self, Lang, t};
 use crate::preview::Pixels;
 use eframe::egui::{self, Align, Key, Layout, Panel, RichText, TextureHandle, TextureOptions};
 use std::collections::HashMap;
@@ -38,8 +39,6 @@ pub struct View {
     zoom: Zoom,
     zoomed_photo: Option<usize>,
 }
-
-const GB: f64 = (1u64 << 30) as f64;
 
 /// 원본 화소 하나를 화면 몇 점까지 키울 수 있는지 (4 = 400%).
 const MAX_ZOOM: f32 = 4.0;
@@ -89,26 +88,47 @@ pub fn draw(ui: &mut egui::Ui, app: &App, view: &mut View, env: &mut dyn Env) ->
     actions
 }
 
+/// 프로그램 이름.
+fn app_name() -> &'static str {
+    t("암실", "Amsil")
+}
+
+/// 언어를 고르는 단추. 지금 언어를 못 읽는 사람도 찾을 수 있게, 각 언어의 이름은 그 언어로 적는다.
+/// 오른쪽부터 채우는 자리에 놓으므로 뒤의 것이 왼쪽에 온다 (화면에는 "한국어 English" 순서).
+fn language_buttons(ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+    for (choice, name) in [(Lang::En, "English"), (Lang::Ko, "한국어")] {
+        let chosen = lang::current() == choice;
+        if ui.selectable_label(chosen, name).clicked() && !chosen {
+            actions.push(Action::SetLanguage(choice));
+        }
+    }
+}
+
 fn start_screen(ui: &mut egui::Ui, app: &App, env: &mut dyn Env, actions: &mut Vec<Action>) {
+    Panel::top("language").show(ui, |ui| {
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            language_buttons(ui, actions)
+        });
+    });
     egui::CentralPanel::default().show(ui, |ui| {
         ui.vertical_centered(|ui| {
             ui.add_space(ui.available_height() * 0.2);
-            ui.heading("암실");
-            ui.label("RAW 사진을 HEIF로");
+            ui.heading(app_name());
+            ui.label(t("RAW 사진을 HEIF로", "RAW photos to HEIF"));
             ui.add_space(24.0);
-            if ui.button("새 프로젝트").clicked()
+            if ui.button(t("새 프로젝트", "New project")).clicked()
                 && let Some(path) = env.new_project_path()
             {
                 actions.push(Action::NewProject(path));
             }
-            if ui.button("프로젝트 열기").clicked()
+            if ui.button(t("프로젝트 열기", "Open project")).clicked()
                 && let Some(path) = env.open_project_path()
             {
                 actions.push(Action::OpenProject(path));
             }
             if !app.config.recent.is_empty() {
                 ui.add_space(24.0);
-                ui.label("최근 프로젝트");
+                ui.label(t("최근 프로젝트", "Recent projects"));
                 for path in &app.config.recent {
                     let name = path.file_stem().map_or_else(
                         || path.display().to_string(),
@@ -147,12 +167,13 @@ fn workspace(
             report: Some(report),
         } => {
             format!(
-                "{:.0}% · {} · 암실",
+                "{:.0}% · {} · {}",
                 report.progress / (*total).max(1) as f64 * 100.0,
-                open.project.name
+                open.project.name,
+                app_name()
             )
         }
-        _ => format!("{} · 암실", open.project.name),
+        _ => format!("{} · {}", open.project.name, app_name()),
     };
     // 제목이 바뀔 때만 보낸다. 매번 보내면 화면이 쉬지 않고 다시 그려진다.
     if view.title != title {
@@ -165,25 +186,33 @@ fn workspace(
         ui.horizontal(|ui| {
             ui.strong(&open.project.name);
             ui.separator();
-            if ui.button("폴더 가져오기").clicked()
+            if ui.button(t("폴더 가져오기", "Import folder")).clicked()
                 && let Some(folder) = env.pick_folder()
             {
                 actions.push(Action::ImportFolder(folder));
             }
             if ui
-                .button("스크린샷")
-                .on_hover_text("지금 창을 PNG로 저장 (F12)")
+                .button(t("스크린샷", "Screenshot"))
+                .on_hover_text(t(
+                    "지금 창을 PNG로 저장 (F12)",
+                    "Save this window as a PNG (F12)",
+                ))
                 .clicked()
             {
                 env.screenshot(ui.ctx());
             }
             if ui
-                .add_enabled(!exporting, egui::Button::new("프로젝트 닫기"))
+                .add_enabled(
+                    !exporting,
+                    egui::Button::new(t("프로젝트 닫기", "Close project")),
+                )
                 .clicked()
             {
                 actions.push(Action::CloseProject);
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                language_buttons(ui, actions);
+                ui.separator();
                 backend_label(ui, app, view)
             });
         });
@@ -217,16 +246,18 @@ fn workspace(
 fn backend_label(ui: &mut egui::Ui, app: &App, view: &mut View) {
     match &app.backend {
         Backend::Unknown => {
-            ui.weak("AI 준비 중");
+            ui.weak(t("AI 준비 중", "Preparing AI"));
         }
         Backend::Gpu => {
-            ui.label("GPU")
-                .on_hover_text("AI 노이즈 제거를 GPU로 실행합니다");
+            ui.label("GPU").on_hover_text(t(
+                "AI 노이즈 제거를 GPU로 실행합니다",
+                "AI noise reduction runs on the GPU",
+            ));
         }
         Backend::Cpu(_) => {
             if ui
-                .link("CPU (느림)")
-                .on_hover_text("눌러서 해결 방법 보기")
+                .link(t("CPU (느림)", "CPU (slow)"))
+                .on_hover_text(t("눌러서 해결 방법 보기", "Click to see how to fix this"))
                 .clicked()
             {
                 view.show_backend_help = true;
@@ -234,8 +265,8 @@ fn backend_label(ui: &mut egui::Ui, app: &App, view: &mut View) {
         }
         Backend::Unavailable(_) => {
             if ui
-                .link("AI 모델 없음")
-                .on_hover_text("눌러서 해결 방법 보기")
+                .link(t("AI 모델 없음", "No AI model"))
+                .on_hover_text(t("눌러서 해결 방법 보기", "Click to see how to fix this"))
                 .clicked()
             {
                 view.show_backend_help = true;
@@ -247,10 +278,13 @@ fn backend_label(ui: &mut egui::Ui, app: &App, view: &mut View) {
 fn backend_help(ctx: &egui::Context, app: &App, view: &mut View) {
     let text = match &app.backend {
         Backend::Cpu(notice) | Backend::Unavailable(notice) => notice.as_str(),
-        _ => "AI 노이즈 제거를 GPU로 실행합니다.",
+        _ => t(
+            "AI 노이즈 제거를 GPU로 실행합니다.",
+            "AI noise reduction runs on the GPU.",
+        ),
     };
     let mut open = true;
-    egui::Window::new("AI 실행 환경")
+    egui::Window::new(t("AI 실행 환경", "AI backend"))
         .open(&mut open)
         .collapsible(false)
         .show(ctx, |ui| {
@@ -274,10 +308,10 @@ fn status_bar(ui: &mut egui::Ui, app: &App, open: &Open) {
                     ui.label(notice);
                 }
                 None => {
-                    ui.weak(format!(
-                        "사진 {}장 · 선택 {}장",
-                        open.photos.len(),
-                        open.selected.len()
+                    let (photos, selected) = (open.photos.len(), open.selected.len());
+                    ui.weak(t(
+                        format!("사진 {photos}장 · 선택 {selected}장"),
+                        format!("Photos: {photos} · Selected: {selected}"),
                     ));
                 }
             },
@@ -290,7 +324,7 @@ fn status_bar(ui: &mut egui::Ui, app: &App, open: &Open) {
                         report.progress,
                         describe_remaining(report.remaining, report.idle),
                     ),
-                    None => (0, 0.0, "준비 중".to_string()),
+                    None => (0, 0.0, t("준비 중", "Preparing").to_string()),
                 };
                 ui.label(format!("{finished}/{total} · {text}"));
                 ui.add(
@@ -303,18 +337,14 @@ fn status_bar(ui: &mut egui::Ui, app: &App, open: &Open) {
 }
 
 fn resources(report: &ReportView) -> String {
-    let mut text = format!(
-        "CPU {:.0}% · 메모리 {:.1}/{:.1}GB · GPU {:.0}% · 처리 중 {}장",
+    describe_resources(
         report.cpu,
-        report.memory as f64 / GB,
-        report.memory_limit as f64 / GB,
+        report.memory,
+        report.memory_limit,
         report.gpu,
-        report.running
-    );
-    if report.low_memory {
-        text.push_str(" · 메모리가 부족해 동시 처리 수를 줄였습니다");
-    }
-    text
+        report.running,
+        report.low_memory,
+    )
 }
 
 fn export_bar(
@@ -327,7 +357,10 @@ fn export_bar(
     let exporting = matches!(open.export, ExportState::Running { .. });
     ui.horizontal(|ui| {
         if ui
-            .add_enabled(!exporting, egui::Button::new("출력 폴더…"))
+            .add_enabled(
+                !exporting,
+                egui::Button::new(t("출력 폴더…", "Output folder…")),
+            )
             .clicked()
             && let Some(folder) = env.pick_folder()
         {
@@ -335,14 +368,14 @@ fn export_bar(
         }
         match &open.project.export.folder {
             Some(folder) => ui.label(folder.display().to_string()),
-            None => ui.weak("아직 정하지 않음"),
+            None => ui.weak(t("아직 정하지 않음", "Not chosen yet")),
         };
         ui.separator();
         let mut quality = view.quality.unwrap_or(open.project.export.quality);
         // 슬라이더에 이름을 붙여 둔다 (화면 낭독기와 테스트가 이 이름으로 찾는다).
         let slider = ui.add_enabled(
             !exporting,
-            egui::Slider::new(&mut quality, 40..=75).text("품질"),
+            egui::Slider::new(&mut quality, 40..=75).text(t("품질", "Quality")),
         );
         // 끄는 동안에는 화면에서만 바꾸고, 놓을 때 한 번 저장한다.
         if slider.dragged() {
@@ -353,11 +386,11 @@ fn export_bar(
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if exporting {
-                if ui.button("취소").clicked() {
+                if ui.button(t("취소", "Cancel")).clicked() {
                     actions.push(Action::CancelExport);
                 }
             } else {
-                if ui.button("전체 내보내기").clicked() {
+                if ui.button(t("전체 내보내기", "Export all")).clicked() {
                     actions.push(Action::Export {
                         only_selected: false,
                     });
@@ -365,7 +398,7 @@ fn export_bar(
                 if ui
                     .add_enabled(
                         !open.selected.is_empty(),
-                        egui::Button::new("선택 내보내기"),
+                        egui::Button::new(t("선택 내보내기", "Export selected")),
                     )
                     .clicked()
                 {
@@ -424,33 +457,39 @@ fn look_panel(
     env: &mut dyn Env,
     actions: &mut Vec<Action>,
 ) {
-    ui.heading("프리셋");
+    ui.heading(t("프리셋", "Presets"));
     let Some(current) = open.current else {
-        ui.weak("사진을 고르면 프리셋을 적용할 수 있습니다");
+        ui.weak(t(
+            "사진을 고르면 프리셋을 적용할 수 있습니다",
+            "Pick a photo to apply a preset",
+        ));
         return;
     };
     let edit = open.edit(current);
     ui.horizontal_wrapped(|ui| {
-        if ui.selectable_label(edit.preset.is_none(), "없음").clicked() {
+        if ui
+            .selectable_label(edit.preset.is_none(), t("없음", "None"))
+            .clicked()
+        {
             actions.push(Action::SetPreset(None));
         }
         for preset in &app.presets {
             let chosen = edit.preset.as_deref() == Some(preset.id.as_str());
-            if ui.selectable_label(chosen, &preset.name).clicked() {
+            if ui.selectable_label(chosen, preset.label()).clicked() {
                 actions.push(Action::SetPreset(Some(preset.id.clone())));
             }
         }
     });
     ui.add_enabled_ui(edit.preset.is_some(), |ui| {
         let mut strength = edit.strength;
-        if let Some(commit) = slider(ui, "강도", &mut strength, 0.0..=1.5) {
+        if let Some(commit) = slider(ui, t("강도", "Strength"), &mut strength, 0.0..=1.5) {
             actions.push(Action::SetStrength {
                 value: strength,
                 commit,
             });
         }
     });
-    ui.collapsing("자세히", |ui| {
+    ui.collapsing(t("자세히", "Details"), |ui| {
         let mut adjust = edit.adjust;
         let mut changed = None;
         let mut row = |ui: &mut egui::Ui, label: &str, value: &mut f32, range| {
@@ -458,19 +497,39 @@ fn look_panel(
                 changed = Some(commit);
             }
         };
-        row(ui, "노출", &mut adjust.exposure, -3.0..=3.0);
-        row(ui, "대비", &mut adjust.contrast, -1.0..=1.0);
-        row(ui, "하이라이트", &mut adjust.highlights, -1.0..=1.0);
-        row(ui, "그림자", &mut adjust.shadows, -1.0..=1.0);
-        row(ui, "색온도", &mut adjust.temp, -1.0..=1.0);
-        row(ui, "틴트", &mut adjust.tint, -1.0..=1.0);
-        row(ui, "채도", &mut adjust.saturation, -1.0..=1.0);
-        row(ui, "생동감", &mut adjust.vibrance, -1.0..=1.0);
-        row(ui, "선명도", &mut adjust.clarity, -1.0..=1.0);
-        row(ui, "샤픈", &mut adjust.sharpen, -1.0..=1.0);
-        row(ui, "비네팅", &mut adjust.vignette, -1.0..=1.0);
-        row(ui, "흑백", &mut adjust.mono, 0.0..=1.0);
-        ui.collapsing("색상별", |ui| {
+        row(ui, t("노출", "Exposure"), &mut adjust.exposure, -3.0..=3.0);
+        row(ui, t("대비", "Contrast"), &mut adjust.contrast, -1.0..=1.0);
+        row(
+            ui,
+            t("하이라이트", "Highlights"),
+            &mut adjust.highlights,
+            -1.0..=1.0,
+        );
+        row(ui, t("그림자", "Shadows"), &mut adjust.shadows, -1.0..=1.0);
+        row(ui, t("색온도", "Temperature"), &mut adjust.temp, -1.0..=1.0);
+        row(ui, t("틴트", "Tint"), &mut adjust.tint, -1.0..=1.0);
+        row(
+            ui,
+            t("채도", "Saturation"),
+            &mut adjust.saturation,
+            -1.0..=1.0,
+        );
+        row(
+            ui,
+            t("생동감", "Vibrance"),
+            &mut adjust.vibrance,
+            -1.0..=1.0,
+        );
+        row(ui, t("선명도", "Clarity"), &mut adjust.clarity, -1.0..=1.0);
+        row(ui, t("샤픈", "Sharpen"), &mut adjust.sharpen, -1.0..=1.0);
+        row(
+            ui,
+            t("비네팅", "Vignette"),
+            &mut adjust.vignette,
+            -1.0..=1.0,
+        );
+        row(ui, t("흑백", "Monochrome"), &mut adjust.mono, 0.0..=1.0);
+        ui.collapsing(t("색상별", "By colour"), |ui| {
             let hsl = &mut adjust.hsl;
             let bands = [
                 &mut hsl.red,
@@ -482,9 +541,11 @@ fn look_panel(
                 &mut hsl.purple,
                 &mut hsl.magenta,
             ];
-            for (name, band) in HUE_NAMES.iter().zip(bands) {
-                row(ui, &format!("{name} 채도"), &mut band.sat, -1.0..=1.0);
-                row(ui, &format!("{name} 밝기"), &mut band.lum, -1.0..=1.0);
+            for (name, band) in hue_names().into_iter().zip(bands) {
+                let sat = t(format!("{name} 채도"), format!("{name} sat"));
+                let lum = t(format!("{name} 밝기"), format!("{name} lum"));
+                row(ui, &sat, &mut band.sat, -1.0..=1.0);
+                row(ui, &lum, &mut band.lum, -1.0..=1.0);
             }
         });
         if let Some(commit) = changed {
@@ -496,8 +557,11 @@ fn look_panel(
     });
     ui.horizontal_wrapped(|ui| {
         if ui
-            .button("LUT 불러오기…")
-            .on_hover_text("3D LUT(.cube) 파일을 보정 뒤에 입힙니다")
+            .button(t("LUT 불러오기…", "Load LUT…"))
+            .on_hover_text(t(
+                "3D LUT(.cube) 파일을 보정 뒤에 입힙니다",
+                "Applies a 3D LUT (.cube) file after the adjustments",
+            ))
             .clicked()
             && let Some(file) = env.pick_lut()
         {
@@ -507,14 +571,15 @@ fn look_panel(
             let name = lut.file.file_name().unwrap_or(lut.file.as_os_str());
             ui.label(name.to_string_lossy())
                 .on_hover_text(lut.file.display().to_string());
-            if ui.button("LUT 없애기").clicked() {
+            if ui.button(t("LUT 없애기", "Remove LUT")).clicked() {
                 actions.push(Action::SetLut(None));
             }
         }
     });
     if let Some(lut) = &edit.lut {
         let mut strength = lut.strength;
-        if let Some(commit) = slider(ui, "LUT 강도", &mut strength, 0.0..=1.0) {
+        if let Some(commit) = slider(ui, t("LUT 강도", "LUT strength"), &mut strength, 0.0..=1.0)
+        {
             actions.push(Action::SetLutStrength {
                 value: strength,
                 commit,
@@ -522,8 +587,11 @@ fn look_panel(
         }
     }
     if ui
-        .button("보정 초기화")
-        .on_hover_text("프리셋, 세부 조정, LUT을 지웁니다 (노이즈 제거는 그대로)")
+        .button(t("보정 초기화", "Reset adjustments"))
+        .on_hover_text(t(
+            "프리셋, 세부 조정, LUT을 지웁니다 (노이즈 제거는 그대로)",
+            "Clears the preset, detail adjustments and LUT (noise reduction stays)",
+        ))
         .clicked()
     {
         actions.push(Action::ResetLook);
@@ -531,12 +599,19 @@ fn look_panel(
 }
 
 /// 색상대의 화면 이름. `edit::Hsl`의 항목과 같은 순서.
-const HUE_NAMES: [&str; 8] = [
-    "빨강", "주황", "노랑", "초록", "청록", "파랑", "보라", "자홍",
-];
+fn hue_names() -> [&'static str; 8] {
+    t(
+        [
+            "빨강", "주황", "노랑", "초록", "청록", "파랑", "보라", "자홍",
+        ],
+        [
+            "Red", "Orange", "Yellow", "Green", "Aqua", "Blue", "Purple", "Magenta",
+        ],
+    )
+}
 
 fn denoise_panel(ui: &mut egui::Ui, app: &App, open: &Open, actions: &mut Vec<Action>) {
-    ui.heading("노이즈 제거");
+    ui.heading(t("노이즈 제거", "Noise reduction"));
     let usable = matches!(app.backend, Backend::Gpu | Backend::Cpu(_));
     ui.add_enabled_ui(usable && !open.selected.is_empty(), |ui| {
         let mut percent = (open.denoise_level * 100.0).round();
@@ -544,25 +619,35 @@ fn denoise_panel(ui: &mut egui::Ui, app: &App, open: &Open, actions: &mut Vec<Ac
             .add(
                 egui::Slider::new(&mut percent, 0.0..=100.0)
                     .suffix("%")
-                    .text("레벨"),
+                    .text(t("레벨", "Level")),
             )
             .changed()
         {
             actions.push(Action::SetDenoiseLevel(percent / 100.0));
         }
-        if ui.button("적용").clicked() {
+        if ui.button(t("적용", "Apply")).clicked() {
             actions.push(Action::ApplyDenoise);
         }
     });
     match (&app.backend, open.selected.len()) {
-        (Backend::Unavailable(_), _) => ui.weak("AI 모델이 없어 쓸 수 없습니다"),
-        (Backend::Unknown, _) => ui.weak("AI 준비 중"),
-        (_, 0) => ui.weak("사진을 고르세요"),
-        (_, count) => ui.weak(format!("선택한 {count}장에 적용됩니다")),
+        (Backend::Unavailable(_), _) => ui.weak(t(
+            "AI 모델이 없어 쓸 수 없습니다",
+            "Unavailable: the AI model is missing",
+        )),
+        (Backend::Unknown, _) => ui.weak(t("AI 준비 중", "Preparing AI")),
+        (_, 0) => ui.weak(t("사진을 고르세요", "Pick a photo")),
+        (_, count) => ui.weak(t(
+            format!("선택한 {count}장에 적용됩니다"),
+            format!("Applies to the {count} selected"),
+        )),
     };
     if let Some(current) = open.current {
         let level = open.edit(current).denoise;
-        ui.weak(format!("지금 사진: {:.0}%", level * 100.0));
+        let percent = level * 100.0;
+        ui.weak(t(
+            format!("지금 사진: {percent:.0}%"),
+            format!("This photo: {percent:.0}%"),
+        ));
     }
 }
 
@@ -571,7 +656,10 @@ const ROW: f32 = 56.0;
 
 fn photo_list(ui: &mut egui::Ui, open: &Open, view: &mut View, actions: &mut Vec<Action>) {
     if open.photos.is_empty() {
-        ui.weak("[폴더 가져오기]로 사진 폴더를 추가하세요");
+        ui.weak(t(
+            "[폴더 가져오기]로 사진 폴더를 추가하세요",
+            "Add a photo folder with [Import folder]",
+        ));
         return;
     }
     // 위아래 화살표로 앞뒤 사진으로 간다.
@@ -679,7 +767,9 @@ impl Zoom {
 
 fn preview(ui: &mut egui::Ui, open: &Open, view: &mut View) {
     let Some(current) = open.current else {
-        ui.centered_and_justified(|ui| ui.weak("왼쪽에서 사진을 고르세요"));
+        ui.centered_and_justified(|ui| {
+            ui.weak(t("왼쪽에서 사진을 고르세요", "Pick a photo on the left"))
+        });
         return;
     };
     let shown = open
@@ -761,10 +851,19 @@ fn preview(ui: &mut egui::Ui, open: &Open, view: &mut View) {
             canvas
                 .put(
                     corner,
-                    egui::Label::new(RichText::new(format!("배율 {percent:.0}%")).weak())
-                        .selectable(false),
+                    egui::Label::new(
+                        RichText::new(t(
+                            format!("배율 {percent:.0}%"),
+                            format!("Zoom {percent:.0}%"),
+                        ))
+                        .weak(),
+                    )
+                    .selectable(false),
                 )
-                .on_hover_text("휠: 확대/축소 · 끌기: 이동 · 두 번 누르기: 맞춤/100%");
+                .on_hover_text(t(
+                    "휠: 확대/축소 · 끌기: 이동 · 두 번 누르기: 맞춤/100%",
+                    "Wheel: zoom · Drag: move · Double-click: fit/100%",
+                ));
         }
         _ => {
             ui.centered_and_justified(|ui| ui.spinner());
@@ -791,58 +890,71 @@ fn export_windows(ctx: &egui::Context, open: &Open, actions: &mut Vec<Action>) {
     };
     match &open.export {
         ExportState::Confirm { photos, existing } => {
-            window("이미 있는 파일").show(ctx, |ui| {
-                ui.label(format!(
-                    "내보낼 {}장 중 {existing}장은 출력 파일이 이미 있습니다.",
-                    photos.len()
+            window(t("이미 있는 파일", "Files already exist")).show(ctx, |ui| {
+                let total = photos.len();
+                ui.label(t(
+                    format!("내보낼 {total}장 중 {existing}장은 출력 파일이 이미 있습니다."),
+                    format!(
+                        "{existing} of the {total} photos to export already have output files."
+                    ),
                 ));
                 ui.horizontal(|ui| {
                     if ui
-                        .button("건너뛰기")
-                        .on_hover_text("없는 것만 새로 만듭니다")
+                        .button(t("건너뛰기", "Skip"))
+                        .on_hover_text(t("없는 것만 새로 만듭니다", "Only makes the missing ones"))
                         .clicked()
                     {
                         actions.push(Action::ConfirmExport { overwrite: false });
                     }
-                    if ui.button("덮어쓰기").clicked() {
+                    if ui.button(t("덮어쓰기", "Overwrite")).clicked() {
                         actions.push(Action::ConfirmExport { overwrite: true });
                     }
-                    if ui.button("취소").clicked() {
+                    if ui.button(t("취소", "Cancel")).clicked() {
                         actions.push(Action::CancelExport);
                     }
                 });
             });
         }
         ExportState::Finished { outcome, warnings } => {
-            window("내보내기 결과").show(ctx, |ui| {
-                ui.label(format!(
-                    "완료 {}장 · 건너뜀 {}장 · 실패 {}장",
-                    outcome.done,
-                    outcome.skipped,
-                    outcome.failed.len()
+            window(t("내보내기 결과", "Export result")).show(ctx, |ui| {
+                let (done, skipped, failed) = (outcome.done, outcome.skipped, outcome.failed.len());
+                ui.label(t(
+                    format!("완료 {done}장 · 건너뜀 {skipped}장 · 실패 {failed}장"),
+                    format!("Done {done} · Skipped {skipped} · Failed {failed}"),
                 ));
                 if let Some(reason) = &outcome.stopped {
-                    ui.label(format!("끝까지 처리하지 못했습니다: {reason}"));
+                    ui.label(t(
+                        format!("끝까지 처리하지 못했습니다: {reason}"),
+                        format!("Stopped before finishing: {reason}"),
+                    ));
                 }
                 egui::ScrollArea::vertical()
                     .max_height(240.0)
                     .show(ui, |ui| {
                         for (file, reason) in &outcome.failed {
-                            ui.label(format!("실패: {}: {reason}", file.display()));
+                            ui.label(format!(
+                                "{}: {}: {reason}",
+                                t("실패", "Failed"),
+                                file.display()
+                            ));
                         }
                         for (file, warning) in warnings {
-                            ui.label(format!("알림: {}: {warning}", file.display()));
+                            ui.label(format!(
+                                "{}: {}: {warning}",
+                                t("알림", "Note"),
+                                file.display()
+                            ));
                         }
                     });
-                if ui.button("닫기").clicked() {
+                if ui.button(t("닫기", "Close")).clicked() {
                     actions.push(Action::DismissExport);
                 }
             });
         }
         ExportState::Failed(reason) => {
-            window("내보내기 실패").show(ctx, |ui| {
+            window(t("내보내기 실패", "Export failed")).show(ctx, |ui| {
                 ui.label(RichText::new(reason));
-                if ui.button("닫기").clicked() {
+                if ui.button(t("닫기", "Close")).clicked() {
                     actions.push(Action::DismissExport);
                 }
             });
@@ -1619,5 +1731,172 @@ mod tests {
         };
         handle(Action::ExportFinished(Ok((outcome, vec![]))));
         shot(&mut harness, "4-finished.png");
+
+        // 영어 화면: 작업 화면(프리셋·LUT·세부 조정을 펼친 모습)과 시작 화면
+        handle(Action::DismissExport);
+        handle(Action::SetLanguage(crate::lang::Lang::En));
+        handle(Action::SetPreset(Some("landscape".into())));
+        handle(Action::SetLut(Some(cube)));
+        let generation = screen
+            .app
+            .borrow()
+            .open
+            .as_ref()
+            .unwrap()
+            .preview_generation();
+        handle(Action::PreviewReady {
+            generation,
+            index: 7,
+            result: Ok(crate::preview::shrink(&toned.image, 8192)),
+        });
+        harness.run_steps(4);
+        harness.get_by_label("Details").click();
+        harness.run_steps(4);
+        harness.get_by_label("By colour").click();
+        shot(&mut harness, "5-english.png");
+        handle(Action::CloseProject);
+        shot(&mut harness, "5b-english-start.png");
+    }
+
+    /// 화면에 나온 글자 가운데 한글이 든 것. 언어 단추의 "한국어"는 뺀다.
+    fn korean_texts(harness: &Harness<'_>) -> Vec<String> {
+        use egui_kittest::kittest::NodeT;
+        harness
+            .root()
+            .children_recursive()
+            .flat_map(|node| {
+                let node = node.accesskit_node();
+                [node.label(), node.value()]
+            })
+            .flatten()
+            .filter(|text| text != "한국어" && text.chars().any(|c| ('가'..='힣').contains(&c)))
+            .collect()
+    }
+
+    #[test]
+    fn the_language_is_switched_on_the_start_screen_and_in_the_workspace() {
+        use crate::lang::Lang;
+        let screen = Screen::new("lang");
+        screen.env.borrow_mut().path = Some(screen.dir.join("trip.amsil"));
+        let mut harness = screen.harness();
+        harness.run_steps(3);
+        harness.get_by_label("새 프로젝트");
+        harness.get_by_label("English").click();
+        harness.run_steps(3);
+        assert_eq!(screen.app.borrow().config.lang, Some(Lang::En));
+        harness.get_by_label("New project").click();
+        harness.run_steps(3);
+        harness.get_by_label("Import folder");
+
+        harness.get_by_label("한국어").click();
+        harness.run_steps(3);
+        assert_eq!(screen.app.borrow().config.lang, Some(Lang::Ko));
+        harness.get_by_label("폴더 가져오기");
+    }
+
+    #[test]
+    fn nothing_is_left_in_korean_when_english_is_chosen() {
+        use crate::lang::Lang;
+        let screen = Screen::new("english");
+        let handle = |action| {
+            screen.app.borrow_mut().handle(action);
+        };
+        handle(Action::NewProject(screen.dir.join("trip.amsil")));
+        handle(Action::CloseProject);
+        let mut harness = screen.harness();
+        harness.run_steps(4);
+        assert!(
+            korean_texts(&harness).len() > 3,
+            "한국어 화면에서는 한글이 보여야 한다 (검사가 글자를 제대로 읽는지 확인)"
+        );
+        handle(Action::SetLanguage(Lang::En));
+        let check = |harness: &mut Harness<'_>, what: &str| {
+            harness.run_steps(4);
+            let left = korean_texts(harness);
+            assert!(left.is_empty(), "{what}: {left:?}");
+        };
+        check(&mut harness, "시작 화면");
+
+        handle(Action::OpenProject(screen.dir.join("trip.amsil")));
+        check(&mut harness, "빈 작업 화면");
+        handle(Action::ImportFolder(screen.dir.join("사진")));
+        handle(Action::Backend(Backend::Cpu("no Vulkan".into())));
+        check(&mut harness, "사진을 고르기 전");
+
+        handle(Action::Select {
+            index: 0,
+            extend: false,
+        });
+        handle(Action::SetPreset(Some("food".into())));
+        handle(Action::SetLut(Some("/luts/film.cube".into())));
+        let generation = screen
+            .app
+            .borrow()
+            .open
+            .as_ref()
+            .unwrap()
+            .preview_generation();
+        handle(Action::PreviewReady {
+            generation,
+            index: 0,
+            result: Ok(Pixels {
+                width: 4,
+                height: 4,
+                rgba: vec![128; 64],
+            }),
+        });
+        harness.run_steps(3);
+        harness.get_by_label("Details").click();
+        harness.run_steps(3);
+        harness.get_by_label("By colour").click();
+        check(&mut harness, "편집 패널을 다 펼친 모습");
+        harness.get_by_label("CPU (slow)").click();
+        check(&mut harness, "CPU 안내");
+        handle(Action::Backend(Backend::Unavailable("no model".into())));
+        check(&mut harness, "모델이 없을 때");
+        handle(Action::Backend(Backend::Unknown));
+        check(&mut harness, "AI 준비 중");
+
+        // 내보내기: 확인 창, 진행 중, 결과, 실패
+        let out = screen.dir.join("out");
+        std::fs::create_dir_all(out.join("사진")).unwrap();
+        std::fs::write(out.join("사진/a.heic"), b"old").unwrap();
+        handle(Action::SetExportFolder(out));
+        handle(Action::Export {
+            only_selected: false,
+        });
+        check(&mut harness, "이미 있는 파일 확인");
+        handle(Action::ConfirmExport { overwrite: false });
+        check(&mut harness, "내보내기 준비 중");
+        let report = |idle| crate::export::Report {
+            status: crate::job::Status {
+                total: 2,
+                finished: 1,
+                progress: 1.4,
+                running: 1,
+            },
+            remaining: Some(372.0),
+            idle,
+            cpu: 87.0,
+            memory: 2 << 30,
+            memory_limit: 8 << 30,
+            gpu: 0.0,
+            low_memory: true,
+        };
+        handle(Action::ExportProgress(report(0.1)));
+        check(&mut harness, "내보내는 중");
+        handle(Action::ExportProgress(report(45.0)));
+        check(&mut harness, "진행이 멈춘 듯할 때");
+        let outcome = Outcome {
+            done: 1,
+            skipped: 0,
+            failed: vec![("b.ARW".into(), "broken".into())],
+            stopped: Some("disk full".into()),
+        };
+        let warnings = vec![("a.ARW".into(), "quality lowered".into())];
+        handle(Action::ExportFinished(Ok((outcome, warnings))));
+        check(&mut harness, "내보내기 결과");
+        handle(Action::ExportFinished(Err("boom".into())));
+        check(&mut harness, "내보내기 실패");
     }
 }

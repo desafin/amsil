@@ -38,6 +38,14 @@ target/release/amsil
 
 [스크린샷] 버튼이나 F12를 누르면 지금 창을 PNG로 저장한다 (프로젝트 파일 옆의 `스크린샷` 폴더).
 
+### 언어 (한국어 / English)
+
+창 오른쪽 위의 [한국어] [English]를 누르면 바로 바뀌고, 다음에 켤 때도 유지된다. 명령행 도구의 메시지도 같은 언어로 나온다.
+
+고른 적이 없으면 시스템 언어를 따른다. `LANG` 등이 한국어 로캘(`ko_KR.UTF-8`)이면 한국어, 그 밖에는 영어다.
+
+The interface is available in Korean and English. Use the [한국어] / [English] buttons at the top right of the window; the choice is saved and also applies to command-line messages.
+
 ### 명령행으로 쓰기
 
 ```
@@ -93,6 +101,7 @@ Sony DSLR-A900의 ARW로 확인했다. RAW 디코딩은 [rawler](https://github.
 
 ```toml
 name = "따뜻한 오후"
+name_en = "Warm afternoon"   # 영어 화면에 보일 이름 (없어도 된다)
 
 [params]
 temp = 0.2          # 색온도: +는 따뜻하게

@@ -1,6 +1,7 @@
 //! 창을 띄우고 `App`(상태), `ui`(그리기), `Workers`(백그라운드 작업)를 잇는다.
 
-use crate::app::{Action, App};
+use crate::app::{Action, App, Effect};
+use crate::lang::t;
 use crate::preview::Pixels;
 use crate::project::Config;
 use crate::ui::{self, Env, View};
@@ -13,7 +14,7 @@ use std::sync::mpsc::Receiver;
 pub fn run() -> crate::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("암실")
+            .with_title(t("암실", "Amsil"))
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([640.0, 480.0]),
         ..Default::default()
@@ -42,7 +43,7 @@ impl Gui {
         ui::install_fonts(ctx);
         let wake = ctx.clone();
         let (workers, events) = Workers::new(move || wake.request_repaint());
-        workers.probe_backend();
+        workers.run(Effect::ProbeBackend);
         let env = Dialogs {
             send: Arc::new(workers.sender()),
         };
@@ -85,16 +86,16 @@ struct Dialogs {
 impl Env for Dialogs {
     fn new_project_path(&mut self) -> Option<PathBuf> {
         rfd::FileDialog::new()
-            .set_title("새 프로젝트")
-            .add_filter("암실 프로젝트", &["amsil"])
-            .set_file_name("새 프로젝트.amsil")
+            .set_title(t("새 프로젝트", "New project"))
+            .add_filter(t("암실 프로젝트", "Amsil project"), &["amsil"])
+            .set_file_name(t("새 프로젝트.amsil", "New project.amsil"))
             .save_file()
     }
 
     fn open_project_path(&mut self) -> Option<PathBuf> {
         rfd::FileDialog::new()
-            .set_title("프로젝트 열기")
-            .add_filter("암실 프로젝트", &["amsil"])
+            .set_title(t("프로젝트 열기", "Open project"))
+            .add_filter(t("암실 프로젝트", "Amsil project"), &["amsil"])
             .pick_file()
     }
 
@@ -104,7 +105,7 @@ impl Env for Dialogs {
 
     fn pick_lut(&mut self) -> Option<PathBuf> {
         rfd::FileDialog::new()
-            .set_title("LUT 불러오기")
+            .set_title(t("LUT 불러오기", "Load LUT"))
             .add_filter("3D LUT", &["cube"])
             .pick_file()
     }

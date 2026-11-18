@@ -1,5 +1,6 @@
 //! sRGB 이미지를 10bit HEIF(HEVC 4:2:0)로 인코딩한다.
 
+use crate::lang::t;
 use crate::{Image, Result};
 use libheif_rs::{
     Channel, ColorSpace, CompressionFormat, EncoderParameterValue, EncoderQuality, HeifContext,
@@ -37,9 +38,12 @@ fn encode_within(
             return Ok(Encoded { bytes, quality });
         }
         if quality <= MIN_QUALITY {
-            return Err(format!(
-                "품질을 {MIN_QUALITY}까지 낮춰도 용량 한도({:.0}MB)를 넘습니다",
-                max_bytes as f64 / 1e6
+            let limit = max_bytes as f64 / 1e6;
+            return Err(t(
+                format!("품질을 {MIN_QUALITY}까지 낮춰도 용량 한도({limit:.0}MB)를 넘습니다"),
+                format!(
+                    "Even at quality {MIN_QUALITY} the file is over the size limit ({limit:.0} MB)"
+                ),
             )
             .into());
         }
@@ -55,10 +59,10 @@ fn encode_once(img: &Image, quality: u8, exif: Option<&[u8]>, threads: usize) ->
     let mut out = libheif_rs::Image::new(w as u32, h as u32, ColorSpace::Rgb(RgbChroma::HdrRgbLe))?;
     out.create_plane(Channel::Interleaved, w as u32, h as u32, 10)?;
     {
-        let plane = out
-            .planes_mut()
-            .interleaved
-            .ok_or("libheif: 인터리브 평면이 없음")?;
+        let plane = out.planes_mut().interleaved.ok_or(t(
+            "libheif: 인터리브 평면이 없음",
+            "libheif: no interleaved plane",
+        ))?;
         for (y, row) in plane.data.chunks_mut(plane.stride).take(h).enumerate() {
             for x in 0..w {
                 for c in 0..3 {

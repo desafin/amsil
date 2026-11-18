@@ -1,4 +1,5 @@
 name = "음식"
+name_en = "Food"
 category = "food"
 
 [params]

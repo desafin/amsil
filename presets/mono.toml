@@ -1,4 +1,5 @@
 name = "흑백"
+name_en = "Black & white"
 
 [params]
 mono = 1.0
