@@ -1,6 +1,7 @@
 //! 화면 그리기. 상태(`App`)를 읽어 그리고, 사용자가 한 일을 `Action`으로 돌려준다. 로직은 여기에 두지 않는다.
 
 use crate::app::{Action, App, Backend, ExportState, Open, ReportView};
+use crate::credits::{self, Credit, Feature};
 use crate::frame::{Frame, Layout as Shape};
 use crate::job::{describe_remaining, describe_resources};
 use crate::lang::{self, Lang, t};
@@ -36,6 +37,8 @@ pub struct View {
     /// (요청 번호, 텍스처)
     preview: Option<(u64, TextureHandle)>,
     show_backend_help: bool,
+    /// "AI 기능과 출처" 창이 열려 있는가.
+    show_ai_info: bool,
     /// 끌고 있는 동안의 품질 슬라이더 값.
     quality: Option<u8>,
     /// 마지막으로 설정한 창 제목.
@@ -77,18 +80,26 @@ pub fn draw(ui: &mut egui::Ui, app: &App, view: &mut View, env: &mut dyn Env) ->
     }
     match &app.open {
         None => {
-            *view = View::default();
-            start_screen(ui, app, env, &mut actions);
+            // 프로젝트에 딸린 것(텍스처, 확대 상태)은 버리고, 열어 둔 창은 그대로 둔다.
+            *view = View {
+                show_ai_info: view.show_ai_info,
+                ..View::default()
+            };
+            start_screen(ui, app, view, env, &mut actions);
         }
         Some(open) => {
             if view.project.as_ref() != Some(&open.path) {
                 *view = View {
                     project: Some(open.path.clone()),
+                    show_ai_info: view.show_ai_info,
                     ..View::default()
                 };
             }
             workspace(ui, app, open, view, env, &mut actions);
         }
+    }
+    if view.show_ai_info {
+        ai_info(ui.ctx(), app, view);
     }
     actions
 }
@@ -142,6 +153,111 @@ fn theme_buttons(ui: &mut egui::Ui, actions: &mut Vec<Action>) {
     }
 }
 
+/// AI 기능이 쓰는 모델의 출처를 보여 주는 창을 여는 단추.
+fn ai_info_button(ui: &mut egui::Ui, view: &mut View) {
+    if ui
+        .button(t("AI 정보", "AI info"))
+        .on_hover_text(t(
+            "AI 기능이 어떤 모델을 쓰고, 그 모델을 누가 만들었는지 봅니다",
+            "Shows which models the AI features use and who made them",
+        ))
+        .clicked()
+    {
+        view.show_ai_info = true;
+    }
+}
+
+/// 기능이 쓰는 모델을 한 줄로 적는다. 자세한 것은 "AI 정보" 창에 있다.
+fn credit_line(ui: &mut egui::Ui, prefix: &str, credit: &Credit) {
+    ui.add(egui::Label::new(
+        RichText::new(format!("{prefix}: {} · {}", credit.model, credit.by))
+            .weak()
+            .small(),
+    ))
+    .on_hover_text(format!(
+        "{} {}\n{}\n{}",
+        t("라이선스", "Licence"),
+        credit.license,
+        credit.source,
+        t(
+            "자세한 것은 위쪽의 [AI 정보]에 있습니다",
+            "See [AI info] at the top for details"
+        )
+    ));
+}
+
+/// 그 기능의 모델이 준비되어 있는지.
+fn model_status(app: &App, feature: Feature) -> &'static str {
+    let ready = t("준비됨", "Ready");
+    let missing = t("모델 없음", "No model");
+    let problem = |problem: &Option<String>| if problem.is_some() { missing } else { ready };
+    match feature {
+        Feature::Denoise => match &app.backend {
+            Backend::Unknown => t("확인 중", "Checking"),
+            Backend::Gpu => t("준비됨 (GPU)", "Ready (GPU)"),
+            Backend::Cpu(_) => t("준비됨 (CPU, 느림)", "Ready (CPU, slow)"),
+            Backend::Unavailable(_) => missing,
+        },
+        Feature::Mask => problem(&app.mask_problem),
+        Feature::Recommend => problem(&app.recommend_problem),
+        Feature::Skin => problem(&app.skin_problem),
+    }
+}
+
+/// AI 기능이 쓰는 모델과 그 출처를 모아 보여 주는 창.
+fn ai_info(ctx: &egui::Context, app: &App, view: &mut View) {
+    let mut open = true;
+    egui::Window::new(t("AI 기능과 출처", "AI features and sources"))
+        .open(&mut open)
+        .collapsible(false)
+        // 창 한가운데에, 창 높이의 대부분을 쓰는 크기로 연다 (끌어서 옮기거나 키울 수 있다).
+        .pivot(egui::Align2::CENTER_CENTER)
+        .default_pos(ctx.content_rect().center())
+        .default_width(540.0)
+        .default_height(ctx.content_rect().height() * 0.75)
+        .vscroll(true)
+        .show(ctx, |ui| {
+            ui.label(t(
+                "AI 기능은 다른 사람들이 만들어 공개한 모델을 그대로 씁니다. 모델은 이 컴퓨터 안에서만 돌고, 사진은 밖으로 나가지 않습니다.",
+                "The AI features use models that other people made and published, unchanged. The models run only on this computer; your photos never leave it.",
+            ));
+            for credit in credits::ALL {
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong(t(credit.name.0, credit.name.1));
+                    ui.weak(model_status(app, credit.feature));
+                });
+                egui::Grid::new(credit.model)
+                    .num_columns(2)
+                    .show(ui, |ui| {
+                        ui.weak(t("모델", "Model"));
+                        ui.label(credit.model);
+                        ui.end_row();
+                        ui.weak(t("만든 곳", "Made by"));
+                        ui.label(credit.by);
+                        ui.end_row();
+                        ui.weak(t("라이선스", "Licence"));
+                        ui.label(credit.license);
+                        ui.end_row();
+                        ui.weak(t("출처", "Source"));
+                        ui.hyperlink(credit.source);
+                        ui.end_row();
+                        if let Some(paper) = credit.paper {
+                            ui.weak(t("논문", "Paper"));
+                            ui.hyperlink(paper);
+                            ui.end_row();
+                        }
+                    });
+                ui.horizontal_wrapped(|ui| {
+                    ui.weak(t("받는 곳", "Downloaded from"));
+                    ui.label(t(credit.from.0, credit.from.1));
+                });
+                ui.weak(t(credit.note.0, credit.note.1));
+            }
+        });
+    view.show_ai_info = open;
+}
+
 /// 문제가 생겼을 때 볼 로그 파일을 여는 단추.
 fn log_button(ui: &mut egui::Ui, env: &mut dyn Env, actions: &mut Vec<Action>) {
     if ui
@@ -156,7 +272,13 @@ fn log_button(ui: &mut egui::Ui, env: &mut dyn Env, actions: &mut Vec<Action>) {
     }
 }
 
-fn start_screen(ui: &mut egui::Ui, app: &App, env: &mut dyn Env, actions: &mut Vec<Action>) {
+fn start_screen(
+    ui: &mut egui::Ui,
+    app: &App,
+    view: &mut View,
+    env: &mut dyn Env,
+    actions: &mut Vec<Action>,
+) {
     Panel::top("language").show(ui, |ui| {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             language_buttons(ui, actions);
@@ -164,6 +286,7 @@ fn start_screen(ui: &mut egui::Ui, app: &App, env: &mut dyn Env, actions: &mut V
             theme_buttons(ui, actions);
             ui.separator();
             log_button(ui, env, actions);
+            ai_info_button(ui, view);
         });
     });
     egui::CentralPanel::default().show(ui, |ui| {
@@ -269,6 +392,7 @@ fn workspace(
             }
             ui.separator();
             backend_label(ui, app, view);
+            ai_info_button(ui, view);
             ui.separator();
             log_button(ui, env, actions);
             ui.separator();
@@ -611,6 +735,7 @@ fn look_panel(
         ui.weak(t("프리셋 추천: 모델 없음", "Preset suggestions: no model"))
             .on_hover_text(problem);
     }
+    credit_line(ui, t("추천", "Suggestions"), &credits::RECOMMEND);
     ui.add_enabled_ui(edit.preset.is_some(), |ui| {
         let mut strength = edit.strength;
         if let Some(commit) = slider(ui, t("강도", "Strength"), &mut strength, 0.0..=1.5) {
@@ -744,6 +869,7 @@ fn hue_names() -> [&'static str; 8] {
 /// 피부 보정 (실험 기능): 인물의 피부만 찾아 얼룩을 누그러뜨린다.
 fn skin_panel(ui: &mut egui::Ui, app: &App, open: &Open, actions: &mut Vec<Action>) {
     ui.heading(t("피부 보정 (실험)", "Skin retouch (experimental)"));
+    credit_line(ui, t("피부 찾기", "Skin finder"), &credits::SKIN);
     let Some(current) = open.current else {
         ui.weak(t(
             "사진을 고르면 인물의 피부를 다듬을 수 있습니다",
@@ -777,6 +903,7 @@ fn skin_panel(ui: &mut egui::Ui, app: &App, open: &Open, actions: &mut Vec<Actio
 /// 마스크: 사진의 일부분을 골라 그곳에만 보정을 더한다.
 fn mask_panel(ui: &mut egui::Ui, app: &App, open: &Open, actions: &mut Vec<Action>) {
     ui.heading(t("마스크", "Masks"));
+    credit_line(ui, t("모델", "Model"), &credits::MASK);
     let Some(current) = open.current else {
         ui.weak(t(
             "사진을 고르면 일부분만 따로 보정할 수 있습니다",
@@ -931,6 +1058,7 @@ fn frame_panel(ui: &mut egui::Ui, open: &Open, actions: &mut Vec<Action>) {
 
 fn denoise_panel(ui: &mut egui::Ui, app: &App, open: &Open, actions: &mut Vec<Action>) {
     ui.heading(t("노이즈 제거", "Noise reduction"));
+    credit_line(ui, t("모델", "Model"), &credits::DENOISE);
     let usable = matches!(app.backend, Backend::Gpu | Backend::Cpu(_));
     ui.add_enabled_ui(usable && !open.selected.is_empty(), |ui| {
         let mut percent = (open.denoise_level * 100.0).round();
@@ -2215,6 +2343,11 @@ mod tests {
         handle(Action::SetTheme(Theme::Light));
         shot(&mut harness, "6-light.png");
 
+        // AI 기능과 출처 창
+        harness.get_by_label("AI 정보").click();
+        shot(&mut harness, "8-ai-info.png");
+        harness.key_press(Key::Escape);
+
         // 좁고 긴 창 (가장 작은 크기에 가까운 640×800)
         let mut narrow = screen.harness_sized(egui::vec2(640.0, 800.0));
         narrow.run_steps(6);
@@ -2353,6 +2486,8 @@ mod tests {
         check(&mut harness, "모델이 없을 때");
         handle(Action::Backend(Backend::Unknown));
         check(&mut harness, "AI 준비 중");
+        harness.get_by_label("AI info").click();
+        check(&mut harness, "AI 정보 창");
         handle(Action::Recommender(Some("no model".into())));
         check(&mut harness, "분류 모델이 없을 때");
 
@@ -2799,6 +2934,66 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// 화면에 이 글이 든 것이 몇 군데 있는가.
+    fn shown(harness: &Harness<'_>, text: &str) -> usize {
+        harness.query_all_by_label_contains(text).count()
+    }
+
+    #[test]
+    fn the_ai_info_window_says_where_every_model_comes_from() {
+        let screen = Screen::new("ai-info");
+        screen.env.borrow_mut().path = Some(screen.dir.join("trip.amsil"));
+        let handle = |action| {
+            screen.app.borrow_mut().handle(action);
+        };
+        // 마스크 모델만 없는 상태
+        handle(Action::Backend(Backend::Gpu));
+        handle(Action::Segmenter(Some("마스크 모델이 없습니다".into())));
+        let mut harness = screen.harness();
+        harness.run_steps(3);
+        // 시작 화면에서도 볼 수 있다.
+        harness.get_by_label("AI 정보").click();
+        harness.run_steps(3);
+        harness.get_by_label("AI 기능과 출처");
+        for text in [
+            "RawNIND UtNet2",
+            "Benoit Brummer (UCLouvain)",
+            "GPL-3.0",
+            "Segment Anything 2.1",
+            "Meta",
+            "CLIP ViT-B/32",
+            "OpenAI",
+            "MediaPipe selfie multiclass",
+            "Google",
+            "https://github.com/facebookresearch/sam2",
+            "https://arxiv.org/abs/2103.00020",
+        ] {
+            assert!(shown(&harness, text) > 0, "창에 없다: {text}");
+        }
+        // 어떤 모델이 준비됐고 어떤 것이 없는지도 보여 준다.
+        assert_eq!(shown(&harness, "모델 없음"), 1);
+        assert!(shown(&harness, "준비됨") >= 3);
+    }
+
+    #[test]
+    fn each_ai_panel_names_the_model_behind_it() {
+        let screen = Screen::with_photos("ai-lines");
+        screen.app.borrow_mut().handle(Action::Select {
+            index: 0,
+            extend: false,
+        });
+        let mut harness = screen.harness();
+        harness.run_steps(3);
+        for text in [
+            "CLIP ViT-B/32 · OpenAI",
+            "RawNIND UtNet2 · Benoit Brummer (UCLouvain)",
+            "Segment Anything 2.1 (Hiera Small) · Meta",
+            "MediaPipe selfie multiclass 256×256 · Google",
+        ] {
+            assert_eq!(shown(&harness, text), 1, "{text}");
         }
     }
 }

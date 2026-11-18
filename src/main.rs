@@ -1,5 +1,6 @@
 mod app;
 mod cli;
+mod credits;
 mod denoise;
 mod develop;
 mod edit;
