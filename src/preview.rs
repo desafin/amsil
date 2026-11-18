@@ -12,6 +12,46 @@ pub struct Pixels {
     pub rgba: Vec<u8>,
 }
 
+impl Pixels {
+    /// 긴 변이 `max_side`를 넘으면 그 안에 들어오도록 줄인 사본을 돌려준다. 넘지 않으면 None.
+    pub fn fit_within(&self, max_side: usize) -> Option<Pixels> {
+        let (w, h) = (self.width, self.height);
+        let long = w.max(h);
+        if long <= max_side {
+            return None;
+        }
+        let (out_w, out_h) = ((w * max_side / long).max(1), (h * max_side / long).max(1));
+        let mut rgba = vec![0u8; out_w * out_h * 4];
+        rgba.par_chunks_mut(out_w * 4)
+            .enumerate()
+            .for_each(|(oy, row)| {
+                let (y0, y1) = (
+                    oy * h / out_h,
+                    ((oy + 1) * h / out_h).max(oy * h / out_h + 1),
+                );
+                for (ox, px) in row.chunks_mut(4).enumerate() {
+                    let (x0, x1) = (
+                        ox * w / out_w,
+                        ((ox + 1) * w / out_w).max(ox * w / out_w + 1),
+                    );
+                    let count = ((x1 - x0) * (y1 - y0)) as u32;
+                    for (c, out) in px.iter_mut().enumerate() {
+                        let sum: u32 = (y0..y1)
+                            .flat_map(|y| (x0..x1).map(move |x| (y * w + x) * 4 + c))
+                            .map(|i| self.rgba[i] as u32)
+                            .sum();
+                        *out = ((sum + count / 2) / count) as u8;
+                    }
+                }
+            });
+        Some(Pixels {
+            width: out_w,
+            height: out_h,
+            rgba,
+        })
+    }
+}
+
 /// 긴 변이 `max_side` 이하가 되도록 줄인다 (넓이 평균). 이미 작으면 크기를 바꾸지 않는다.
 pub fn shrink(image: &Image, max_side: usize) -> Pixels {
     let (w, h) = (image.width, image.height);
@@ -114,6 +154,31 @@ mod tests {
             &out.rgba[..12],
             [0, 0, 0, 255, 128, 128, 128, 255, 255, 255, 255, 255]
         );
+    }
+
+    #[test]
+    fn pixels_larger_than_the_limit_are_reduced_by_averaging() {
+        // 빨강 0·100 | 200·200 (녹색과 파랑은 0)
+        let px = |r: u8| [r, 0, 0, 255];
+        let pixels = Pixels {
+            width: 4,
+            height: 1,
+            rgba: [px(0), px(100), px(200), px(200)].concat(),
+        };
+        let small = pixels.fit_within(2).unwrap();
+        assert_eq!((small.width, small.height), (2, 1));
+        assert_eq!(small.rgba, [50, 0, 0, 255, 200, 0, 0, 255]);
+    }
+
+    #[test]
+    fn pixels_within_the_limit_are_left_alone() {
+        let pixels = Pixels {
+            width: 4,
+            height: 2,
+            rgba: vec![7; 32],
+        };
+        assert!(pixels.fit_within(4).is_none());
+        assert!(pixels.fit_within(100).is_none());
     }
 
     #[test]

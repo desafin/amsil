@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 /// 썸네일의 긴 변 (화소).
 const THUMBNAIL_SIDE: usize = 160;
-/// 미리보기의 긴 변 (화소).
+/// 미리보기의 긴 변 (화소)의 기본값. 화면 쪽에서 GPU가 받을 수 있는 크기를 알려 주면 그 값으로 바뀐다.
 const PREVIEW_SIDE: usize = 2048;
 
 type SharedDenoiser = Arc<Mutex<Denoiser>>;
@@ -25,6 +25,8 @@ pub struct Workers {
     cancel: Arc<AtomicBool>,
     /// 가장 최근의 미리보기 요청 번호.
     latest_preview: Arc<AtomicU64>,
+    /// 미리보기의 긴 변 한도.
+    preview_side: Arc<AtomicU64>,
 }
 
 impl Workers {
@@ -36,6 +38,7 @@ impl Workers {
             denoiser: Arc::default(),
             cancel: Arc::default(),
             latest_preview: Arc::default(),
+            preview_side: Arc::new(AtomicU64::new(PREVIEW_SIDE as u64)),
         };
         (workers, rx)
     }
@@ -50,6 +53,11 @@ impl Workers {
     pub fn sender(&self) -> impl Fn(Action) + Send + Sync + 'static {
         let workers = self.clone();
         move |action| workers.send(action)
+    }
+
+    /// 미리보기를 얼마나 크게 만들지 정한다. 확대해서 볼 수 있도록 GPU 텍스처가 허용하는 만큼 크게 준다.
+    pub fn set_preview_side(&self, side: usize) {
+        self.preview_side.store(side as u64, SeqCst);
     }
 
     /// 모델을 읽어 GPU를 쓸 수 있는지 알아본다. 프로그램을 켤 때 한 번 부른다.
@@ -111,7 +119,10 @@ impl Workers {
                         let model = denoiser.as_deref().map(|model| (model, denoise));
                         let rendered =
                             export::render(&path, model, &|_| {}).map_err(|e| e.to_string())?;
-                        Ok(preview::shrink(&rendered.image, PREVIEW_SIDE))
+                        Ok(preview::shrink(
+                            &rendered.image,
+                            workers.preview_side.load(SeqCst) as usize,
+                        ))
                     })();
                     if workers.latest_preview.load(SeqCst) == generation {
                         workers.send(Action::PreviewReady {

@@ -26,6 +26,9 @@ pub fn run() -> crate::Result<()> {
     .map_err(|e| e.to_string().into())
 }
 
+/// 미리보기 한 장의 긴 변 상한. 6,000만 화소 사진도 여기까지 줄여서 올린다 (RGBA로 약 200MB).
+const MAX_PREVIEW_SIDE: usize = 8192;
+
 struct Gui {
     app: App,
     view: View,
@@ -55,6 +58,11 @@ impl Gui {
 
 impl eframe::App for Gui {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // 미리보기는 GPU가 한 장으로 받을 수 있는 크기까지 원본에 가깝게 만든다 (확대해서 보기 위해).
+        let texture_side = ui.ctx().input(|input| input.max_texture_side);
+        self.workers
+            .set_preview_side(texture_side.min(MAX_PREVIEW_SIDE));
+
         // 백그라운드 작업이 보낸 결과를 먼저 반영하고, 그 상태를 그린 뒤, 사용자가 한 일을 처리한다.
         let mut actions: Vec<Action> = self.events.try_iter().collect();
         actions.extend(ui::draw(ui, &self.app, &mut self.view, &mut self.env));

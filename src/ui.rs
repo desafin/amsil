@@ -32,9 +32,17 @@ pub struct View {
     quality: Option<u8>,
     /// 마지막으로 설정한 창 제목.
     title: String,
+    /// 미리보기의 확대 상태와, 그것이 어느 사진의 것인지.
+    zoom: Zoom,
+    zoomed_photo: Option<usize>,
 }
 
 const GB: f64 = (1u64 << 30) as f64;
+
+/// 원본 화소 하나를 화면 몇 점까지 키울 수 있는지 (4 = 400%).
+const MAX_ZOOM: f32 = 4.0;
+/// 휠 한 칸에 얼마나 확대할지 정하는 값.
+const WHEEL_ZOOM: f32 = 0.005;
 
 /// 한글 글꼴(나눔고딕)을 등록한다. egui 내장 글꼴에는 한글이 없어서, 시스템에 한글 글꼴이 없는
 /// 컴퓨터에서는 글자가 네모로 나온다. 글꼴을 프로그램에 넣어 어디서나 같은 화면이 나오게 한다.
@@ -474,6 +482,42 @@ fn thumbnail(
     Some(texture)
 }
 
+/// 미리보기의 확대 상태.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Zoom {
+    /// 1이면 창에 맞춘 크기, 2면 그 두 배.
+    pub scale: f32,
+    /// 이미지 중심이 미리보기 영역의 중심에서 벗어난 거리 (화면 단위).
+    pub offset: egui::Vec2,
+}
+
+impl Default for Zoom {
+    fn default() -> Self {
+        Self {
+            scale: 1.0,
+            offset: egui::Vec2::ZERO,
+        }
+    }
+}
+
+impl Zoom {
+    /// `factor`배로 확대하되, `pointer`(영역 중심 기준 위치) 아래의 이미지 지점이 제자리에 있게 한다.
+    /// `max`는 최대 배율.
+    pub fn zoom_at(&mut self, factor: f32, pointer: egui::Vec2, max: f32) {
+        let scale = (self.scale * factor).clamp(1.0, max.max(1.0));
+        let applied = scale / self.scale;
+        self.offset = pointer - (pointer - self.offset) * applied;
+        self.scale = scale;
+    }
+
+    /// 이미지가 영역보다 크면 가장자리가 영역 안으로 들어오지 않게, 작으면 가운데에 오게 한다.
+    /// `fit`은 창에 맞춘 이미지 크기, `area`는 미리보기 영역의 크기.
+    pub fn clamp(&mut self, fit: egui::Vec2, area: egui::Vec2) {
+        let limit = ((fit * self.scale - area) / 2.0).max(egui::Vec2::ZERO);
+        self.offset = self.offset.clamp(-limit, limit);
+    }
+}
+
 fn preview(ui: &mut egui::Ui, open: &Open, view: &mut View) {
     let Some(current) = open.current else {
         ui.centered_and_justified(|ui| ui.weak("왼쪽에서 사진을 고르세요"));
@@ -489,19 +533,79 @@ fn preview(ui: &mut egui::Ui, open: &Open, view: &mut View) {
             .as_ref()
             .is_none_or(|(generation, _)| *generation != preview.generation)
     {
-        let texture = ui.ctx().load_texture(
-            "preview",
-            color_image(&preview.pixels),
-            TextureOptions::LINEAR,
-        );
+        // 줄여서 볼 때는 부드럽게(밉맵), 100%를 넘겨 볼 때는 화소가 그대로 보이게 한다.
+        let options = TextureOptions {
+            magnification: egui::TextureFilter::Nearest,
+            minification: egui::TextureFilter::Linear,
+            mipmap_mode: Some(egui::TextureFilter::Linear),
+            ..TextureOptions::LINEAR
+        };
+        // GPU가 받을 수 있는 크기를 넘으면 줄여서 올린다 (넘는 텍스처를 올리면 프로그램이 멈춘다).
+        let limit = ui.ctx().input(|input| input.max_texture_side);
+        let image = match preview.pixels.fit_within(limit) {
+            Some(smaller) => color_image(&smaller),
+            None => color_image(&preview.pixels),
+        };
+        let texture = ui.ctx().load_texture("preview", image, options);
         view.preview = Some((preview.generation, texture));
     }
     match (shown, &view.preview) {
         (Some(_), Some((_, texture))) => {
-            let size = fit(texture.size_vec2(), ui.available_size());
-            ui.centered_and_justified(|ui| {
-                ui.add(egui::Image::new(texture).fit_to_exact_size(size))
-            });
+            // 다른 사진으로 넘어가면 창에 맞춘 상태로 돌아간다. 같은 사진을 다시 그린 경우(노이즈 제거 적용 등)에는
+            // 보던 자리를 유지한다.
+            if view.zoomed_photo != Some(current) {
+                view.zoomed_photo = Some(current);
+                view.zoom = Zoom::default();
+            }
+            let area = ui.available_rect_before_wrap();
+            let response = ui.allocate_rect(area, egui::Sense::click_and_drag());
+            let image = texture.size_vec2();
+            let fit_size = fit(image, area.size());
+            // 창에 맞춘 크기를 1로 볼 때 원본 크기(100%)에 해당하는 배율
+            let actual = image.x / fit_size.x;
+            let max = (MAX_ZOOM * actual).max(1.0);
+            let pointer = response.hover_pos().map(|pos| pos - area.center());
+            if let Some(pointer) = pointer {
+                let (wheel, pinch) =
+                    ui.input(|input| (input.smooth_scroll_delta.y, input.zoom_delta()));
+                let factor = (wheel * WHEEL_ZOOM).exp() * pinch;
+                if factor != 1.0 {
+                    view.zoom.zoom_at(factor, pointer, max);
+                }
+            }
+            if response.dragged() {
+                view.zoom.offset += response.drag_delta();
+            }
+            if response.double_clicked() {
+                // 창에 맞춤 ↔ 100%
+                if view.zoom.scale == 1.0 {
+                    view.zoom.zoom_at(actual, pointer.unwrap_or_default(), max);
+                } else {
+                    view.zoom = Zoom::default();
+                }
+            }
+            view.zoom.clamp(fit_size, area.size());
+            let rect = egui::Rect::from_center_size(
+                area.center() + view.zoom.offset,
+                fit_size * view.zoom.scale,
+            );
+            let mut canvas = ui.new_child(egui::UiBuilder::new().max_rect(area));
+            canvas.set_clip_rect(area);
+            egui::Image::new(texture).paint_at(&canvas, rect);
+            // 지금 배율 (원본 화소 대비)
+            let percent = view.zoom.scale / actual * 100.0;
+            let corner = egui::Rect::from_min_max(
+                area.right_bottom() - egui::vec2(90.0, 24.0),
+                area.right_bottom(),
+            );
+            // 사용법은 배율 표시에 마우스를 올렸을 때만 보여 준다. 사진 위에 계속 뜨면 거슬린다.
+            canvas
+                .put(
+                    corner,
+                    egui::Label::new(RichText::new(format!("배율 {percent:.0}%")).weak())
+                        .selectable(false),
+                )
+                .on_hover_text("휠: 확대/축소 · 끌기: 이동 · 두 번 누르기: 맞춤/100%");
         }
         _ => {
             ui.centered_and_justified(|ui| ui.spinner());
@@ -595,6 +699,78 @@ mod tests {
     use egui_kittest::Harness;
     use egui_kittest::kittest::Queryable;
     use std::cell::RefCell;
+
+    use egui::vec2;
+
+    /// 포인터 아래에 있는 이미지 지점 (이미지 중심 기준, 창에 맞춘 크기 단위).
+    fn image_point(zoom: &Zoom, pointer: egui::Vec2) -> egui::Vec2 {
+        (pointer - zoom.offset) / zoom.scale
+    }
+
+    #[test]
+    fn zooming_keeps_the_point_under_the_cursor_in_place() {
+        let mut zoom = Zoom::default();
+        let pointer = vec2(120.0, -80.0);
+        let before = image_point(&zoom, pointer);
+        zoom.zoom_at(2.0, pointer, 8.0);
+        assert_eq!(zoom.scale, 2.0);
+        let after = image_point(&zoom, pointer);
+        assert!((before - after).length() < 1e-3, "{before:?} → {after:?}");
+
+        // 이미 확대하고 옮긴 상태에서 한 번 더
+        zoom.zoom_at(1.5, vec2(-40.0, 30.0), 8.0);
+        let moved = image_point(&zoom, vec2(-40.0, 30.0));
+        zoom.zoom_at(0.8, vec2(-40.0, 30.0), 8.0);
+        assert!((moved - image_point(&zoom, vec2(-40.0, 30.0))).length() < 1e-3);
+    }
+
+    #[test]
+    fn zooming_at_the_centre_does_not_move_the_image() {
+        let mut zoom = Zoom::default();
+        zoom.zoom_at(3.0, vec2(0.0, 0.0), 8.0);
+        assert_eq!(
+            zoom,
+            Zoom {
+                scale: 3.0,
+                offset: vec2(0.0, 0.0)
+            }
+        );
+    }
+
+    #[test]
+    fn zoom_stays_between_fit_and_the_maximum() {
+        let mut zoom = Zoom::default();
+        zoom.zoom_at(0.5, vec2(50.0, 50.0), 8.0);
+        assert_eq!(zoom, Zoom::default(), "창에 맞춘 크기보다 작아지지 않는다");
+        zoom.zoom_at(100.0, vec2(0.0, 0.0), 8.0);
+        assert_eq!(zoom.scale, 8.0);
+    }
+
+    #[test]
+    fn panning_stops_at_the_image_edges() {
+        // 400×300 영역에 꽉 맞는 이미지를 2배로: 800×600. 좌우 200, 상하 150까지만 움직일 수 있다.
+        let (fit, area) = (vec2(400.0, 300.0), vec2(400.0, 300.0));
+        let mut zoom = Zoom {
+            scale: 2.0,
+            offset: vec2(500.0, -40.0),
+        };
+        zoom.clamp(fit, area);
+        assert_eq!(zoom.offset, vec2(200.0, -40.0));
+        zoom.offset = vec2(-999.0, 999.0);
+        zoom.clamp(fit, area);
+        assert_eq!(zoom.offset, vec2(-200.0, 150.0));
+    }
+
+    #[test]
+    fn an_image_smaller_than_the_area_stays_centred() {
+        // 세로 사진: 영역 400×300 안에 200×300으로 맞춰짐. 1.5배면 300×450 → 좌우는 아직 영역보다 좁다.
+        let mut zoom = Zoom {
+            scale: 1.5,
+            offset: vec2(80.0, 500.0),
+        };
+        zoom.clamp(vec2(200.0, 300.0), vec2(400.0, 300.0));
+        assert_eq!(zoom.offset, vec2(0.0, 75.0));
+    }
 
     /// 대화 상자 대신 정해 둔 경로를 돌려주는 가짜 환경.
     #[derive(Default)]
@@ -768,6 +944,111 @@ mod tests {
         harness.run_steps(3);
         assert_eq!(screen.app.borrow().open.as_ref().unwrap().current, Some(1));
         assert_eq!(*screen.seen.borrow(), ["ImportFolder", "Select 1 false"]);
+    }
+
+    /// 미리보기 구석에 표시된 배율(%)을 읽는다.
+    fn shown_zoom(harness: &Harness<'_>) -> f32 {
+        use egui_kittest::kittest::NodeT;
+        let node = harness.get_by_label_contains("배율 ").accesskit_node();
+        let text = node
+            .label()
+            .or_else(|| node.value())
+            .expect("배율 표시에 글자가 없다");
+        text.trim_start_matches("배율 ")
+            .trim_end_matches('%')
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn wheel_zooms_the_preview_between_fit_and_400_percent() {
+        let screen = Screen::with_photos("zoom");
+        screen.app.borrow_mut().handle(Action::Select {
+            index: 0,
+            extend: false,
+        });
+        let generation = screen
+            .app
+            .borrow()
+            .open
+            .as_ref()
+            .unwrap()
+            .preview_generation();
+        let pixels = Pixels {
+            width: 2000,
+            height: 1000,
+            rgba: vec![128; 2000 * 1000 * 4],
+        };
+        screen.app.borrow_mut().handle(Action::PreviewReady {
+            generation,
+            index: 0,
+            result: Ok(pixels),
+        });
+        let mut harness = screen.harness();
+        harness.run();
+        let fit = shown_zoom(&harness);
+        assert!(
+            fit > 10.0 && fit < 60.0,
+            "2000화소 폭의 사진이 창에 맞게 줄어 있어야 한다: {fit}%"
+        );
+
+        // 미리보기 위에서 휠을 올린다
+        let wheel = |amount: f32| egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: vec2(0.0, amount),
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
+            modifiers: egui::Modifiers::NONE,
+        };
+        harness.hover_at(egui::pos2(550.0, 330.0));
+        harness.event(wheel(120.0));
+        harness.run();
+        let zoomed = shown_zoom(&harness);
+        assert!(zoomed > fit * 1.2, "{fit}% → {zoomed}%");
+
+        // 아무리 올려도 400%를 넘지 않는다
+        for _ in 0..40 {
+            harness.event(wheel(400.0));
+            harness.run();
+        }
+        assert_eq!(shown_zoom(&harness), 400.0);
+
+        // 아무리 내려도 창에 맞춘 크기보다 작아지지 않는다
+        for _ in 0..40 {
+            harness.event(wheel(-400.0));
+            harness.run();
+        }
+        assert_eq!(shown_zoom(&harness), fit);
+    }
+
+    #[test]
+    fn a_preview_larger_than_the_gpu_texture_limit_is_still_shown() {
+        let screen = Screen::with_photos("huge-preview");
+        screen.app.borrow_mut().handle(Action::Select {
+            index: 0,
+            extend: false,
+        });
+        let generation = screen
+            .app
+            .borrow()
+            .open
+            .as_ref()
+            .unwrap()
+            .preview_generation();
+        // 시험 환경의 텍스처 한도(2048)보다 큰 미리보기
+        let pixels = Pixels {
+            width: 3000,
+            height: 100,
+            rgba: vec![128; 3000 * 100 * 4],
+        };
+        screen.app.borrow_mut().handle(Action::PreviewReady {
+            generation,
+            index: 0,
+            result: Ok(pixels),
+        });
+        let mut harness = screen.harness();
+        harness.run();
+        harness.get_by_label_contains("배율 ");
     }
 
     #[test]
@@ -976,13 +1257,28 @@ mod tests {
         handle(Action::PreviewReady {
             generation,
             index: 7,
-            result: Ok(crate::preview::shrink(&rendered.image, 2048)),
+            result: Ok(crate::preview::shrink(&rendered.image, 8192)),
         });
         handle(Action::SetDenoiseLevel(0.6));
         handle(Action::SetExportFolder(
             "/home/user/Pictures/가을여행".into(),
         ));
         shot(&mut harness, "2-workspace.png");
+
+        // 휠로 확대한 모습
+        harness.hover_at(egui::pos2(560.0, 300.0));
+        for _ in 0..6 {
+            harness.event(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: vec2(0.0, 120.0),
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Wheel,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.run_steps(2);
+        }
+        shot(&mut harness, "2b-zoomed.png");
+        harness.remove_cursor();
 
         // 내보내는 중
         handle(Action::Export {
