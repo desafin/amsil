@@ -9,7 +9,7 @@ use crate::export::{self, Report};
 use crate::job::Outcome;
 use crate::preset::{self, Preset};
 use crate::preview::Pixels;
-use crate::project::{Config, Edit, Folder, Project};
+use crate::project::{Config, Edit, Folder, LutRef, Project};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -133,7 +133,14 @@ pub enum Action {
         params: Params,
         commit: bool,
     },
-    /// 프리셋과 수동 조정을 지운다 (노이즈 제거는 그대로).
+    /// 선택한 사진들에 입힐 LUT 파일을 정한다 (None이면 없앤다).
+    SetLut(Option<PathBuf>),
+    /// LUT의 강도.
+    SetLutStrength {
+        value: f32,
+        commit: bool,
+    },
+    /// 프리셋, 수동 조정, LUT을 지운다 (노이즈 제거는 그대로).
     ResetLook,
     SetExportFolder(PathBuf),
     SetQuality(u8),
@@ -176,6 +183,8 @@ pub enum Effect {
         denoise: f32,
         /// 보정 값 (프리셋 × 강도 + 수동 조정).
         params: Params,
+        /// 마지막에 입힐 LUT 파일과 강도.
+        lut: Option<(PathBuf, f32)>,
     },
     Export {
         photos: Vec<export::Photo>,
@@ -327,6 +336,21 @@ impl App {
                     edit.adjust = params
                 })?;
             }
+            Action::SetLut(file) => {
+                open.change_look(true, &self.presets, &mut effects, |edit| {
+                    edit.lut = file.clone().map(|file| LutRef {
+                        file,
+                        strength: 1.0,
+                    })
+                })?;
+            }
+            Action::SetLutStrength { value, commit } => {
+                open.change_look(commit, &self.presets, &mut effects, |edit| {
+                    if let Some(lut) = &mut edit.lut {
+                        lut.strength = value.clamp(0.0, 1.0);
+                    }
+                })?;
+            }
             Action::ResetLook => {
                 open.change_look(true, &self.presets, &mut effects, |edit| {
                     *edit = Edit {
@@ -366,6 +390,7 @@ impl App {
                             ),
                             denoise: open.edit(index).denoise,
                             params: open.params(index, &self.presets),
+                            lut: open.lut(index),
                         }
                     })
                     .collect();
@@ -555,6 +580,11 @@ impl Open {
         preset::resolve(presets, edit.preset.as_deref(), edit.strength, &edit.adjust)
     }
 
+    /// 사진에 입힐 LUT 파일과 강도.
+    fn lut(&self, index: usize) -> Option<(PathBuf, f32)> {
+        self.edit(index).lut.map(|lut| (lut.file, lut.strength))
+    }
+
     fn request_preview(&mut self, index: usize, presets: &[Preset]) -> Effect {
         self.generation += 1;
         Effect::Preview {
@@ -563,6 +593,7 @@ impl Open {
             path: self.photo_path(index),
             denoise: self.edit(index).denoise,
             params: self.params(index, presets),
+            lut: self.lut(index),
         }
     }
 
@@ -1056,6 +1087,70 @@ mod tests {
     }
 
     #[test]
+    fn a_lut_is_applied_to_selected_photos_previewed_and_exported() {
+        let mut fx = Fixture::with_photos("lut");
+        let lut = fx.dir.join("필름.cube");
+        fx.app.handle(Action::Select {
+            index: 0,
+            extend: false,
+        });
+
+        let effects = fx.app.handle(Action::SetLut(Some(lut.clone())));
+        let stored = fx.open().edit(0).lut.unwrap();
+        assert_eq!((stored.file.clone(), stored.strength), (lut.clone(), 1.0));
+        let [
+            Effect::Preview {
+                lut: Some((file, strength)),
+                ..
+            },
+        ] = &effects[..]
+        else {
+            panic!("{effects:?}")
+        };
+        assert_eq!((file, *strength), (&lut, 1.0));
+
+        fx.app.handle(Action::SetLutStrength {
+            value: 0.4,
+            commit: true,
+        });
+        assert_eq!(
+            Project::load(&fx.open().path)
+                .unwrap()
+                .edit(0, "a.ARW")
+                .lut
+                .unwrap()
+                .strength,
+            0.4
+        );
+
+        fx.app.handle(Action::SetExportFolder(fx.dir.join("결과")));
+        let effects = fx.app.handle(Action::Export {
+            only_selected: false,
+        });
+        let [Effect::Export { photos, .. }] = &effects[..] else {
+            panic!("{effects:?}")
+        };
+        assert_eq!(photos[0].lut, Some((lut, 0.4)));
+        assert_eq!(photos[1].lut, None);
+        fx.app.handle(Action::CancelExport);
+    }
+
+    #[test]
+    fn removing_the_lut_and_resetting_the_look_both_clear_it() {
+        let mut fx = Fixture::with_photos("lut-clear");
+        fx.app.handle(Action::Select {
+            index: 1,
+            extend: false,
+        });
+        fx.app.handle(Action::SetLut(Some("/luts/a.cube".into())));
+        fx.app.handle(Action::SetLut(None));
+        assert_eq!(fx.open().edit(1).lut, None);
+        fx.app.handle(Action::SetLut(Some("/luts/a.cube".into())));
+        fx.app.handle(Action::ResetLook);
+        assert_eq!(fx.open().edit(1).lut, None);
+    }
+
+    #[test]
     fn user_presets_in_the_config_folder_are_offered_after_the_builtin_ones() {
         let dir =
             std::env::temp_dir().join(format!("amsil-app-user-presets-{}", std::process::id()));
@@ -1134,18 +1229,21 @@ mod tests {
                     output: out.join("사진/a.heic"),
                     denoise: 0.0,
                     params: Params::default(),
+                    lut: None,
                 },
                 export::Photo {
                     input: src.join("c.ARW"),
                     output: out.join("사진/c.heic"),
                     denoise: 0.0,
                     params: Params::default(),
+                    lut: None,
                 },
                 export::Photo {
                     input: src.join("sub/b.ARW"),
                     output: out.join("사진/sub/b.heic"),
                     denoise: 0.5,
                     params: Params::default(),
+                    lut: None,
                 },
             ]
         );

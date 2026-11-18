@@ -15,6 +15,8 @@ pub trait Env {
     fn open_project_path(&mut self) -> Option<PathBuf>;
     /// 폴더를 묻는다.
     fn pick_folder(&mut self) -> Option<PathBuf>;
+    /// LUT(.cube) 파일을 묻는다.
+    fn pick_lut(&mut self) -> Option<PathBuf>;
     /// 지금 창을 갈무리한다. 결과는 나중에 `Action::SaveScreenshot`으로 도착한다.
     fn screenshot(&mut self, ctx: &egui::Context);
 }
@@ -193,11 +195,11 @@ fn workspace(
     // 창이 세로로 길면 편집 패널을 아래로 내린다.
     let portrait = ui.available_width() < ui.available_height();
     if portrait {
-        Panel::bottom("edit").show(ui, |ui| edit_panel(ui, app, open, actions));
+        Panel::bottom("edit").show(ui, |ui| edit_panel(ui, app, open, env, actions));
     } else {
         Panel::right("edit")
             .default_size(240.0)
-            .show(ui, |ui| edit_panel(ui, app, open, actions));
+            .show(ui, |ui| edit_panel(ui, app, open, env, actions));
     }
     Panel::left("photos")
         .default_size(if portrait { 160.0 } else { 220.0 })
@@ -376,11 +378,17 @@ fn export_bar(
     });
 }
 
-fn edit_panel(ui: &mut egui::Ui, app: &App, open: &Open, actions: &mut Vec<Action>) {
+fn edit_panel(
+    ui: &mut egui::Ui,
+    app: &App,
+    open: &Open,
+    env: &mut dyn Env,
+    actions: &mut Vec<Action>,
+) {
     egui::ScrollArea::vertical()
         .auto_shrink(false)
         .show(ui, |ui| {
-            look_panel(ui, app, open, actions);
+            look_panel(ui, app, open, env, actions);
             ui.separator();
             denoise_panel(ui, app, open, actions);
         });
@@ -408,8 +416,14 @@ fn slider(
     }
 }
 
-/// 프리셋, 강도, 세부 조정.
-fn look_panel(ui: &mut egui::Ui, app: &App, open: &Open, actions: &mut Vec<Action>) {
+/// 프리셋, 강도, 세부 조정, LUT.
+fn look_panel(
+    ui: &mut egui::Ui,
+    app: &App,
+    open: &Open,
+    env: &mut dyn Env,
+    actions: &mut Vec<Action>,
+) {
     ui.heading("프리셋");
     let Some(current) = open.current else {
         ui.weak("사진을 고르면 프리셋을 적용할 수 있습니다");
@@ -480,9 +494,36 @@ fn look_panel(ui: &mut egui::Ui, app: &App, open: &Open, actions: &mut Vec<Actio
             });
         }
     });
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .button("LUT 불러오기…")
+            .on_hover_text("3D LUT(.cube) 파일을 보정 뒤에 입힙니다")
+            .clicked()
+            && let Some(file) = env.pick_lut()
+        {
+            actions.push(Action::SetLut(Some(file)));
+        }
+        if let Some(lut) = &edit.lut {
+            let name = lut.file.file_name().unwrap_or(lut.file.as_os_str());
+            ui.label(name.to_string_lossy())
+                .on_hover_text(lut.file.display().to_string());
+            if ui.button("LUT 없애기").clicked() {
+                actions.push(Action::SetLut(None));
+            }
+        }
+    });
+    if let Some(lut) = &edit.lut {
+        let mut strength = lut.strength;
+        if let Some(commit) = slider(ui, "LUT 강도", &mut strength, 0.0..=1.0) {
+            actions.push(Action::SetLutStrength {
+                value: strength,
+                commit,
+            });
+        }
+    }
     if ui
         .button("보정 초기화")
-        .on_hover_text("프리셋과 세부 조정을 지웁니다 (노이즈 제거는 그대로)")
+        .on_hover_text("프리셋, 세부 조정, LUT을 지웁니다 (노이즈 제거는 그대로)")
         .clicked()
     {
         actions.push(Action::ResetLook);
@@ -907,6 +948,9 @@ mod tests {
         fn pick_folder(&mut self) -> Option<PathBuf> {
             self.path.clone()
         }
+        fn pick_lut(&mut self) -> Option<PathBuf> {
+            self.path.clone()
+        }
         fn screenshot(&mut self, _: &egui::Context) {
             self.screenshots += 1;
         }
@@ -1192,6 +1236,30 @@ mod tests {
     }
 
     #[test]
+    fn a_lut_file_is_chosen_shown_by_name_and_removed() {
+        let screen = Screen::with_photos("lut");
+        screen.app.borrow_mut().handle(Action::Select {
+            index: 0,
+            extend: false,
+        });
+        screen.env.borrow_mut().path = Some("/home/user/luts/따뜻한 필름.cube".into());
+        let mut harness = screen.harness();
+        harness.run_steps(3);
+        harness.get_by_label("LUT 불러오기…").click();
+        harness.run_steps(3);
+        let lut = || screen.app.borrow().open.as_ref().unwrap().edit(0).lut;
+        assert_eq!(
+            lut().unwrap().file,
+            std::path::Path::new("/home/user/luts/따뜻한 필름.cube")
+        );
+        harness.get_by_label("따뜻한 필름.cube");
+
+        harness.get_by_label("LUT 없애기").click();
+        harness.run_steps(3);
+        assert_eq!(lut(), None);
+    }
+
+    #[test]
     fn reset_button_clears_the_look() {
         let screen = Screen::with_photos("reset-look");
         screen.app.borrow_mut().handle(Action::Select {
@@ -1418,7 +1486,8 @@ mod tests {
         });
         let path = screen.app.borrow().open.as_ref().unwrap().photo_path(7);
         let rendered =
-            crate::export::render(&path, None, &crate::edit::Params::default(), &|_| {}).unwrap();
+            crate::export::render(&path, None, &crate::edit::Params::default(), None, &|_| {})
+                .unwrap();
         let generation = screen
             .app
             .borrow()
@@ -1462,7 +1531,7 @@ mod tests {
             let app = screen.app.borrow();
             app.open.as_ref().unwrap().params(7, &app.presets)
         };
-        let looked = crate::export::render(&path, None, &params, &|_| {}).unwrap();
+        let looked = crate::export::render(&path, None, &params, None, &|_| {}).unwrap();
         let generation = screen
             .app
             .borrow()
@@ -1476,6 +1545,45 @@ mod tests {
             result: Ok(crate::preview::shrink(&looked.image, 8192)),
         });
         shot(&mut harness, "2c-preset.png");
+        handle(Action::ResetLook);
+
+        // LUT을 입힌 모습 (따뜻하고 채도가 낮은 시험용 LUT, 강도 80%)
+        let cube = screen.dir.join("따뜻한 필름.cube");
+        let mut text = String::from("LUT_3D_SIZE 17\n");
+        for index in 0..17usize.pow(3) {
+            let [r, g, b] = [index % 17, index / 17 % 17, index / 289].map(|v| v as f32 / 16.0);
+            let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            let fade = |v: f32| y + (v - y) * 0.6;
+            text += &format!(
+                "{} {} {}\n",
+                (fade(r) * 1.06 + 0.02).min(1.0),
+                fade(g),
+                fade(b) * 0.9
+            );
+        }
+        std::fs::write(&cube, text).unwrap();
+        handle(Action::SetLut(Some(cube.clone())));
+        handle(Action::SetLutStrength {
+            value: 0.8,
+            commit: true,
+        });
+        let lut = crate::lut::Lut::load(&cube).unwrap();
+        let params = crate::edit::Params::default();
+        let toned =
+            crate::export::render(&path, None, &params, Some((&lut, 0.8)), &|_| {}).unwrap();
+        let generation = screen
+            .app
+            .borrow()
+            .open
+            .as_ref()
+            .unwrap()
+            .preview_generation();
+        handle(Action::PreviewReady {
+            generation,
+            index: 7,
+            result: Ok(crate::preview::shrink(&toned.image, 8192)),
+        });
+        shot(&mut harness, "2d-lut.png");
         handle(Action::ResetLook);
 
         // 내보내는 중

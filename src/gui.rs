@@ -102,6 +102,13 @@ impl Env for Dialogs {
         rfd::FileDialog::new().pick_folder()
     }
 
+    fn pick_lut(&mut self) -> Option<PathBuf> {
+        rfd::FileDialog::new()
+            .set_title("LUT 불러오기")
+            .add_filter("3D LUT", &["cube"])
+            .pick_file()
+    }
+
     fn screenshot(&mut self, ctx: &egui::Context) {
         let send = self.send.clone();
         ctx.request_screenshot(move |image| {

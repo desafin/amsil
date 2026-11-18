@@ -53,6 +53,22 @@ pub struct Edit {
     /// 프리셋 위에 더하는 수동 조정.
     #[serde(skip_serializing_if = "Params::is_neutral")]
     pub adjust: Params,
+    /// 마지막에 입히는 LUT.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lut: Option<LutRef>,
+}
+
+/// 사진에 입힐 LUT 파일과 강도.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LutRef {
+    pub file: PathBuf,
+    /// 1이면 LUT 그대로, 0이면 원본.
+    #[serde(default = "one", skip_serializing_if = "is_one")]
+    pub strength: f32,
+}
+
+fn one() -> f32 {
+    1.0
 }
 
 impl Default for Edit {
@@ -62,6 +78,7 @@ impl Default for Edit {
             preset: None,
             strength: 1.0,
             adjust: Params::default(),
+            lut: None,
         }
     }
 }
@@ -351,6 +368,36 @@ mod tests {
         assert!(
             !text.contains("contrast") && !text.contains("blue"),
             "0인 값은 적지 않는다:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_lut_and_its_strength_are_saved_per_photo() {
+        let dir = temp("lut");
+        let path = dir.join("p.amsil");
+        let mut project = sample();
+        let lut = LutRef {
+            file: "/home/user/luts/따뜻한 필름.cube".into(),
+            strength: 0.5,
+        };
+        project.set_edit(
+            0,
+            "a.ARW",
+            Edit {
+                lut: Some(lut.clone()),
+                ..Edit::default()
+            },
+        );
+        project.save(&path).unwrap();
+        assert_eq!(
+            Project::load(&path).unwrap().edit(0, "a.ARW").lut,
+            Some(lut)
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(
+            text.contains("따뜻한 필름.cube") && text.contains("strength = 0.5"),
+            "{text}"
         );
     }
 

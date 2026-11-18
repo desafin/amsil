@@ -3,6 +3,7 @@
 
 use crate::edit::Params;
 use crate::gpu::{self, Denoiser};
+use crate::lut::Lut;
 use crate::{Result, denoise, develop, heif, job, raw};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -28,6 +29,8 @@ pub struct Photo {
     pub denoise: f32,
     /// 보정 값 (프리셋 × 강도 + 수동 조정).
     pub params: Params,
+    /// 마지막에 입힐 LUT 파일과 강도.
+    pub lut: Option<(PathBuf, f32)>,
 }
 
 /// 배치 전체에 적용되는 설정.
@@ -75,8 +78,17 @@ pub struct Loaded {
 
 impl Loaded {
     /// 보정을 적용해 현상하고 바로 세운다. `cam`에는 `self.cam`이나 그것을 줄인 것을 준다.
-    pub fn develop(&self, cam: &crate::Image, params: &Params) -> crate::Image {
-        let image = develop::develop(cam, self.wb, self.xyz_to_cam, params);
+    /// `lut`이 있으면 마지막에 그 강도로 입힌다.
+    pub fn develop(
+        &self,
+        cam: &crate::Image,
+        params: &Params,
+        lut: Option<(&Lut, f32)>,
+    ) -> crate::Image {
+        let mut image = develop::develop(cam, self.wb, self.xyz_to_cam, params);
+        if let Some((lut, strength)) = lut {
+            lut.apply(&mut image, strength);
+        }
         let (transpose, flip_h, flip_v) = self.flips;
         develop::orient(image, transpose, flip_h, flip_v)
     }
@@ -132,11 +144,12 @@ pub fn render(
     input: &Path,
     denoise: Option<(&Mutex<Denoiser>, f32)>,
     params: &Params,
+    lut: Option<(&Lut, f32)>,
     progress: &dyn Fn(f32),
 ) -> Result<Rendered> {
     let timing = Timing::start();
     let loaded = load(input, denoise, progress)?;
-    let image = loaded.develop(&loaded.cam, params);
+    let image = loaded.develop(&loaded.cam, params, lut);
     timing.mark("현상");
     progress(0.75);
     Ok(Rendered {
@@ -147,6 +160,7 @@ pub fn render(
 
 /// RAW 한 장을 HEIF로 바꾼다. `progress`에는 진행 정도(0~1)를 알린다.
 /// 알려야 할 일이 있으면(품질을 낮춘 경우) 그 문구를 돌려준다.
+#[allow(clippy::too_many_arguments)] // ponytail: 인자가 더 늘면 보정·LUT을 한 구조체로 묶는다
 pub fn convert(
     input: &Path,
     output: &Path,
@@ -154,10 +168,11 @@ pub fn convert(
     encoder_threads: usize,
     denoise: Option<(&Mutex<Denoiser>, f32)>,
     params: &Params,
+    lut: Option<(&Lut, f32)>,
     progress: &dyn Fn(f32),
 ) -> Result<Option<String>> {
     let timing = Timing::start();
-    let Rendered { image, exif } = render(input, denoise, params, progress)?;
+    let Rendered { image, exif } = render(input, denoise, params, lut, progress)?;
     let encoded = heif::encode(&image, quality, Some(&exif), encoder_threads)?;
     timing.mark("인코딩");
     progress(0.98);
@@ -356,9 +371,15 @@ pub fn run(
             output: photo.output.clone(),
         })
         .collect();
-    let looks: HashMap<&Path, (f32, Params)> = photos
+    let looks: HashMap<&Path, &Photo> = photos
         .iter()
-        .map(|photo| (photo.input.as_path(), (photo.denoise, photo.params)))
+        .map(|photo| (photo.output.as_path(), photo))
+        .collect();
+    // LUT 파일은 한 번씩만 읽는다. 읽지 못한 것은 그 LUT을 쓰는 사진만 실패시킨다.
+    let luts: HashMap<&Path, std::result::Result<Lut, String>> = photos
+        .iter()
+        .filter_map(|photo| photo.lut.as_ref())
+        .map(|(file, _)| (file.as_path(), Lut::load(file).map_err(|e| e.to_string())))
         .collect();
 
     let mut system = sysinfo::System::new()?;
@@ -386,15 +407,23 @@ pub fn run(
             system.available_memory()
         },
         work: &|task, progress| {
-            let (strength, params) = looks[task.input.as_path()];
-            let denoise = denoiser.map(|model| (model, strength));
+            let photo = looks[task.output.as_path()];
+            let denoise = denoiser.map(|model| (model, photo.denoise));
+            let lut = match &photo.lut {
+                Some((file, strength)) => Some((
+                    luts[file.as_path()].as_ref().map_err(|e| e.clone())?,
+                    *strength,
+                )),
+                None => None,
+            };
             let warning = convert(
                 &task.input,
                 &task.output,
                 settings.quality,
                 encoder_threads,
                 denoise,
-                &params,
+                &photo.params,
+                lut,
                 progress,
             )?;
             if let Some(warning) = warning {
@@ -421,7 +450,17 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let output = dir.join("out.heic");
 
-        convert(&input, &output, 55, 8, None, &Params::default(), &|_| {}).unwrap();
+        convert(
+            &input,
+            &output,
+            55,
+            8,
+            None,
+            &Params::default(),
+            None,
+            &|_| {},
+        )
+        .unwrap();
 
         let ctx = HeifContext::read_from_file(output.to_str().unwrap()).unwrap();
         let handle = ctx.primary_image_handle().unwrap();
@@ -465,7 +504,17 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let (plain, denoised) = (dir.join("plain.heic"), dir.join("denoised.heic"));
 
-        convert(&input, &plain, 55, 8, None, &Params::default(), &|_| {}).unwrap();
+        convert(
+            &input,
+            &plain,
+            55,
+            8,
+            None,
+            &Params::default(),
+            None,
+            &|_| {},
+        )
+        .unwrap();
         convert(
             &input,
             &denoised,
@@ -473,6 +522,7 @@ mod tests {
             8,
             Some((&Mutex::new(model), 1.0)),
             &Params::default(),
+            None,
             &|_| {},
         )
         .unwrap();
@@ -522,5 +572,81 @@ mod tests {
             (2, 16),
             "사진이 두 장뿐이면 코어를 둘이 나눠 쓴다"
         );
+    }
+
+    /// 출력 이미지의 채널별 평균.
+    fn means(image: &crate::Image) -> [f32; 3] {
+        [0, 1, 2].map(|c| image.planes[c].iter().sum::<f32>() / image.planes[c].len() as f32)
+    }
+
+    #[test]
+    fn a_lut_changes_the_picture_by_its_strength_and_an_identity_lut_does_not() {
+        let Some(input) = sample_arw() else { return };
+        let identity = crate::lut::Lut::parse(
+            "LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n",
+        )
+        .unwrap();
+        // 빨강을 없애는 LUT
+        let no_red = crate::lut::Lut::parse(
+            "LUT_3D_SIZE 2\n0 0 0\n0 0 0\n0 1 0\n0 1 0\n0 0 1\n0 0 1\n0 1 1\n0 1 1\n",
+        )
+        .unwrap();
+        let loaded = load(&input, None, &|_| {}).unwrap();
+        let small = crate::preview::downscale(&loaded.cam, 400).unwrap();
+        let plain = means(&loaded.develop(&small, &Params::default(), None));
+
+        let same = means(&loaded.develop(&small, &Params::default(), Some((&identity, 1.0))));
+        assert!(
+            (0..3).all(|c| (same[c] - plain[c]).abs() < 1e-3),
+            "{same:?} 대 {plain:?}"
+        );
+
+        let full = means(&loaded.develop(&small, &Params::default(), Some((&no_red, 1.0))));
+        assert!(
+            full[0] < 1e-4 && (full[1] - plain[1]).abs() < 1e-3,
+            "{full:?}"
+        );
+        let half = means(&loaded.develop(&small, &Params::default(), Some((&no_red, 0.5))));
+        assert!((half[0] - plain[0] / 2.0).abs() < 1e-3, "{half:?}");
+    }
+
+    #[test]
+    fn a_photo_whose_lut_cannot_be_read_fails_with_the_file_name_and_the_rest_continue() {
+        let Some(input) = sample_arw() else { return };
+        let dir = std::env::temp_dir().join(format!("amsil-test-lut-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("없는 필름.cube");
+        let photos = vec![
+            Photo {
+                input: input.clone(),
+                output: dir.join("with-lut.heic"),
+                denoise: 0.0,
+                params: Params::default(),
+                lut: Some((missing, 1.0)),
+            },
+            Photo {
+                input,
+                output: dir.join("plain.heic"),
+                denoise: 0.0,
+                params: Params::default(),
+                lut: None,
+            },
+        ];
+        let (outcome, _) = run(
+            &photos,
+            &Settings::default(),
+            None,
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!((outcome.done, outcome.failed.len()), (1, 1));
+        assert!(
+            outcome.failed[0].1.contains("없는 필름.cube"),
+            "{:?}",
+            outcome.failed
+        );
+        assert!(dir.join("plain.heic").exists() && !dir.join("with-lut.heic").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

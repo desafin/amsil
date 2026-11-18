@@ -8,6 +8,7 @@ mod gpu;
 mod gui;
 mod heif;
 mod job;
+mod lut;
 mod preset;
 mod preview;
 mod project;

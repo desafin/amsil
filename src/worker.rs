@@ -2,6 +2,7 @@
 
 use crate::app::{Action, Backend, Effect};
 use crate::gpu::Denoiser;
+use crate::lut::Lut;
 use crate::{export, preview};
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
@@ -15,6 +16,8 @@ const THUMBNAIL_SIDE: usize = 160;
 const PREVIEW_SIDE: usize = 2048;
 
 type SharedDenoiser = Arc<Mutex<Denoiser>>;
+/// (파일 경로, 읽은 LUT)
+type CachedLut = (PathBuf, Arc<Lut>);
 
 /// 보정을 바꿀 때 바로 보여 주는 작은 미리보기의 긴 변 (화소).
 const QUICK_SIDE: usize = 1200;
@@ -42,6 +45,8 @@ pub struct Workers {
     preview_side: Arc<AtomicU64>,
     /// 미리보기 중인 사진 한 장.
     base: Arc<Mutex<Option<Arc<Base>>>>,
+    /// 마지막으로 읽은 LUT. 강도 슬라이더를 끄는 동안 파일을 다시 읽지 않게 한다.
+    lut: Arc<Mutex<Option<CachedLut>>>,
 }
 
 impl Workers {
@@ -55,6 +60,7 @@ impl Workers {
             latest_preview: Arc::default(),
             preview_side: Arc::new(AtomicU64::new(PREVIEW_SIDE as u64)),
             base: Arc::default(),
+            lut: Arc::default(),
         };
         (workers, rx)
     }
@@ -131,6 +137,17 @@ impl Workers {
         Ok(base)
     }
 
+    // ponytail: 경로만 보고 재사용한다. 프로그램을 켜 둔 채 LUT 파일을 고치면 사진을 다시 골라도 옛 내용이 보인다.
+    fn lut(&self, path: &Path) -> std::result::Result<Arc<Lut>, String> {
+        let mut slot = self.lut.lock().unwrap();
+        if let Some((_, lut)) = slot.as_ref().filter(|(cached, _)| cached == path) {
+            return Ok(lut.clone());
+        }
+        let lut = Arc::new(Lut::load(path).map_err(|e| e.to_string())?);
+        *slot = Some((path.to_owned(), lut.clone()));
+        Ok(lut)
+    }
+
     pub fn run(&self, effect: Effect) {
         let workers = self.clone();
         match effect {
@@ -148,6 +165,7 @@ impl Workers {
                 path,
                 denoise,
                 params,
+                lut,
             } => {
                 self.latest_preview.store(generation, SeqCst);
                 std::thread::spawn(move || {
@@ -161,6 +179,11 @@ impl Workers {
                         });
                     };
                     let result = (|| -> std::result::Result<(), String> {
+                        let lut = match &lut {
+                            Some((file, strength)) => Some((workers.lut(file)?, *strength)),
+                            None => None,
+                        };
+                        let lut = lut.as_ref().map(|(lut, strength)| (&**lut, *strength));
                         let base = workers.base(&path, denoise)?;
                         if stale() {
                             return Ok(());
@@ -168,14 +191,14 @@ impl Workers {
                         // 먼저 줄인 사본으로 빨리 보여 주고, 이어서 원본 크기로 다시 만든다.
                         if let Some(small) = &base.small {
                             send(preview::shrink(
-                                &base.loaded.develop(small, &params),
+                                &base.loaded.develop(small, &params, lut),
                                 usize::MAX,
                             ));
                             if stale() {
                                 return Ok(());
                             }
                         }
-                        let full = base.loaded.develop(&base.loaded.cam, &params);
+                        let full = base.loaded.develop(&base.loaded.cam, &params, lut);
                         if !stale() {
                             send(preview::shrink(
                                 &full,
@@ -272,6 +295,7 @@ mod tests {
             path: sample.clone(),
             denoise: 0.0,
             params: Default::default(),
+            lut: None,
         });
         // 빠른 작은 미리보기가 먼저 오고, 원본 크기에 가까운 것이 뒤따른다.
         let seen = wait_for(
@@ -306,6 +330,7 @@ mod tests {
             path: sample.clone(),
             denoise: 0.0,
             params: mono,
+            lut: None,
         });
         let seen = wait_for(&rx, |action| {
             matches!(action, Action::PreviewReady { generation: 8, .. })
@@ -338,6 +363,7 @@ mod tests {
             output: output.clone(),
             denoise: 0.0,
             params: Default::default(),
+            lut: None,
         }];
         workers.run(Effect::Export {
             photos,
@@ -370,6 +396,7 @@ mod tests {
             path: sample.clone(),
             denoise: 0.0,
             params: Default::default(),
+            lut: None,
         });
         workers.run(Effect::Preview {
             generation: 2,
@@ -377,6 +404,7 @@ mod tests {
             path: sample,
             denoise: 0.0,
             params: Default::default(),
+            lut: None,
         });
         let seen = wait_for(&rx, |action| {
             matches!(action, Action::PreviewReady { generation: 2, .. })
