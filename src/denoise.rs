@@ -52,6 +52,12 @@ pub fn run(packed: &Packed, infer: impl FnMut(&[f32]) -> Result<Vec<f32>>) -> Re
     Ok(out)
 }
 
+/// `run`이 모델을 부르는 횟수.
+pub fn tile_count(packed: &Packed) -> usize {
+    let step = TILE - 2 * OVERLAP;
+    packed.width.div_ceil(step) * packed.height.div_ceil(step)
+}
+
 /// 타일마다 `infer`를 불러 2배 해상도의 3채널 이미지를 만든다.
 ///
 /// `infer`는 4×512×512 입력(채널 우선)을 받아 3×1024×1024 출력을 돌려준다.
@@ -219,6 +225,7 @@ mod tests {
 
         assert_eq!((out.width, out.height), (1800, 1200));
         assert_eq!(calls, 3 * 2);
+        assert_eq!(tile_count(&packed), calls);
         for c in 0..3 {
             for y in 0..out.height {
                 for x in 0..out.width {

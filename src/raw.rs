@@ -111,9 +111,22 @@ fn rggb_offset(cfa: &CFA) -> Option<(usize, usize)> {
         })
 }
 
+/// 센서의 화소 수. 화소 데이터를 풀지 않고 헤더만 읽는다 (메모리 사용량을 미리 가늠하는 데 쓴다).
+pub fn pixel_count(path: &Path) -> Result<u64> {
+    let source = RawSource::new(path)?;
+    let image = decoder(&source)?.raw_image(&source, &RawDecodeParams::default(), true)?;
+    Ok((image.width * image.height) as u64)
+}
+
+/// 파일 형식에 맞는 디코더를 찾는다.
+fn decoder(source: &RawSource) -> Result<Box<dyn rawler::decoders::Decoder>> {
+    rawler::get_decoder(source)
+        .map_err(|e| format!("지원하지 않거나 손상된 RAW 파일입니다 ({e})").into())
+}
+
 pub fn decode(path: &Path) -> Result<Raw> {
     let source = RawSource::new(path)?;
-    let decoder = rawler::get_decoder(&source)?;
+    let decoder = decoder(&source)?;
     let params = RawDecodeParams::default();
     let mut image = decoder.raw_image(&source, &params, false)?;
     let mut metadata = decoder.raw_metadata(&source, &params)?;
@@ -173,6 +186,28 @@ mod tests {
         assert_eq!(rggb_offset(&CFA::new("GRBG")), Some((1, 0)));
         assert_eq!(rggb_offset(&CFA::new("GBRG")), Some((0, 1)));
         assert_eq!(rggb_offset(&CFA::new("BGGR")), Some((1, 1)));
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_raw_photo_gets_a_plain_explanation() {
+        let path = std::env::temp_dir().join(format!("amsil-not-raw-{}.ARW", std::process::id()));
+        std::fs::write(&path, [0x5a; 4096]).unwrap();
+        let (decoded, counted) = (
+            decode(&path).err().unwrap(),
+            pixel_count(&path).err().unwrap(),
+        );
+        std::fs::remove_file(&path).unwrap();
+        for error in [decoded.to_string(), counted.to_string()] {
+            assert!(error.contains("지원하지 않거나 손상된 RAW 파일"), "{error}");
+        }
+    }
+
+    #[test]
+    fn pixel_count_is_the_sensor_size() {
+        let Some(path) = crate::sample_arw() else {
+            return;
+        };
+        assert_eq!(pixel_count(&path).unwrap(), 6080 * 4048);
     }
 
     #[test]

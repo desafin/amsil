@@ -8,11 +8,20 @@ use ort::session::Session;
 use ort::value::TensorRef;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Instant;
 
 /// ONNX Runtime 환경은 프로세스에 하나만 만들 수 있다.
 static ENV: LazyLock<std::result::Result<Environment, String>> =
     LazyLock::new(|| ort::init().build().map_err(|e| e.to_string()));
+
+/// 모델을 실제로 돌린 시간의 누적 (나노초). 화면에 GPU 사용률을 보여 주는 데 쓴다.
+static BUSY_NANOS: AtomicU64 = AtomicU64::new(0);
+
+/// 프로그램 시작부터 지금까지 모델을 돌린 시간 (나노초).
+pub fn busy_nanos() -> u64 {
+    BUSY_NANOS.load(Relaxed)
+}
 
 /// 모델이 실제로 돌아가는 곳.
 #[derive(Debug)]
@@ -75,10 +84,13 @@ impl Denoiser {
 
     /// 4×512×512 타일(채널 우선)을 받아 3×1024×1024를 돌려준다.
     pub fn infer(&mut self, tile: &[f32]) -> Result<Vec<f32>> {
+        let started = Instant::now();
         let input = TensorRef::from_array_view(([1, 4, TILE, TILE], tile))?;
         let outputs = self.session.run(ort::inputs![input])?;
         let (_, data) = outputs[0].try_extract_tensor::<f32>()?;
-        Ok(data.to_vec())
+        let out = data.to_vec();
+        BUSY_NANOS.fetch_add(started.elapsed().as_nanos() as u64, Relaxed);
+        Ok(out)
     }
 }
 

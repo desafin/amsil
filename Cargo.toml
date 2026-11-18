@@ -12,6 +12,7 @@ libheif-rs = { version = "3.0.0", features = ["embedded-libheif"] }
 ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "download-binaries", "copy-dylibs", "tls-rustls", "api-31", "webgpu"] }
 rawler = "0.8.0"
 rayon = "1.12"
+sysinfo = { version = "0.40", default-features = false, features = ["system"] }
 
 # 이미지 처리 코드는 최적화 없이는 테스트조차 너무 느리다.
 [profile.dev]
