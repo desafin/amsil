@@ -1612,27 +1612,35 @@ mod tests {
 
         /// 창 크기를 정해서 띄운다.
         fn harness_sized(&self, size: egui::Vec2) -> Harness<'_> {
+            self.harness_scaled(size, 1.0)
+        }
+
+        /// 창 크기와, 화면의 한 점을 몇 화소로 그릴지를 정해서 띄운다 (그림을 또렷하게 남길 때 쓴다).
+        fn harness_scaled(&self, size: egui::Vec2, pixels_per_point: f32) -> Harness<'_> {
             let mut view = View::default();
             let mut fonts_installed = false;
-            Harness::builder().with_size(size).build_ui(move |ui| {
-                // 글꼴은 다음 프레임부터 적용된다. 첫 프레임에는 아무것도 그리지 않는다.
-                if !fonts_installed {
-                    install_fonts(ui.ctx());
-                    fonts_installed = true;
-                    ui.ctx().request_repaint();
-                    return;
-                }
-                let actions = draw(
-                    ui,
-                    &self.app.borrow(),
-                    &mut view,
-                    &mut *self.env.borrow_mut(),
-                );
-                for action in actions {
-                    self.seen.borrow_mut().push(name_of(&action));
-                    self.app.borrow_mut().handle(action);
-                }
-            })
+            Harness::builder()
+                .with_size(size)
+                .with_pixels_per_point(pixels_per_point)
+                .build_ui(move |ui| {
+                    // 글꼴은 다음 프레임부터 적용된다. 첫 프레임에는 아무것도 그리지 않는다.
+                    if !fonts_installed {
+                        install_fonts(ui.ctx());
+                        fonts_installed = true;
+                        ui.ctx().request_repaint();
+                        return;
+                    }
+                    let actions = draw(
+                        ui,
+                        &self.app.borrow(),
+                        &mut view,
+                        &mut *self.env.borrow_mut(),
+                    );
+                    for action in actions {
+                        self.seen.borrow_mut().push(name_of(&action));
+                        self.app.borrow_mut().handle(action);
+                    }
+                })
         }
     }
 
@@ -2995,5 +3003,106 @@ mod tests {
         ] {
             assert_eq!(shown(&harness, text), 1, "{text}");
         }
+    }
+
+    /// README에 넣는 화면 그림(`assets/screenshots/workspace.jpg`)을 만든다.
+    /// `cargo test -- --ignored render_readme_screenshot`
+    ///
+    /// 그림은 공개 저장소에 올라간다. 그래서 사람이 나오지 않는 풍경·건축·음식 사진만 골라 쓰고,
+    /// 화면에 나오는 경로도 실제 것이 아닌 것으로 둔다.
+    #[test]
+    #[ignore = "샘플 사진이 필요하고, 저장소에 든 그림 파일을 고쳐 쓴다"]
+    fn render_readme_screenshot() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source = root.join("DCIM/10361110");
+        let chosen = [
+            "DSC04545.ARW", // 가을 숲길 (미리보기에 띄운다)
+            "DSC04546.ARW", // 언덕
+            "DSC04549.ARW", // 솔가지
+            "DSC04551.ARW", // 건물들
+            "DSC04553.ARW", // 처마와 건물
+            "DSC04554.ARW", // 돌길
+            "DSC04558.ARW", // 감자튀김
+            "DSC04559.ARW", // 햄버거
+            "DSC04560.ARW", // 감자튀김
+        ];
+        let screen = Screen::new("readme");
+        let handle = |action| {
+            screen.app.borrow_mut().handle(action);
+        };
+        // 고른 사진만 든 폴더를 만들어 가져온다.
+        let folder = screen.dir.join("가을 여행");
+        std::fs::create_dir_all(&folder).unwrap();
+        for name in chosen {
+            std::os::unix::fs::symlink(source.join(name), folder.join(name)).unwrap();
+        }
+        handle(Action::NewProject(screen.dir.join("가을 여행.amsil")));
+        handle(Action::ImportFolder(folder));
+        handle(Action::Backend(Backend::Gpu));
+        handle(Action::SetTheme(Theme::Dark));
+
+        let mut classifier = crate::recommend::load_classifier().ok();
+        for index in 0..chosen.len() {
+            let path = screen.app.borrow().open.as_ref().unwrap().photo_path(index);
+            let picture = crate::preview::thumbnail(&path, 448).unwrap();
+            let guess = picture
+                .as_ref()
+                .zip(classifier.as_mut())
+                .map(|(picture, classifier)| classifier.classify(picture).unwrap());
+            handle(Action::Thumbnail {
+                index,
+                pixels: picture.map(|picture| picture.fit_within(160).unwrap()),
+                guess,
+            });
+        }
+        // 숲길 사진을 고르고 "풍경" 프리셋을 적용한 모습
+        handle(Action::Select {
+            index: 0,
+            extend: false,
+        });
+        handle(Action::SetPreset(Some("landscape".into())));
+        let (path, params) = {
+            let app = screen.app.borrow();
+            let open = app.open.as_ref().unwrap();
+            (open.photo_path(0), open.params(0, &app.presets))
+        };
+        let rendered =
+            crate::export::render(&path, None, crate::export::Look::new(&params), &|_| {}).unwrap();
+        let generation = screen
+            .app
+            .borrow()
+            .open
+            .as_ref()
+            .unwrap()
+            .preview_generation();
+        handle(Action::PreviewReady {
+            generation,
+            index: 0,
+            result: Ok(crate::preview::shrink(&rendered.image, 8192)),
+        });
+        handle(Action::SetExportFolder(
+            "/home/user/Pictures/가을 여행".into(),
+        ));
+
+        let out = root.join("assets/screenshots");
+        std::fs::create_dir_all(&out).unwrap();
+        // 1100×700짜리 창을 1.5배로 그려, 줄여 보여도 글자가 또렷하게 한다.
+        let scale = 1.5;
+        let mut harness = screen.harness_scaled(egui::vec2(1100.0, 700.0), scale);
+        harness.run_steps(6);
+        let rendered = harness.render().unwrap();
+        // 시험 환경이 둘레에 두는 여백(8점)을 잘라 내고, 용량이 작은 JPEG로 저장한다.
+        let margin = (8.0 * scale) as u32;
+        let (width, height) = (
+            rendered.width() - 2 * margin,
+            rendered.height() - 2 * margin,
+        );
+        let cropped =
+            image::imageops::crop_imm(&rendered, margin, margin, width, height).to_image();
+        let rgb = image::DynamicImage::ImageRgba8(cropped).into_rgb8();
+        let file = std::fs::File::create(out.join("workspace.jpg")).unwrap();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(file, 90)
+            .encode_image(&rgb)
+            .unwrap();
     }
 }

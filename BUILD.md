@@ -34,6 +34,7 @@ cargo test --locked
 - 실제 RAW 파일이 필요한 테스트는 `DCIM/` 아래의 샘플 사진이 있을 때만, 모델이 필요한 테스트는 모델을 받아 두었을 때만 실행된다. 없으면 건너뛴다. 샘플 사진은 개인 사진이라 저장소에 없다.
 - 화면 테스트는 창을 띄우지 않고 돈다 (`egui_kittest`).
 - 눈으로 확인할 화면 그림은 `cargo test -- --ignored render`로 `target/ui/`에 만든다 (샘플 사진 필요).
+- README의 화면 그림(`assets/screenshots/workspace.jpg`)은 `cargo test -- --ignored render_readme_screenshot`으로 다시 만든다. 공개 저장소에 올라가는 그림이라, 쓸 사진(사람이 나오지 않는 것)의 목록이 그 테스트 안에 적혀 있다.
 
 커밋을 올리면 GitHub Actions가 깨끗한 Ubuntu 24.04에서 같은 절차로 빌드하고 테스트한다 ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
 
