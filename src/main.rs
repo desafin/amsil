@@ -1,11 +1,17 @@
+mod app;
 mod cli;
 mod denoise;
 mod develop;
 mod export;
 mod gpu;
+mod gui;
 mod heif;
 mod job;
+mod preview;
+mod project;
 mod raw;
+mod ui;
+mod worker;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -17,6 +23,19 @@ pub struct Image {
 }
 
 fn main() -> std::process::ExitCode {
+    // 인자 없이 실행하면 창을 띄운다.
+    if std::env::args_os().len() <= 1 {
+        return match gui::run() {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!(
+                    "창을 열 수 없습니다: {e}\n\n화면 없이 쓰려면 명령행으로 실행하세요.\n{}",
+                    cli::USAGE
+                );
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
     let args = match cli::parse_args(std::env::args_os().skip(1)) {
         Ok(args) => args,
         Err(message) => {

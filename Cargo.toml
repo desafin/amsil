@@ -8,11 +8,20 @@ rust-version = "1.95"
 publish = false
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+eframe = "0.37"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 libheif-rs = { version = "3.0.0", features = ["embedded-libheif"] }
 ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "download-binaries", "copy-dylibs", "tls-rustls", "api-31", "webgpu"] }
 rawler = "0.8.0"
+rfd = "0.18"
 rayon = "1.12"
+serde = { version = "1", features = ["derive"] }
 sysinfo = { version = "0.40", default-features = false, features = ["system"] }
+toml = "1"
+
+[dev-dependencies]
+egui_kittest = { version = "0.37", features = ["wgpu"] }
 
 # 이미지 처리 코드는 최적화 없이는 테스트조차 너무 느리다.
 [profile.dev]

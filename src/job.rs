@@ -182,7 +182,7 @@ pub struct Status {
     pub running: usize,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct Outcome {
     pub done: usize,
     pub skipped: usize,

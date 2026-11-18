@@ -111,6 +111,31 @@ fn rggb_offset(cfa: &CFA) -> Option<(usize, usize)> {
         })
 }
 
+/// RAW 파일 안에 들어 있는 미리보기 JPEG를 바로 세워서 돌려준다. 없으면 None.
+pub fn embedded_preview(path: &Path) -> Result<Option<image::DynamicImage>> {
+    let source = RawSource::new(path)?;
+    let decoder = decoder(&source)?;
+    let params = RawDecodeParams::default();
+    let Some(preview) = decoder.preview_image(&source, &params)? else {
+        return Ok(None);
+    };
+    let orientation = decoder
+        .raw_metadata(&source, &params)?
+        .exif
+        .orientation
+        .unwrap_or(1);
+    Ok(Some(match Orientation::from_u16(orientation) {
+        Orientation::Rotate90 => preview.rotate90(),
+        Orientation::Rotate180 => preview.rotate180(),
+        Orientation::Rotate270 => preview.rotate270(),
+        Orientation::HorizontalFlip => preview.fliph(),
+        Orientation::VerticalFlip => preview.flipv(),
+        Orientation::Transpose => preview.rotate90().fliph(),
+        Orientation::Transverse => preview.rotate270().fliph(),
+        Orientation::Normal | Orientation::Unknown => preview,
+    }))
+}
+
 /// 센서의 화소 수. 화소 데이터를 풀지 않고 헤더만 읽는다 (메모리 사용량을 미리 가늠하는 데 쓴다).
 pub fn pixel_count(path: &Path) -> Result<u64> {
     let source = RawSource::new(path)?;

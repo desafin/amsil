@@ -76,7 +76,6 @@ fn encode_once(img: &Image, quality: u8, exif: Option<&[u8]>, threads: usize) ->
     let mut encoder = lib.encoder_for_format(CompressionFormat::Hevc)?;
     encoder.set_quality(EncoderQuality::Lossy(quality))?;
     // libheif의 기본값은 slow다. medium은 파일이 8% 크지만 화질은 같거나 약간 높고 인코딩 시간이 절반이다
-    // (docs/design.md 10장).
     encoder.set_parameter_value("preset", EncoderParameterValue::String("medium".into()))?;
     // x265는 인코더마다 스레드 풀을 따로 만든다. 여러 장을 동시에 인코딩할 때 그대로 두면 스레드가
     // 코어 수의 몇십 배가 되어 서로 방해한다.

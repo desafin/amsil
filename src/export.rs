@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 use std::time::Instant;
 
-/// libheif의 품질 값. 55가 JPEG q90 수준이고 70부터는 JPEG보다 파일이 커진다 (docs/design.md 3.2절).
+/// libheif의 품질 값. A900 사진으로 재 보니 55가 JPEG q90 수준이고 70부터는 JPEG보다 파일이 커진다.
 pub const QUALITY: u8 = 55;
 
 /// 사진 한 장을 처리하는 데 드는 메모리의 추정값 (센서 화소당 바이트).
@@ -53,16 +53,19 @@ impl Default for Settings {
 /// 변환은 됐지만 알려야 할 일이 있는 사진과 그 내용.
 pub type Warnings = Vec<(PathBuf, String)>;
 
-/// RAW 한 장을 HEIF로 바꾼다. `denoise`는 모델과 강도(0~1), `progress`에는 진행 정도(0~1)를 알린다.
-/// 알려야 할 일이 있으면(품질을 낮춘 경우) 그 문구를 돌려준다.
-pub fn convert(
+/// 현상이 끝난 사진: 바로 세운 sRGB 이미지와 출력 파일에 넣을 EXIF.
+pub struct Rendered {
+    pub image: crate::Image,
+    pub exif: Vec<u8>,
+}
+
+/// RAW 한 장을 읽어 현상한다. `denoise`는 모델과 강도(0~1), `progress`에는 진행 정도(0~0.75)를 알린다.
+/// 미리보기와 내보내기가 같은 과정을 쓴다.
+pub fn render(
     input: &Path,
-    output: &Path,
-    quality: u8,
-    encoder_threads: usize,
     denoise: Option<(&Mutex<Denoiser>, f32)>,
     progress: &dyn Fn(f32),
-) -> Result<Option<String>> {
+) -> Result<Rendered> {
     let timing = Timing::start();
     let raw = raw::decode(input)?;
     timing.mark("읽기");
@@ -99,7 +102,25 @@ pub fn convert(
     let image = develop::orient(image, transpose, flip_h, flip_v);
     timing.mark("현상");
     progress(0.75);
-    let encoded = heif::encode(&image, quality, Some(&raw.exif), encoder_threads)?;
+    Ok(Rendered {
+        image,
+        exif: raw.exif,
+    })
+}
+
+/// RAW 한 장을 HEIF로 바꾼다. `progress`에는 진행 정도(0~1)를 알린다.
+/// 알려야 할 일이 있으면(품질을 낮춘 경우) 그 문구를 돌려준다.
+pub fn convert(
+    input: &Path,
+    output: &Path,
+    quality: u8,
+    encoder_threads: usize,
+    denoise: Option<(&Mutex<Denoiser>, f32)>,
+    progress: &dyn Fn(f32),
+) -> Result<Option<String>> {
+    let timing = Timing::start();
+    let Rendered { image, exif } = render(input, denoise, progress)?;
+    let encoded = heif::encode(&image, quality, Some(&exif), encoder_threads)?;
     timing.mark("인코딩");
     progress(0.98);
 
@@ -168,6 +189,7 @@ pub fn cpu_notice(denoiser: &Denoiser) -> Option<String> {
 }
 
 /// 배치가 도는 동안 주기적으로 알리는 내용.
+#[derive(Debug, Clone, Copy)]
 pub struct Report {
     pub status: job::Status,
     /// 남은 시간(초). 아직 모르면 None.
