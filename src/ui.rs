@@ -377,6 +377,124 @@ fn export_bar(
 }
 
 fn edit_panel(ui: &mut egui::Ui, app: &App, open: &Open, actions: &mut Vec<Action>) {
+    egui::ScrollArea::vertical()
+        .auto_shrink(false)
+        .show(ui, |ui| {
+            look_panel(ui, app, open, actions);
+            ui.separator();
+            denoise_panel(ui, app, open, actions);
+        });
+}
+
+/// 슬라이더 하나. 값이 바뀌면 `Some(놓았는가)`를 돌려준다. 끄는 동안에는 거짓, 놓을 때 참이다.
+fn slider(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+) -> Option<bool> {
+    let response = ui.add(
+        egui::Slider::new(value, range)
+            .text(label)
+            .fixed_decimals(2),
+    );
+    if response.drag_stopped() {
+        Some(true)
+    } else if response.changed() {
+        // 끌지 않고 바뀐 경우(숫자를 직접 입력, 키보드)는 바로 확정한다.
+        Some(!response.dragged())
+    } else {
+        None
+    }
+}
+
+/// 프리셋, 강도, 세부 조정.
+fn look_panel(ui: &mut egui::Ui, app: &App, open: &Open, actions: &mut Vec<Action>) {
+    ui.heading("프리셋");
+    let Some(current) = open.current else {
+        ui.weak("사진을 고르면 프리셋을 적용할 수 있습니다");
+        return;
+    };
+    let edit = open.edit(current);
+    ui.horizontal_wrapped(|ui| {
+        if ui.selectable_label(edit.preset.is_none(), "없음").clicked() {
+            actions.push(Action::SetPreset(None));
+        }
+        for preset in &app.presets {
+            let chosen = edit.preset.as_deref() == Some(preset.id.as_str());
+            if ui.selectable_label(chosen, &preset.name).clicked() {
+                actions.push(Action::SetPreset(Some(preset.id.clone())));
+            }
+        }
+    });
+    ui.add_enabled_ui(edit.preset.is_some(), |ui| {
+        let mut strength = edit.strength;
+        if let Some(commit) = slider(ui, "강도", &mut strength, 0.0..=1.5) {
+            actions.push(Action::SetStrength {
+                value: strength,
+                commit,
+            });
+        }
+    });
+    ui.collapsing("자세히", |ui| {
+        let mut adjust = edit.adjust;
+        let mut changed = None;
+        let mut row = |ui: &mut egui::Ui, label: &str, value: &mut f32, range| {
+            if let Some(commit) = slider(ui, label, value, range) {
+                changed = Some(commit);
+            }
+        };
+        row(ui, "노출", &mut adjust.exposure, -3.0..=3.0);
+        row(ui, "대비", &mut adjust.contrast, -1.0..=1.0);
+        row(ui, "하이라이트", &mut adjust.highlights, -1.0..=1.0);
+        row(ui, "그림자", &mut adjust.shadows, -1.0..=1.0);
+        row(ui, "색온도", &mut adjust.temp, -1.0..=1.0);
+        row(ui, "틴트", &mut adjust.tint, -1.0..=1.0);
+        row(ui, "채도", &mut adjust.saturation, -1.0..=1.0);
+        row(ui, "생동감", &mut adjust.vibrance, -1.0..=1.0);
+        row(ui, "선명도", &mut adjust.clarity, -1.0..=1.0);
+        row(ui, "샤픈", &mut adjust.sharpen, -1.0..=1.0);
+        row(ui, "비네팅", &mut adjust.vignette, -1.0..=1.0);
+        row(ui, "흑백", &mut adjust.mono, 0.0..=1.0);
+        ui.collapsing("색상별", |ui| {
+            let hsl = &mut adjust.hsl;
+            let bands = [
+                &mut hsl.red,
+                &mut hsl.orange,
+                &mut hsl.yellow,
+                &mut hsl.green,
+                &mut hsl.aqua,
+                &mut hsl.blue,
+                &mut hsl.purple,
+                &mut hsl.magenta,
+            ];
+            for (name, band) in HUE_NAMES.iter().zip(bands) {
+                row(ui, &format!("{name} 채도"), &mut band.sat, -1.0..=1.0);
+                row(ui, &format!("{name} 밝기"), &mut band.lum, -1.0..=1.0);
+            }
+        });
+        if let Some(commit) = changed {
+            actions.push(Action::SetAdjust {
+                params: adjust,
+                commit,
+            });
+        }
+    });
+    if ui
+        .button("보정 초기화")
+        .on_hover_text("프리셋과 세부 조정을 지웁니다 (노이즈 제거는 그대로)")
+        .clicked()
+    {
+        actions.push(Action::ResetLook);
+    }
+}
+
+/// 색상대의 화면 이름. `edit::Hsl`의 항목과 같은 순서.
+const HUE_NAMES: [&str; 8] = [
+    "빨강", "주황", "노랑", "초록", "청록", "파랑", "보라", "자홍",
+];
+
+fn denoise_panel(ui: &mut egui::Ui, app: &App, open: &Open, actions: &mut Vec<Action>) {
     ui.heading("노이즈 제거");
     let usable = matches!(app.backend, Backend::Gpu | Backend::Cpu(_));
     ui.add_enabled_ui(usable && !open.selected.is_empty(), |ui| {
@@ -531,7 +649,7 @@ fn preview(ui: &mut egui::Ui, open: &Open, view: &mut View) {
         && view
             .preview
             .as_ref()
-            .is_none_or(|(generation, _)| *generation != preview.generation)
+            .is_none_or(|(generation, _)| *generation != preview.serial)
     {
         // 줄여서 볼 때는 부드럽게(밉맵), 100%를 넘겨 볼 때는 화소가 그대로 보이게 한다.
         let options = TextureOptions {
@@ -547,7 +665,7 @@ fn preview(ui: &mut egui::Ui, open: &Open, view: &mut View) {
             None => color_image(&preview.pixels),
         };
         let texture = ui.ctx().load_texture("preview", image, options);
-        view.preview = Some((preview.generation, texture));
+        view.preview = Some((preview.serial, texture));
     }
     match (shown, &view.preview) {
         (Some(_), Some((_, texture))) => {
@@ -1052,6 +1170,59 @@ mod tests {
     }
 
     #[test]
+    fn a_preset_is_chosen_with_one_click_and_cleared_with_none() {
+        let screen = Screen::with_photos("presets");
+        screen.app.borrow_mut().handle(Action::Select {
+            index: 0,
+            extend: false,
+        });
+        let mut harness = screen.harness();
+        harness.run_steps(3);
+        for name in ["없음", "음식", "인물", "풍경", "야경", "흑백"] {
+            harness.get_by_label(name);
+        }
+        harness.get_by_label("음식").click();
+        harness.run_steps(3);
+        let preset = || screen.app.borrow().open.as_ref().unwrap().edit(0).preset;
+        assert_eq!(preset().as_deref(), Some("food"));
+
+        harness.get_by_label("없음").click();
+        harness.run_steps(3);
+        assert_eq!(preset(), None);
+    }
+
+    #[test]
+    fn reset_button_clears_the_look() {
+        let screen = Screen::with_photos("reset-look");
+        screen.app.borrow_mut().handle(Action::Select {
+            index: 0,
+            extend: false,
+        });
+        screen
+            .app
+            .borrow_mut()
+            .handle(Action::SetPreset(Some("mono".into())));
+        screen.app.borrow_mut().handle(Action::SetStrength {
+            value: 0.5,
+            commit: true,
+        });
+        let mut harness = screen.harness();
+        harness.run_steps(3);
+        harness.get_by_label("보정 초기화").click();
+        harness.run_steps(3);
+        let edit = screen.app.borrow().open.as_ref().unwrap().edit(0);
+        assert_eq!((edit.preset, edit.strength), (None, 1.0));
+    }
+
+    #[test]
+    fn the_look_panel_asks_to_pick_a_photo_first() {
+        let screen = Screen::with_photos("no-photo");
+        let mut harness = screen.harness();
+        harness.run();
+        harness.get_by_label("사진을 고르면 프리셋을 적용할 수 있습니다");
+    }
+
+    #[test]
     fn ctrl_a_selects_every_photo() {
         let screen = Screen::with_photos("select-all");
         let mut harness = screen.harness();
@@ -1246,7 +1417,8 @@ mod tests {
             extend: true,
         });
         let path = screen.app.borrow().open.as_ref().unwrap().photo_path(7);
-        let rendered = crate::export::render(&path, None, &|_| {}).unwrap();
+        let rendered =
+            crate::export::render(&path, None, &crate::edit::Params::default(), &|_| {}).unwrap();
         let generation = screen
             .app
             .borrow()
@@ -1279,6 +1451,32 @@ mod tests {
         }
         shot(&mut harness, "2b-zoomed.png");
         harness.remove_cursor();
+
+        // 프리셋을 적용한 모습 ("풍경", 강도 120%)
+        handle(Action::SetPreset(Some("landscape".into())));
+        handle(Action::SetStrength {
+            value: 1.2,
+            commit: true,
+        });
+        let params = {
+            let app = screen.app.borrow();
+            app.open.as_ref().unwrap().params(7, &app.presets)
+        };
+        let looked = crate::export::render(&path, None, &params, &|_| {}).unwrap();
+        let generation = screen
+            .app
+            .borrow()
+            .open
+            .as_ref()
+            .unwrap()
+            .preview_generation();
+        handle(Action::PreviewReady {
+            generation,
+            index: 7,
+            result: Ok(crate::preview::shrink(&looked.image, 8192)),
+        });
+        shot(&mut harness, "2c-preset.png");
+        handle(Action::ResetLook);
 
         // 내보내는 중
         handle(Action::Export {

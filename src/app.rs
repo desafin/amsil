@@ -4,8 +4,10 @@
 //! 화면 밖에서 해야 할 일(썸네일 만들기, 내보내기 등)을 `Effect`로 돌려준다. 화면 코드는 상태를 읽어
 //! 그리기만 한다.
 
+use crate::edit::Params;
 use crate::export::{self, Report};
 use crate::job::Outcome;
+use crate::preset::{self, Preset};
 use crate::preview::Pixels;
 use crate::project::{Config, Edit, Folder, Project};
 use std::collections::BTreeSet;
@@ -20,6 +22,8 @@ pub struct App {
     pub notice: Option<String>,
     /// AI 모델이 어디서 도는지.
     pub backend: Backend,
+    /// 고를 수 있는 프리셋: 기본 프리셋 뒤에 사용자가 만든 것.
+    pub presets: Vec<Preset>,
 }
 
 /// AI 모델(노이즈 제거)의 실행 환경.
@@ -50,6 +54,7 @@ pub struct Open {
     pub export: ExportState,
     /// 미리보기 요청 번호. 늦게 도착한 옛 결과를 버리는 데 쓴다.
     generation: u64,
+    preview_serial: u64,
 }
 
 pub struct Photo {
@@ -62,8 +67,8 @@ pub struct Photo {
 
 pub struct Preview {
     pub index: usize,
-    /// 요청 번호. 화면 쪽에서 그림이 바뀌었는지 아는 데 쓴다.
-    pub generation: u64,
+    /// 그림이 바뀔 때마다 달라지는 번호. 화면 쪽에서 텍스처를 다시 올릴지 아는 데 쓴다.
+    pub serial: u64,
     pub pixels: Pixels,
 }
 
@@ -116,6 +121,20 @@ pub enum Action {
     SetDenoiseLevel(f32),
     /// 슬라이더의 레벨을 선택한 사진들에 적용한다.
     ApplyDenoise,
+    /// 선택한 사진들의 프리셋을 정한다 (None이면 없앤다).
+    SetPreset(Option<String>),
+    /// 프리셋의 강도. 슬라이더를 끄는 동안에는 `commit`이 거짓이고, 놓을 때 참으로 한 번 온다 (그때 저장한다).
+    SetStrength {
+        value: f32,
+        commit: bool,
+    },
+    /// 수동 조정.
+    SetAdjust {
+        params: Params,
+        commit: bool,
+    },
+    /// 프리셋과 수동 조정을 지운다 (노이즈 제거는 그대로).
+    ResetLook,
     SetExportFolder(PathBuf),
     SetQuality(u8),
     Export {
@@ -155,6 +174,8 @@ pub enum Effect {
         index: usize,
         path: PathBuf,
         denoise: f32,
+        /// 보정 값 (프리셋 × 강도 + 수동 조정).
+        params: Params,
     },
     Export {
         photos: Vec<export::Photo>,
@@ -166,12 +187,17 @@ pub enum Effect {
 impl App {
     /// `config_path`의 설정을 읽어 시작 화면 상태로 만든다.
     pub fn new(config_path: PathBuf) -> Self {
+        // 사용자 프리셋은 설정 파일 옆의 presets 폴더에 둔다.
+        let (user, problems) = preset::load_dir(&config_path.with_file_name("presets"));
+        let mut presets = preset::builtin();
+        presets.extend(user);
         Self {
             config: Config::load(&config_path),
             config_path,
             open: None,
-            notice: None,
+            notice: (!problems.is_empty()).then(|| problems.join("\n")),
             backend: Backend::Unknown,
+            presets,
         }
     }
 
@@ -266,7 +292,7 @@ impl App {
                 open.selected.insert(index);
                 open.current = Some(index);
                 open.denoise_level = open.edit(index).denoise;
-                effects.push(open.request_preview(index));
+                effects.push(open.request_preview(index, &self.presets));
             }
             Action::SelectAll => open.selected = (0..open.photos.len()).collect(),
             Action::SetDenoiseLevel(level) => open.denoise_level = level.clamp(0.0, 1.0),
@@ -283,8 +309,31 @@ impl App {
                 }
                 open.save()?;
                 if let Some(current) = open.current {
-                    effects.push(open.request_preview(current));
+                    effects.push(open.request_preview(current, &self.presets));
                 }
+            }
+            Action::SetPreset(preset) => {
+                open.change_look(true, &self.presets, &mut effects, |edit| {
+                    edit.preset = preset.clone()
+                })?;
+            }
+            Action::SetStrength { value, commit } => {
+                open.change_look(commit, &self.presets, &mut effects, |edit| {
+                    edit.strength = value
+                })?;
+            }
+            Action::SetAdjust { params, commit } => {
+                open.change_look(commit, &self.presets, &mut effects, |edit| {
+                    edit.adjust = params
+                })?;
+            }
+            Action::ResetLook => {
+                open.change_look(true, &self.presets, &mut effects, |edit| {
+                    *edit = Edit {
+                        denoise: edit.denoise,
+                        ..Edit::default()
+                    };
+                })?;
             }
             Action::SetExportFolder(folder) => {
                 open.project.export.folder = Some(folder);
@@ -316,6 +365,7 @@ impl App {
                                 Path::new(&photo.relative),
                             ),
                             denoise: open.edit(index).denoise,
+                            params: open.params(index, &self.presets),
                         }
                     })
                     .collect();
@@ -358,9 +408,10 @@ impl App {
             } => {
                 // 그 사이에 다른 사진을 골랐다면 버린다.
                 if generation == open.generation {
+                    open.preview_serial += 1;
                     open.preview = Some(Preview {
                         index,
-                        generation,
+                        serial: open.preview_serial,
                         pixels: result?,
                     });
                 }
@@ -403,6 +454,7 @@ impl App {
             preview: None,
             export: ExportState::Idle,
             generation: 0,
+            preview_serial: 0,
         };
         let mut wanted = Vec::new();
         let mut missing = Vec::new();
@@ -497,14 +549,47 @@ impl Open {
         )
     }
 
-    fn request_preview(&mut self, index: usize) -> Effect {
+    /// 사진에 최종으로 적용할 보정 값.
+    pub fn params(&self, index: usize, presets: &[Preset]) -> Params {
+        let edit = self.edit(index);
+        preset::resolve(presets, edit.preset.as_deref(), edit.strength, &edit.adjust)
+    }
+
+    fn request_preview(&mut self, index: usize, presets: &[Preset]) -> Effect {
         self.generation += 1;
         Effect::Preview {
             generation: self.generation,
             index,
             path: self.photo_path(index),
             denoise: self.edit(index).denoise,
+            params: self.params(index, presets),
         }
+    }
+
+    /// 선택한 사진들의 편집 내용을 바꾸고 미리보기를 다시 요청한다. `commit`이면 파일에도 저장한다.
+    fn change_look(
+        &mut self,
+        commit: bool,
+        presets: &[Preset],
+        effects: &mut Vec<Effect>,
+        change: impl Fn(&mut Edit),
+    ) -> crate::Result<()> {
+        for index in self.selected.clone() {
+            let (folder, relative) = (
+                self.photos[index].folder,
+                self.photos[index].relative.clone(),
+            );
+            let mut edit = self.edit(index);
+            change(&mut edit);
+            self.project.set_edit(folder, &relative, edit);
+        }
+        if commit {
+            self.save()?;
+        }
+        if let Some(current) = self.current {
+            effects.push(self.request_preview(current, presets));
+        }
+        Ok(())
     }
 
     fn start_export(&mut self, photos: Vec<export::Photo>, overwrite: bool) -> Effect {
@@ -828,6 +913,174 @@ mod tests {
     }
 
     #[test]
+    fn choosing_a_preset_applies_it_to_the_selected_photos_and_previews_the_result() {
+        let mut fx = Fixture::with_photos("preset");
+        fx.app.handle(Action::Select {
+            index: 0,
+            extend: false,
+        });
+        fx.app.handle(Action::Select {
+            index: 2,
+            extend: true,
+        });
+        let effects = fx.app.handle(Action::SetPreset(Some("food".into())));
+
+        assert_eq!(fx.open().edit(0).preset.as_deref(), Some("food"));
+        assert_eq!(fx.open().edit(1).preset, None);
+        assert_eq!(fx.open().edit(2).preset.as_deref(), Some("food"));
+        let food = fx
+            .app
+            .presets
+            .iter()
+            .find(|p| p.id == "food")
+            .unwrap()
+            .params;
+        let [
+            Effect::Preview {
+                index: 2, params, ..
+            },
+        ] = &effects[..]
+        else {
+            panic!("{effects:?}")
+        };
+        assert_eq!(*params, food, "미리보기는 프리셋을 적용한 값으로 만든다");
+        assert_eq!(
+            Project::load(&fx.open().path)
+                .unwrap()
+                .edit(0, "a.ARW")
+                .preset
+                .as_deref(),
+            Some("food")
+        );
+
+        fx.app.handle(Action::SetPreset(None));
+        assert_eq!(fx.open().edit(0).preset, None);
+    }
+
+    #[test]
+    fn strength_and_adjustments_preview_at_once_but_are_saved_when_the_slider_is_released() {
+        let mut fx = Fixture::with_photos("sliders");
+        fx.app.handle(Action::Select {
+            index: 0,
+            extend: false,
+        });
+        fx.app.handle(Action::SetPreset(Some("food".into())));
+        let food = fx
+            .app
+            .presets
+            .iter()
+            .find(|p| p.id == "food")
+            .unwrap()
+            .params;
+        let on_disk = |fx: &Fixture| Project::load(&fx.open().path).unwrap().edit(0, "a.ARW");
+
+        // 끄는 중: 화면에는 바로 반영되고 파일은 그대로
+        let effects = fx.app.handle(Action::SetStrength {
+            value: 0.5,
+            commit: false,
+        });
+        assert_eq!(fx.open().edit(0).strength, 0.5);
+        assert_eq!(on_disk(&fx).strength, 1.0);
+        let [Effect::Preview { params, .. }] = &effects[..] else {
+            panic!("{effects:?}")
+        };
+        assert_eq!(params.temp, food.temp * 0.5);
+
+        // 놓으면 저장
+        fx.app.handle(Action::SetStrength {
+            value: 0.6,
+            commit: true,
+        });
+        assert_eq!(on_disk(&fx).strength, 0.6);
+
+        let adjust = Params {
+            exposure: 0.4,
+            ..Params::default()
+        };
+        let effects = fx.app.handle(Action::SetAdjust {
+            params: adjust,
+            commit: false,
+        });
+        assert_eq!(on_disk(&fx).adjust, Params::default());
+        let [Effect::Preview { params, .. }] = &effects[..] else {
+            panic!("{effects:?}")
+        };
+        assert_eq!(params.exposure, 0.4);
+        fx.app.handle(Action::SetAdjust {
+            params: adjust,
+            commit: true,
+        });
+        assert_eq!(on_disk(&fx).adjust.exposure, 0.4);
+    }
+
+    #[test]
+    fn reset_clears_the_look_but_keeps_denoise() {
+        let mut fx = Fixture::with_photos("reset");
+        fx.app.handle(Action::Select {
+            index: 1,
+            extend: false,
+        });
+        fx.app.handle(Action::SetDenoiseLevel(0.5));
+        fx.app.handle(Action::ApplyDenoise);
+        fx.app.handle(Action::SetPreset(Some("mono".into())));
+        fx.app.handle(Action::SetStrength {
+            value: 0.7,
+            commit: true,
+        });
+        fx.app.handle(Action::ResetLook);
+        let edit = fx.open().edit(1);
+        assert_eq!(
+            (edit.preset, edit.strength, edit.adjust),
+            (None, 1.0, Params::default())
+        );
+        assert_eq!(edit.denoise, 0.5);
+    }
+
+    #[test]
+    fn export_uses_each_photos_look() {
+        let mut fx = Fixture::with_photos("export-look");
+        fx.app.handle(Action::SetExportFolder(fx.dir.join("결과")));
+        fx.app.handle(Action::Select {
+            index: 1,
+            extend: false,
+        });
+        fx.app.handle(Action::SetPreset(Some("mono".into())));
+        let effects = fx.app.handle(Action::Export {
+            only_selected: false,
+        });
+        let [Effect::Export { photos, .. }] = &effects[..] else {
+            panic!("{effects:?}")
+        };
+        assert_eq!(photos[1].params.mono, 1.0);
+        assert!(photos[0].params.is_neutral() && photos[2].params.is_neutral());
+    }
+
+    #[test]
+    fn user_presets_in_the_config_folder_are_offered_after_the_builtin_ones() {
+        let dir =
+            std::env::temp_dir().join(format!("amsil-app-user-presets-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("presets")).unwrap();
+        std::fs::write(
+            dir.join("presets/warm.toml"),
+            "name = \"따뜻하게\"\n[params]\ntemp = 0.3\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("presets/bad.toml"), "name = 1\n").unwrap();
+        let app = App::new(dir.join("config.toml"));
+        std::fs::remove_dir_all(&dir).unwrap();
+        let ids: Vec<&str> = app.presets.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["food", "portrait", "landscape", "night", "mono", "warm"]
+        );
+        assert!(
+            app.notice.as_ref().unwrap().contains("bad"),
+            "읽지 못한 프리셋은 알린다"
+        );
+    }
+
+    #[test]
     fn thumbnails_arrive_one_by_one() {
         let mut fx = Fixture::with_photos("thumbs");
         fx.app.handle(Action::Thumbnail {
@@ -879,17 +1132,20 @@ mod tests {
                 export::Photo {
                     input: src.join("a.ARW"),
                     output: out.join("사진/a.heic"),
-                    denoise: 0.0
+                    denoise: 0.0,
+                    params: Params::default(),
                 },
                 export::Photo {
                     input: src.join("c.ARW"),
                     output: out.join("사진/c.heic"),
-                    denoise: 0.0
+                    denoise: 0.0,
+                    params: Params::default(),
                 },
                 export::Photo {
                     input: src.join("sub/b.ARW"),
                     output: out.join("사진/sub/b.heic"),
-                    denoise: 0.5
+                    denoise: 0.5,
+                    params: Params::default(),
                 },
             ]
         );

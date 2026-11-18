@@ -1,6 +1,7 @@
 //! 변환의 실제 작업: 사진 한 장의 처리 과정과, 여러 장을 자원 한도 안에서 동시에 돌리는 일.
 //! 명령행과 GUI가 함께 쓴다.
 
+use crate::edit::Params;
 use crate::gpu::{self, Denoiser};
 use crate::{Result, denoise, develop, heif, job, raw};
 use std::collections::HashMap;
@@ -14,7 +15,7 @@ pub const QUALITY: u8 = 55;
 
 /// 사진 한 장을 처리하는 데 드는 메모리의 추정값 (센서 화소당 바이트).
 // ponytail: 실측으로 정한 상수 (A900 기준 장당 최대 53바이트/화소). 다른 카메라에서 틀려도 시스템 여유 메모리 감시가 받쳐 준다.
-const BYTES_PER_PIXEL: u64 = 56;
+const BYTES_PER_PIXEL: u64 = 64;
 
 pub const GB: f64 = (1u64 << 30) as f64;
 
@@ -25,6 +26,8 @@ pub struct Photo {
     pub output: PathBuf,
     /// 노이즈 제거 강도 (0~1). 0이면 끈다.
     pub denoise: f32,
+    /// 보정 값 (프리셋 × 강도 + 수동 조정).
+    pub params: Params,
 }
 
 /// 배치 전체에 적용되는 설정.
@@ -59,13 +62,32 @@ pub struct Rendered {
     pub exif: Vec<u8>,
 }
 
-/// RAW 한 장을 읽어 현상한다. `denoise`는 모델과 강도(0~1), `progress`에는 진행 정도(0~0.75)를 알린다.
-/// 미리보기와 내보내기가 같은 과정을 쓴다.
-pub fn render(
+/// 읽어 들인 사진: 보정을 적용하기 전의 카메라 RGB와 현상에 필요한 값들.
+/// 읽기(디모자익, 노이즈 제거)는 오래 걸리고 보정을 바꿀 때마다 되풀이할 필요가 없어서 따로 둔다.
+pub struct Loaded {
+    /// 카메라 RGB (선형, 출력 영역으로 잘린 것).
+    pub cam: crate::Image,
+    wb: [f32; 3],
+    xyz_to_cam: [[f32; 3]; 3],
+    flips: (bool, bool, bool),
+    pub exif: Vec<u8>,
+}
+
+impl Loaded {
+    /// 보정을 적용해 현상하고 바로 세운다. `cam`에는 `self.cam`이나 그것을 줄인 것을 준다.
+    pub fn develop(&self, cam: &crate::Image, params: &Params) -> crate::Image {
+        let image = develop::develop(cam, self.wb, self.xyz_to_cam, params);
+        let (transpose, flip_h, flip_v) = self.flips;
+        develop::orient(image, transpose, flip_h, flip_v)
+    }
+}
+
+/// RAW 한 장을 읽는다. `denoise`는 모델과 강도(0~1), `progress`에는 진행 정도(0~0.6)를 알린다.
+pub fn load(
     input: &Path,
     denoise: Option<(&Mutex<Denoiser>, f32)>,
     progress: &dyn Fn(f32),
-) -> Result<Rendered> {
+) -> Result<Loaded> {
     let timing = Timing::start();
     let raw = raw::decode(input)?;
     timing.mark("읽기");
@@ -96,15 +118,30 @@ pub fn render(
     };
     timing.mark("디모자익/노이즈 제거");
     progress(0.6);
-    let image = develop::develop(&cam, raw.wb, raw.xyz_to_cam);
-    drop(cam);
-    let (transpose, flip_h, flip_v) = raw.flips;
-    let image = develop::orient(image, transpose, flip_h, flip_v);
+    Ok(Loaded {
+        cam,
+        wb: raw.wb,
+        xyz_to_cam: raw.xyz_to_cam,
+        flips: raw.flips,
+        exif: raw.exif,
+    })
+}
+
+/// RAW 한 장을 읽어 현상한다. 미리보기와 내보내기가 같은 과정을 쓴다.
+pub fn render(
+    input: &Path,
+    denoise: Option<(&Mutex<Denoiser>, f32)>,
+    params: &Params,
+    progress: &dyn Fn(f32),
+) -> Result<Rendered> {
+    let timing = Timing::start();
+    let loaded = load(input, denoise, progress)?;
+    let image = loaded.develop(&loaded.cam, params);
     timing.mark("현상");
     progress(0.75);
     Ok(Rendered {
         image,
-        exif: raw.exif,
+        exif: loaded.exif,
     })
 }
 
@@ -116,10 +153,11 @@ pub fn convert(
     quality: u8,
     encoder_threads: usize,
     denoise: Option<(&Mutex<Denoiser>, f32)>,
+    params: &Params,
     progress: &dyn Fn(f32),
 ) -> Result<Option<String>> {
     let timing = Timing::start();
-    let Rendered { image, exif } = render(input, denoise, progress)?;
+    let Rendered { image, exif } = render(input, denoise, params, progress)?;
     let encoded = heif::encode(&image, quality, Some(&exif), encoder_threads)?;
     timing.mark("인코딩");
     progress(0.98);
@@ -318,9 +356,9 @@ pub fn run(
             output: photo.output.clone(),
         })
         .collect();
-    let strength: HashMap<&Path, f32> = photos
+    let looks: HashMap<&Path, (f32, Params)> = photos
         .iter()
-        .map(|photo| (photo.input.as_path(), photo.denoise))
+        .map(|photo| (photo.input.as_path(), (photo.denoise, photo.params)))
         .collect();
 
     let mut system = sysinfo::System::new()?;
@@ -348,13 +386,15 @@ pub fn run(
             system.available_memory()
         },
         work: &|task, progress| {
-            let denoise = denoiser.map(|model| (model, strength[task.input.as_path()]));
+            let (strength, params) = looks[task.input.as_path()];
+            let denoise = denoiser.map(|model| (model, strength));
             let warning = convert(
                 &task.input,
                 &task.output,
                 settings.quality,
                 encoder_threads,
                 denoise,
+                &params,
                 progress,
             )?;
             if let Some(warning) = warning {
@@ -381,7 +421,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let output = dir.join("out.heic");
 
-        convert(&input, &output, 55, 8, None, &|_| {}).unwrap();
+        convert(&input, &output, 55, 8, None, &Params::default(), &|_| {}).unwrap();
 
         let ctx = HeifContext::read_from_file(output.to_str().unwrap()).unwrap();
         let handle = ctx.primary_image_handle().unwrap();
@@ -425,13 +465,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let (plain, denoised) = (dir.join("plain.heic"), dir.join("denoised.heic"));
 
-        convert(&input, &plain, 55, 8, None, &|_| {}).unwrap();
+        convert(&input, &plain, 55, 8, None, &Params::default(), &|_| {}).unwrap();
         convert(
             &input,
             &denoised,
             55,
             8,
             Some((&Mutex::new(model), 1.0)),
+            &Params::default(),
             &|_| {},
         )
         .unwrap();

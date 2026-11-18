@@ -1,7 +1,8 @@
 //! 명령행 도구.
 
+use crate::edit::Params;
 use crate::export::{self, GB, Photo, Report, Settings};
-use crate::{Result, job};
+use crate::{Result, job, preset};
 use std::ffi::OsString;
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -22,18 +23,25 @@ pub struct Args {
     jobs: Option<usize>,
     /// 메모리 한도(GB). 없으면 남은 메모리의 70%.
     memory_gb: Option<f64>,
+    /// 프리셋의 식별자.
+    preset: Option<String>,
+    /// 프리셋의 강도 (0~1.5).
+    strength: f32,
 }
 
 pub const USAGE: &str = "사용법: amsil [옵션] <입력 RAW> <출력.heic>
         amsil [옵션] <입력 폴더> <출력 폴더>     하위 폴더까지 전부 변환
 옵션:
   --denoise[=강도]  AI 노이즈 제거 (강도 0~1, 생략하면 1)
+  --preset=이름     프리셋 적용 (food, portrait, landscape, night, mono 또는 직접 만든 것)
+  --strength=강도   프리셋의 강도 (0~1.5, 기본 1)
   --overwrite       이미 있는 출력 파일도 다시 만든다 (기본은 건너뜀)
   --jobs=N          동시에 처리할 장수 (기본: CPU 코어 수)
   --memory=GB       사용할 메모리 한도 (기본: 남은 메모리의 70%)";
 
 pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> std::result::Result<Args, String> {
     let (mut denoise, mut overwrite, mut jobs, mut memory_gb) = (0.0, false, None, None);
+    let (mut preset, mut strength) = (None, 1.0);
     let mut paths = Vec::new();
     for arg in args {
         let Some(option) = arg.to_str().filter(|text| text.starts_with("--")) else {
@@ -72,6 +80,14 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> std::result::Resu
                         .ok_or("--memory에는 0보다 큰 숫자(GB)를 줘야 합니다")?,
                 );
             }
+            ("--preset", Some(value)) => preset = Some(value.to_owned()),
+            ("--strength", Some(value)) => {
+                strength = value
+                    .parse()
+                    .ok()
+                    .filter(|strength| (0.0..=1.5).contains(strength))
+                    .ok_or("프리셋 강도는 0에서 1.5 사이의 숫자여야 합니다")?;
+            }
             _ => return Err(format!("모르는 옵션: {option}")),
         }
     }
@@ -83,9 +99,33 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> std::result::Resu
             overwrite,
             jobs,
             memory_gb,
+            preset,
+            strength,
         }),
         Err(_) => Err("입력과 출력을 하나씩 지정해야 합니다".into()),
     }
+}
+
+/// 명령행에서 고른 프리셋과 강도로 보정 값을 정한다.
+fn look(args: &Args) -> Result<Params> {
+    let mut presets = preset::builtin();
+    presets.extend(preset::load_dir(&crate::project::Config::path().with_file_name("presets")).0);
+    if let Some(id) = &args.preset
+        && !presets.iter().any(|p| &p.id == id)
+    {
+        let known: Vec<&str> = presets.iter().map(|p| p.id.as_str()).collect();
+        return Err(format!(
+            "모르는 프리셋: {id}\n쓸 수 있는 프리셋: {}",
+            known.join(", ")
+        )
+        .into());
+    }
+    Ok(preset::resolve(
+        &presets,
+        args.preset.as_deref(),
+        args.strength,
+        &Params::default(),
+    ))
 }
 
 /// 노이즈 제거를 쓸 때만 모델을 읽는다. CPU로 돌게 되면 경고를 출력한다.
@@ -109,12 +149,14 @@ fn run_folder(
     if files.is_empty() {
         return Err("RAW 파일을 찾지 못했습니다".into());
     }
+    let params = look(args)?;
     let photos: Vec<Photo> = files
         .iter()
         .map(|file| Photo {
             input: args.input.join(file),
             output: job::output_path(&args.output, file),
             denoise: args.denoise,
+            params,
         })
         .collect();
     let denoiser = load_denoiser(args.denoise > 0.0)?;
@@ -167,6 +209,7 @@ pub fn run(args: &Args) -> Result<()> {
             export::QUALITY,
             export::cores(),
             denoise,
+            &look(args)?,
             &|_| {},
         )?;
         if let Some(warning) = warning {
@@ -252,6 +295,32 @@ mod tests {
     }
 
     #[test]
+    fn parses_preset_and_strength() {
+        let parsed = args(&["--preset=food", "--strength=0.5", "in", "out"]).unwrap();
+        assert_eq!(
+            (parsed.preset.as_deref(), parsed.strength),
+            (Some("food"), 0.5)
+        );
+        let plain = args(&["in", "out"]).unwrap();
+        assert_eq!((plain.preset, plain.strength), (None, 1.0));
+        assert!(args(&["--strength=9", "in", "out"]).is_err());
+    }
+
+    #[test]
+    fn preset_option_becomes_scaled_params_and_an_unknown_name_lists_the_choices() {
+        let half = look(&args(&["--preset=mono", "--strength=0.5", "in", "out"]).unwrap()).unwrap();
+        assert_eq!(half.mono, 0.5);
+        assert!(look(&args(&["in", "out"]).unwrap()).unwrap().is_neutral());
+        let error = look(&args(&["--preset=없는것", "in", "out"]).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("없는것") && error.contains("food") && error.contains("mono"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn rejects_bad_arguments() {
         assert!(args(&["a.ARW"]).is_err());
         assert!(args(&["a.ARW", "b.heic", "c.heic"]).is_err());
@@ -279,6 +348,8 @@ mod tests {
             overwrite: false,
             jobs: Some(2),
             memory_gb: None,
+            preset: None,
+            strength: 1.0,
         };
 
         let mut last = None;

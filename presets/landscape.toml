@@ -1,0 +1,15 @@
+name = "풍경"
+category = "landscape"
+
+[params]
+contrast = 0.15
+highlights = -0.20
+shadows = 0.15
+vibrance = 0.35
+clarity = 0.25
+sharpen = 0.30
+
+[params.hsl]
+green = { sat = 0.12 }
+aqua = { sat = 0.10 }
+blue = { sat = 0.15 }

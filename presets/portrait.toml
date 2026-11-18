@@ -1,0 +1,14 @@
+name = "인물"
+category = "portrait"
+
+[params]
+temp = 0.06
+contrast = -0.05
+highlights = -0.10
+shadows = 0.15
+vibrance = 0.10
+saturation = -0.03
+clarity = -0.15
+
+[params.hsl]
+orange = { sat = -0.08, lum = 0.08 }

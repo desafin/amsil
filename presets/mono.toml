@@ -1,0 +1,8 @@
+name = "흑백"
+
+[params]
+mono = 1.0
+contrast = 0.25
+highlights = -0.10
+shadows = 0.05
+clarity = 0.20

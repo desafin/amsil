@@ -52,6 +52,43 @@ impl Pixels {
     }
 }
 
+/// 긴 변이 `max_side`를 넘으면 그 안에 들어오도록 줄인 이미지를 돌려준다 (넓이 평균). 넘지 않으면 None.
+/// 보정을 빠르게 미리 보기 위한 작은 사본을 만드는 데 쓴다.
+pub fn downscale(image: &Image, max_side: usize) -> Option<Image> {
+    let (w, h) = (image.width, image.height);
+    let long = w.max(h);
+    if long <= max_side {
+        return None;
+    }
+    let (out_w, out_h) = ((w * max_side / long).max(1), (h * max_side / long).max(1));
+    let planes = [0, 1, 2].map(|c| {
+        let src = &image.planes[c];
+        let mut out = vec![0f32; out_w * out_h];
+        out.par_chunks_mut(out_w).enumerate().for_each(|(oy, row)| {
+            let (y0, y1) = (
+                oy * h / out_h,
+                ((oy + 1) * h / out_h).max(oy * h / out_h + 1),
+            );
+            for (ox, value) in row.iter_mut().enumerate() {
+                let (x0, x1) = (
+                    ox * w / out_w,
+                    ((ox + 1) * w / out_w).max(ox * w / out_w + 1),
+                );
+                let sum: f32 = (y0..y1)
+                    .map(|y| src[y * w + x0..y * w + x1].iter().sum::<f32>())
+                    .sum();
+                *value = sum / ((x1 - x0) * (y1 - y0)) as f32;
+            }
+        });
+        out
+    });
+    Some(Image {
+        width: out_w,
+        height: out_h,
+        planes,
+    })
+}
+
 /// 긴 변이 `max_side` 이하가 되도록 줄인다 (넓이 평균). 이미 작으면 크기를 바꾸지 않는다.
 pub fn shrink(image: &Image, max_side: usize) -> Pixels {
     let (w, h) = (image.width, image.height);
@@ -179,6 +216,26 @@ mod tests {
         };
         assert!(pixels.fit_within(4).is_none());
         assert!(pixels.fit_within(100).is_none());
+    }
+
+    #[test]
+    fn downscaling_keeps_values_as_floats_and_averages_them() {
+        let src = image(4, 2, |x, y| {
+            if x >= 2 {
+                0.2
+            } else if (x + y) % 2 == 0 {
+                0.0
+            } else {
+                1.0
+            }
+        });
+        let small = downscale(&src, 2).unwrap();
+        assert_eq!((small.width, small.height), (2, 1));
+        assert_eq!(small.planes[1], [0.5, 0.2]);
+        assert!(
+            downscale(&src, 4).is_none() && downscale(&src, 99).is_none(),
+            "작으면 그대로 쓴다"
+        );
     }
 
     #[test]

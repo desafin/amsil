@@ -1,0 +1,14 @@
+name = "음식"
+category = "food"
+
+[params]
+temp = 0.12
+contrast = 0.12
+highlights = -0.10
+vibrance = 0.30
+clarity = 0.20
+
+[params.hsl]
+red = { sat = 0.10 }
+orange = { sat = 0.15 }
+yellow = { sat = 0.10 }

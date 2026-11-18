@@ -4,6 +4,7 @@ use crate::app::{Action, Backend, Effect};
 use crate::gpu::Denoiser;
 use crate::{export, preview};
 use rayon::prelude::*;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -14,6 +15,18 @@ const THUMBNAIL_SIDE: usize = 160;
 const PREVIEW_SIDE: usize = 2048;
 
 type SharedDenoiser = Arc<Mutex<Denoiser>>;
+
+/// 보정을 바꿀 때 바로 보여 주는 작은 미리보기의 긴 변 (화소).
+const QUICK_SIDE: usize = 1200;
+
+/// 읽어 둔 사진. 보정만 바꿀 때는 다시 읽지 않고 이것으로 현상만 다시 한다.
+struct Base {
+    path: PathBuf,
+    denoise: f32,
+    loaded: export::Loaded,
+    /// 빠른 미리보기용으로 줄인 카메라 RGB. 원본이 이미 작으면 없다.
+    small: Option<crate::Image>,
+}
 
 #[derive(Clone)]
 pub struct Workers {
@@ -27,6 +40,8 @@ pub struct Workers {
     latest_preview: Arc<AtomicU64>,
     /// 미리보기의 긴 변 한도.
     preview_side: Arc<AtomicU64>,
+    /// 미리보기 중인 사진 한 장.
+    base: Arc<Mutex<Option<Arc<Base>>>>,
 }
 
 impl Workers {
@@ -39,6 +54,7 @@ impl Workers {
             cancel: Arc::default(),
             latest_preview: Arc::default(),
             preview_side: Arc::new(AtomicU64::new(PREVIEW_SIDE as u64)),
+            base: Arc::default(),
         };
         (workers, rx)
     }
@@ -87,6 +103,34 @@ impl Workers {
             .clone()
     }
 
+    /// 사진을 읽는다. 방금 읽은 사진(같은 노이즈 제거 레벨)이면 다시 읽지 않는다.
+    /// 여러 요청이 동시에 와도 한 번만 읽도록, 읽는 동안 잠금을 쥐고 있는다.
+    fn base(&self, path: &Path, denoise: f32) -> std::result::Result<Arc<Base>, String> {
+        let mut slot = self.base.lock().unwrap();
+        if let Some(base) = slot
+            .as_ref()
+            .filter(|base| base.path == path && base.denoise == denoise)
+        {
+            return Ok(base.clone());
+        }
+        let denoiser = if denoise > 0.0 {
+            Some(self.denoiser()?)
+        } else {
+            None
+        };
+        let model = denoiser.as_deref().map(|model| (model, denoise));
+        let loaded = export::load(path, model, &|_| {}).map_err(|e| e.to_string())?;
+        let small = preview::downscale(&loaded.cam, QUICK_SIDE);
+        let base = Arc::new(Base {
+            path: path.to_owned(),
+            denoise,
+            loaded,
+            small,
+        });
+        *slot = Some(base.clone());
+        Ok(base)
+    }
+
     pub fn run(&self, effect: Effect) {
         let workers = self.clone();
         match effect {
@@ -103,32 +147,50 @@ impl Workers {
                 index,
                 path,
                 denoise,
+                params,
             } => {
                 self.latest_preview.store(generation, SeqCst);
                 std::thread::spawn(move || {
-                    let result = (|| {
-                        let denoiser = if denoise > 0.0 {
-                            Some(workers.denoiser()?)
-                        } else {
-                            None
-                        };
-                        // 그 사이에 다른 사진을 골랐으면 무거운 일을 시작하지 않는다.
-                        if workers.latest_preview.load(SeqCst) != generation {
-                            return Err("취소됨".to_string());
-                        }
-                        let model = denoiser.as_deref().map(|model| (model, denoise));
-                        let rendered =
-                            export::render(&path, model, &|_| {}).map_err(|e| e.to_string())?;
-                        Ok(preview::shrink(
-                            &rendered.image,
-                            workers.preview_side.load(SeqCst) as usize,
-                        ))
-                    })();
-                    if workers.latest_preview.load(SeqCst) == generation {
+                    // 그 사이에 더 새로운 요청이 왔으면 이 요청은 버린다.
+                    let stale = || workers.latest_preview.load(SeqCst) != generation;
+                    let send = |pixels| {
                         workers.send(Action::PreviewReady {
                             generation,
                             index,
-                            result,
+                            result: Ok(pixels),
+                        });
+                    };
+                    let result = (|| -> std::result::Result<(), String> {
+                        let base = workers.base(&path, denoise)?;
+                        if stale() {
+                            return Ok(());
+                        }
+                        // 먼저 줄인 사본으로 빨리 보여 주고, 이어서 원본 크기로 다시 만든다.
+                        if let Some(small) = &base.small {
+                            send(preview::shrink(
+                                &base.loaded.develop(small, &params),
+                                usize::MAX,
+                            ));
+                            if stale() {
+                                return Ok(());
+                            }
+                        }
+                        let full = base.loaded.develop(&base.loaded.cam, &params);
+                        if !stale() {
+                            send(preview::shrink(
+                                &full,
+                                workers.preview_side.load(SeqCst) as usize,
+                            ));
+                        }
+                        Ok(())
+                    })();
+                    if let Err(error) = result
+                        && !stale()
+                    {
+                        workers.send(Action::PreviewReady {
+                            generation,
+                            index,
+                            result: Err(error),
                         });
                     }
                 });
@@ -209,20 +271,64 @@ mod tests {
             index: 0,
             path: sample.clone(),
             denoise: 0.0,
+            params: Default::default(),
         });
-        let seen = wait_for(&rx, |action| matches!(action, Action::PreviewReady { .. }));
-        let Action::PreviewReady {
-            generation: 7,
+        // 빠른 작은 미리보기가 먼저 오고, 원본 크기에 가까운 것이 뒤따른다.
+        let seen = wait_for(
+            &rx,
+            |action| matches!(action, Action::PreviewReady { generation: 7, result: Ok(preview), .. } if preview.height == 2048),
+        );
+        let sizes: Vec<(usize, usize)> = seen
+            .iter()
+            .filter_map(|action| match action {
+                Action::PreviewReady {
+                    result: Ok(preview),
+                    ..
+                } => Some((preview.width, preview.height)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sizes,
+            [(800, 1200), (1365, 2048)],
+            "세로 사진: 긴 변 1200짜리가 먼저, 2048짜리가 나중"
+        );
+
+        // 같은 사진의 보정만 바꾸면 다시 읽지 않아서 금방 온다.
+        let started = std::time::Instant::now();
+        let mono = crate::edit::Params {
+            mono: 1.0,
+            ..Default::default()
+        };
+        workers.run(Effect::Preview {
+            generation: 8,
             index: 0,
-            result: Ok(preview),
+            path: sample.clone(),
+            denoise: 0.0,
+            params: mono,
+        });
+        let seen = wait_for(&rx, |action| {
+            matches!(action, Action::PreviewReady { generation: 8, .. })
+        });
+        let Action::PreviewReady {
+            result: Ok(quick), ..
         } = seen.last().unwrap()
         else {
             panic!("미리보기가 아니다")
         };
-        assert_eq!(
-            (preview.width, preview.height),
-            (1365, 2048),
-            "세로 사진을 긴 변 2048로 줄인 크기"
+        assert!(
+            started.elapsed() < Duration::from_millis(400),
+            "{:?}",
+            started.elapsed()
+        );
+        let px = &quick.rgba[..4];
+        assert!(
+            px[0].abs_diff(px[1]) <= 1 && px[1].abs_diff(px[2]) <= 1,
+            "흑백이어야 한다: {px:?}"
+        );
+        wait_for(
+            &rx,
+            |action| matches!(action, Action::PreviewReady { generation: 8, result: Ok(preview), .. } if preview.height == 2048),
         );
 
         let dir = std::env::temp_dir().join(format!("amsil-worker-{}", std::process::id()));
@@ -231,6 +337,7 @@ mod tests {
             input: sample,
             output: output.clone(),
             denoise: 0.0,
+            params: Default::default(),
         }];
         workers.run(Effect::Export {
             photos,
@@ -262,12 +369,14 @@ mod tests {
             index: 0,
             path: sample.clone(),
             denoise: 0.0,
+            params: Default::default(),
         });
         workers.run(Effect::Preview {
             generation: 2,
             index: 1,
             path: sample,
             denoise: 0.0,
+            params: Default::default(),
         });
         let seen = wait_for(&rx, |action| {
             matches!(action, Action::PreviewReady { generation: 2, .. })

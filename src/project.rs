@@ -3,6 +3,7 @@
 //! 프로젝트 파일에는 가져온 폴더, 사진별 편집, 내보내기 설정이 들어간다. 사진 폴더에는 아무것도 쓰지 않는다.
 
 use crate::Result;
+use crate::edit::Params;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -36,12 +37,41 @@ pub struct Folder {
     pub photos: BTreeMap<String, Edit>,
 }
 
-/// 사진 한 장의 편집 내용.
-#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+/// 사진 한 장의 편집 내용. 기본값과 같은 항목은 파일에 적지 않는다.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Edit {
     /// 노이즈 제거 강도 (0~1).
-    #[serde(default)]
+    #[serde(skip_serializing_if = "is_zero")]
     pub denoise: f32,
+    /// 프리셋의 식별자.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
+    /// 프리셋의 강도. 1이 프리셋 그대로다.
+    #[serde(skip_serializing_if = "is_one")]
+    pub strength: f32,
+    /// 프리셋 위에 더하는 수동 조정.
+    #[serde(skip_serializing_if = "Params::is_neutral")]
+    pub adjust: Params,
+}
+
+impl Default for Edit {
+    fn default() -> Self {
+        Self {
+            denoise: 0.0,
+            preset: None,
+            strength: 1.0,
+            adjust: Params::default(),
+        }
+    }
+}
+
+fn is_zero(value: &f32) -> bool {
+    *value == 0.0
+}
+
+fn is_one(value: &f32) -> bool {
+    *value == 1.0
 }
 
 impl Default for Export {
@@ -92,7 +122,7 @@ impl Project {
         self.folders
             .get(folder)
             .and_then(|f| f.photos.get(photo))
-            .copied()
+            .cloned()
             .unwrap_or_default()
     }
 
@@ -200,7 +230,14 @@ mod tests {
             path: "/home/user/Photos/DCIM".into(),
             photos: BTreeMap::new(),
         });
-        project.set_edit(0, "10161107/DSC04307.ARW", Edit { denoise: 0.75 });
+        project.set_edit(
+            0,
+            "10161107/DSC04307.ARW",
+            Edit {
+                denoise: 0.75,
+                ..Edit::default()
+            },
+        );
         project
     }
 
@@ -274,6 +311,73 @@ mod tests {
         assert!(
             project.folders[0].photos.is_empty(),
             "기본값으로 돌아가면 기록을 지운다"
+        );
+    }
+
+    #[test]
+    fn preset_strength_and_manual_adjustments_are_saved_per_photo() {
+        let dir = temp("edits");
+        let path = dir.join("p.amsil");
+        let mut project = sample();
+        let mut adjust = crate::edit::Params {
+            exposure: 0.3,
+            ..Default::default()
+        };
+        adjust.hsl.orange.sat = 0.1;
+        let edit = Edit {
+            preset: Some("food".into()),
+            strength: 0.8,
+            adjust,
+            ..Edit::default()
+        };
+        project.set_edit(0, "sub/b.ARW", edit.clone());
+        project.save(&path).unwrap();
+
+        let loaded = Project::load(&path).unwrap();
+        assert_eq!(loaded.edit(0, "sub/b.ARW"), edit);
+        assert_eq!(
+            loaded.edit(0, "10161107/DSC04307.ARW").strength,
+            1.0,
+            "적지 않은 강도는 1"
+        );
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(
+            text.contains("preset = \"food\"") && text.contains("strength = 0.8"),
+            "{text}"
+        );
+        assert!(text.contains("exposure = 0.3"), "{text}");
+        assert!(
+            !text.contains("contrast") && !text.contains("blue"),
+            "0인 값은 적지 않는다:\n{text}"
+        );
+    }
+
+    #[test]
+    fn an_edit_with_full_strength_and_nothing_else_counts_as_default() {
+        let mut project = sample();
+        project.set_edit(
+            0,
+            "x.ARW",
+            Edit {
+                preset: Some("food".into()),
+                ..Edit::default()
+            },
+        );
+        assert_eq!(project.folders[0].photos.len(), 2);
+        project.set_edit(
+            0,
+            "x.ARW",
+            Edit {
+                strength: 1.0,
+                ..Edit::default()
+            },
+        );
+        assert_eq!(
+            project.folders[0].photos.len(),
+            1,
+            "기본값이 되면 기록을 지운다"
         );
     }
 
