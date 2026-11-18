@@ -574,11 +574,10 @@ mod tests {
             for (label, layout, dark) in frames {
                 let frame = Frame { layout, dark };
                 let look = crate::export::Look {
-                    params: &params,
-                    lut: None,
                     frame: Some(&frame),
+                    ..crate::export::Look::new(&params)
                 };
-                let pixels = crate::preview::shrink(&loaded.develop(&small, look), usize::MAX);
+                let pixels = crate::preview::shrink(&loaded.develop(&small, look, &[]), usize::MAX);
                 image::save_buffer(
                     out.join(format!("frame-{name}-{label}.png")),
                     &pixels.rgba,

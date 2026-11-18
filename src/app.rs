@@ -9,6 +9,7 @@ use crate::export::{self, Report};
 use crate::frame::Frame;
 use crate::job::Outcome;
 use crate::lang::{self, Lang, t};
+use crate::mask::{Mask, Point};
 use crate::preset::{self, Preset};
 use crate::preview::Pixels;
 use crate::project::{Config, Edit, Folder, LutRef, Project};
@@ -29,6 +30,8 @@ pub struct App {
     pub presets: Vec<Preset>,
     /// 프리셋 추천(사진 분류)을 쓸 수 없는 이유. 쓸 수 있으면 None.
     pub recommend_problem: Option<String>,
+    /// 마스크를 쓸 수 없는 이유. 쓸 수 있으면 None.
+    pub mask_problem: Option<String>,
 }
 
 /// AI 모델(노이즈 제거)의 실행 환경.
@@ -56,6 +59,10 @@ pub struct Open {
     /// 노이즈 제거 슬라이더의 값. [적용]을 눌러야 사진에 반영된다.
     pub denoise_level: f32,
     pub preview: Option<Preview>,
+    /// 지금 보는 사진에서 고쳐 쓰는 중인 마스크의 번호. 미리보기를 누르면 이 마스크에 자리가 더해진다.
+    pub mask: Option<usize>,
+    /// 고쳐 쓰는 마스크가 고른 영역을 미리보기에 붉게 표시할지.
+    pub show_mask: bool,
     pub export: ExportState,
     /// 미리보기 요청 번호. 늦게 도착한 옛 결과를 버리는 데 쓴다.
     generation: u64,
@@ -151,7 +158,29 @@ pub enum Action {
     },
     /// 선택한 사진들에 두를 프레임을 정한다 (None이면 없앤다).
     SetFrame(Option<Frame>),
-    /// 프리셋, 수동 조정, LUT을 지운다 (노이즈 제거와 프레임은 그대로).
+    /// 지금 보는 사진에 새 마스크를 만들고 고쳐 쓰기 시작한다.
+    AddMask,
+    /// 고쳐 쓸 마스크를 고른다 (None이면 고쳐 쓰기를 마친다).
+    SelectMask(Option<usize>),
+    /// 고쳐 쓰는 마스크를 지운다.
+    RemoveMask,
+    /// 고쳐 쓰는 마스크에 누른 자리를 더한다. 좌표는 사진의 왼쪽 위가 (0, 0), 오른쪽 아래가 (1, 1)이다.
+    AddMaskPoint {
+        x: f32,
+        y: f32,
+        include: bool,
+    },
+    /// 마지막으로 누른 자리를 없앤다.
+    UndoMaskPoint,
+    SetMaskInvert(bool),
+    /// 고쳐 쓰는 마스크의 영역에만 더할 보정.
+    SetMaskAdjust {
+        params: Params,
+        commit: bool,
+    },
+    /// 고른 영역을 미리보기에 표시할지.
+    ShowMask(bool),
+    /// 프리셋, 수동 조정, LUT을 지운다 (노이즈 제거, 프레임, 마스크는 그대로).
     ResetLook,
     SetExportFolder(PathBuf),
     SetQuality(u8),
@@ -186,6 +215,8 @@ pub enum Action {
     Backend(Backend),
     /// 프리셋 추천을 쓸 수 있는지. 쓸 수 없으면 그 이유.
     Recommender(Option<String>),
+    /// 마스크를 쓸 수 있는지. 쓸 수 없으면 그 이유.
+    Segmenter(Option<String>),
 }
 
 /// 화면 밖에서 해야 할 일.
@@ -204,6 +235,10 @@ pub enum Effect {
         lut: Option<(PathBuf, f32)>,
         /// 사진에 두를 프레임.
         frame: Option<Frame>,
+        /// 부분 보정 마스크.
+        masks: Vec<Mask>,
+        /// 이 번호의 마스크가 고른 영역을 붉게 표시한다.
+        overlay: Option<usize>,
     },
     Export {
         photos: Vec<export::Photo>,
@@ -229,6 +264,7 @@ impl App {
             backend: Backend::Unknown,
             presets,
             recommend_problem: None,
+            mask_problem: None,
         }
     }
 
@@ -268,6 +304,10 @@ impl App {
                 self.recommend_problem = problem;
                 return Ok(Vec::new());
             }
+            Action::Segmenter(problem) => {
+                self.mask_problem = problem;
+                return Ok(Vec::new());
+            }
             Action::SaveScreenshot(pixels) => {
                 let path = self.save_screenshot(&pixels)?;
                 let path = path.display();
@@ -297,6 +337,7 @@ impl App {
             | Action::SaveScreenshot(_)
             | Action::SetLanguage(_)
             | Action::Recommender(_)
+            | Action::Segmenter(_)
             | Action::Backend(_) => {
                 unreachable!()
             }
@@ -350,6 +391,8 @@ impl App {
                 }
                 open.selected.insert(index);
                 open.current = Some(index);
+                // 마스크는 사진마다 따로다. 다른 사진으로 가면 고쳐 쓰기를 마친다.
+                open.mask = None;
                 open.denoise_level = open.edit(index).denoise;
                 effects.push(open.request_preview(index, &self.presets));
             }
@@ -424,11 +467,66 @@ impl App {
             Action::SetFrame(frame) => {
                 open.change_look(true, &self.presets, &mut effects, |edit| edit.frame = frame)?;
             }
+            Action::AddMask => {
+                if let Some(current) = open.current {
+                    open.mask = Some(open.edit(current).masks.len());
+                    open.show_mask = true;
+                    open.change_masks(true, &self.presets, &mut effects, |masks| {
+                        masks.push(Mask::default())
+                    })?;
+                }
+            }
+            Action::SelectMask(choice) => {
+                if let Some(current) = open.current {
+                    open.mask = choice.filter(|&index| index < open.edit(current).masks.len());
+                    effects.push(open.request_preview(current, &self.presets));
+                }
+            }
+            Action::RemoveMask => {
+                if let Some(active) = open.mask.take() {
+                    open.change_masks(true, &self.presets, &mut effects, |masks| {
+                        if active < masks.len() {
+                            masks.remove(active);
+                        }
+                    })?;
+                }
+            }
+            Action::AddMaskPoint { x, y, include } => {
+                open.change_mask(true, &self.presets, &mut effects, |mask| {
+                    mask.points.push(Point {
+                        x: x.clamp(0.0, 1.0),
+                        y: y.clamp(0.0, 1.0),
+                        include,
+                    })
+                })?;
+            }
+            Action::UndoMaskPoint => {
+                open.change_mask(true, &self.presets, &mut effects, |mask| {
+                    mask.points.pop();
+                })?;
+            }
+            Action::SetMaskInvert(invert) => {
+                open.change_mask(true, &self.presets, &mut effects, |mask| {
+                    mask.invert = invert
+                })?;
+            }
+            Action::SetMaskAdjust { params, commit } => {
+                open.change_mask(commit, &self.presets, &mut effects, |mask| {
+                    mask.adjust = params
+                })?;
+            }
+            Action::ShowMask(show) => {
+                open.show_mask = show;
+                if let Some(current) = open.current {
+                    effects.push(open.request_preview(current, &self.presets));
+                }
+            }
             Action::ResetLook => {
                 open.change_look(true, &self.presets, &mut effects, |edit| {
                     *edit = Edit {
                         denoise: edit.denoise,
                         frame: edit.frame,
+                        masks: std::mem::take(&mut edit.masks),
                         ..Edit::default()
                     };
                 })?;
@@ -468,6 +566,7 @@ impl App {
                             params: open.params(index, &self.presets),
                             lut: open.lut(index),
                             frame: open.edit(index).frame,
+                            masks: open.edit(index).masks,
                         }
                     })
                     .collect();
@@ -559,6 +658,8 @@ impl App {
             current: None,
             denoise_level: 0.0,
             preview: None,
+            mask: None,
+            show_mask: true,
             export: ExportState::Idle,
             generation: 0,
             preview_serial: 0,
@@ -675,15 +776,63 @@ impl Open {
 
     fn request_preview(&mut self, index: usize, presets: &[Preset]) -> Effect {
         self.generation += 1;
+        let edit = self.edit(index);
+        // 마스크를 고쳐 쓰는 동안에는 누른 자리가 어긋나지 않도록 프레임 없이 보여 준다.
+        let editing = self.mask.filter(|_| self.current == Some(index));
         Effect::Preview {
             generation: self.generation,
             index,
             path: self.photo_path(index),
-            denoise: self.edit(index).denoise,
+            denoise: edit.denoise,
             params: self.params(index, presets),
             lut: self.lut(index),
-            frame: self.edit(index).frame,
+            frame: edit.frame.filter(|_| editing.is_none()),
+            masks: edit.masks,
+            overlay: editing.filter(|_| self.show_mask),
         }
+    }
+
+    /// 지금 보는 사진의 마스크 목록을 바꾸고 미리보기를 다시 요청한다. `commit`이면 파일에도 저장한다.
+    fn change_masks(
+        &mut self,
+        commit: bool,
+        presets: &[Preset],
+        effects: &mut Vec<Effect>,
+        change: impl FnOnce(&mut Vec<Mask>),
+    ) -> crate::Result<()> {
+        let Some(current) = self.current else {
+            return Ok(());
+        };
+        let (folder, relative) = (
+            self.photos[current].folder,
+            self.photos[current].relative.clone(),
+        );
+        let mut edit = self.edit(current);
+        change(&mut edit.masks);
+        self.project.set_edit(folder, &relative, edit);
+        if commit {
+            self.save()?;
+        }
+        effects.push(self.request_preview(current, presets));
+        Ok(())
+    }
+
+    /// 고쳐 쓰는 중인 마스크를 바꾼다. 고쳐 쓰는 마스크가 없으면 아무 일도 하지 않는다.
+    fn change_mask(
+        &mut self,
+        commit: bool,
+        presets: &[Preset],
+        effects: &mut Vec<Effect>,
+        change: impl FnOnce(&mut Mask),
+    ) -> crate::Result<()> {
+        let Some(active) = self.mask else {
+            return Ok(());
+        };
+        self.change_masks(commit, presets, effects, |masks| {
+            if let Some(mask) = masks.get_mut(active) {
+                change(mask)
+            }
+        })
     }
 
     /// 선택한 사진들의 편집 내용을 바꾸고 미리보기를 다시 요청한다. `commit`이면 파일에도 저장한다.
@@ -1322,6 +1471,7 @@ mod tests {
                     params: Params::default(),
                     lut: None,
                     frame: None,
+                    masks: Vec::new(),
                 },
                 export::Photo {
                     input: src.join("c.ARW"),
@@ -1330,6 +1480,7 @@ mod tests {
                     params: Params::default(),
                     lut: None,
                     frame: None,
+                    masks: Vec::new(),
                 },
                 export::Photo {
                     input: src.join("sub/b.ARW"),
@@ -1338,6 +1489,7 @@ mod tests {
                     params: Params::default(),
                     lut: None,
                     frame: None,
+                    masks: Vec::new(),
                 },
             ]
         );
@@ -1631,5 +1783,176 @@ mod tests {
         assert_eq!(fx.app.recommend_problem.as_deref(), Some("모델이 없습니다"));
         fx.app.handle(Action::Recommender(None));
         assert_eq!(fx.app.recommend_problem, None);
+    }
+
+    /// 마지막 동작이 요청한 미리보기에서 마스크와 관련된 것만 꺼낸다: (마스크 수, 영역 표시, 프레임 유무).
+    fn mask_preview(effects: &[Effect]) -> (usize, Option<usize>, bool) {
+        let [
+            Effect::Preview {
+                masks,
+                overlay,
+                frame,
+                ..
+            },
+        ] = effects
+        else {
+            panic!("{effects:?}")
+        };
+        (masks.len(), *overlay, frame.is_some())
+    }
+
+    #[test]
+    fn a_mask_is_made_on_the_current_photo_and_grows_point_by_point() {
+        use crate::frame::{Frame, Layout};
+        use crate::mask::Point;
+        let mut fx = Fixture::with_photos("mask");
+        // 사진을 고르기 전에는 만들 곳이 없다.
+        assert!(fx.app.handle(Action::AddMask).is_empty());
+        fx.app.handle(Action::Select {
+            index: 0,
+            extend: false,
+        });
+        fx.app.handle(Action::Select {
+            index: 1,
+            extend: true,
+        });
+        fx.app.handle(Action::SetFrame(Some(Frame {
+            layout: Layout::Band,
+            dark: false,
+        })));
+
+        let effects = fx.app.handle(Action::AddMask);
+        assert_eq!(
+            fx.open().mask,
+            Some(0),
+            "새 마스크가 바로 고쳐 쓸 대상이 된다"
+        );
+        assert_eq!(
+            fx.open().edit(1).masks.len(),
+            1,
+            "지금 보는 사진에만 생긴다"
+        );
+        assert_eq!(fx.open().edit(0).masks.len(), 0);
+        // 마스크를 고치는 동안에는 누른 자리가 어긋나지 않게 프레임 없이 보여 주고, 고른 영역을 표시한다.
+        assert_eq!(mask_preview(&effects), (1, Some(0), false));
+
+        fx.app.handle(Action::AddMaskPoint {
+            x: 0.25,
+            y: 0.5,
+            include: true,
+        });
+        fx.app.handle(Action::AddMaskPoint {
+            x: 1.7,
+            y: -0.2,
+            include: false,
+        });
+        let points = fx.open().edit(1).masks[0].points.clone();
+        assert_eq!(
+            points,
+            [
+                Point {
+                    x: 0.25,
+                    y: 0.5,
+                    include: true
+                },
+                Point {
+                    x: 1.0,
+                    y: 0.0,
+                    include: false
+                },
+            ],
+            "사진 밖의 좌표는 가장자리로 당긴다"
+        );
+        fx.app.handle(Action::UndoMaskPoint);
+        assert_eq!(fx.open().edit(1).masks[0].points.len(), 1);
+
+        fx.app.handle(Action::SetMaskInvert(true));
+        let adjust = Params {
+            exposure: 0.7,
+            ..Params::default()
+        };
+        fx.app.handle(Action::SetMaskAdjust {
+            params: adjust,
+            commit: true,
+        });
+        let saved = Project::load(&fx.open().path)
+            .unwrap()
+            .edit(0, "c.ARW")
+            .masks;
+        assert_eq!(saved.len(), 1);
+        assert!(saved[0].invert && saved[0].adjust == adjust && saved[0].points.len() == 1);
+
+        // 영역 표시를 끄면 보정된 결과만 보인다.
+        let effects = fx.app.handle(Action::ShowMask(false));
+        assert_eq!(mask_preview(&effects), (1, None, false));
+        // 고쳐 쓰기를 마치면 프레임이 다시 보인다.
+        let effects = fx.app.handle(Action::SelectMask(None));
+        assert_eq!(fx.open().mask, None);
+        assert_eq!(mask_preview(&effects), (1, None, true));
+
+        // 보정 초기화는 마스크를 지우지 않는다.
+        fx.app.handle(Action::ResetLook);
+        assert_eq!(fx.open().edit(1).masks.len(), 1);
+
+        // 내보낼 때 마스크도 함께 간다.
+        fx.app.handle(Action::SetExportFolder(fx.dir.join("결과")));
+        let effects = fx.app.handle(Action::Export {
+            only_selected: false,
+        });
+        let [Effect::Export { photos, .. }] = &effects[..] else {
+            panic!("{effects:?}")
+        };
+        assert_eq!(
+            photos
+                .iter()
+                .map(|photo| photo.masks.len())
+                .collect::<Vec<_>>(),
+            [0, 1, 0]
+        );
+        fx.app.handle(Action::CancelExport);
+
+        fx.app.handle(Action::SelectMask(Some(0)));
+        fx.app.handle(Action::RemoveMask);
+        assert_eq!(fx.open().edit(1).masks.len(), 0);
+        assert_eq!(fx.open().mask, None);
+    }
+
+    #[test]
+    fn choosing_another_photo_stops_editing_the_mask() {
+        let mut fx = Fixture::with_photos("mask-leave");
+        fx.app.handle(Action::Select {
+            index: 0,
+            extend: false,
+        });
+        fx.app.handle(Action::AddMask);
+        assert_eq!(fx.open().mask, Some(0));
+        fx.app.handle(Action::Select {
+            index: 1,
+            extend: false,
+        });
+        assert_eq!(fx.open().mask, None);
+        // 고쳐 쓰는 마스크가 없으면 점을 찍어도 아무 일도 없다.
+        assert!(
+            fx.app
+                .handle(Action::AddMaskPoint {
+                    x: 0.5,
+                    y: 0.5,
+                    include: true
+                })
+                .is_empty()
+        );
+        // 없는 번호는 고를 수 없다.
+        fx.app.handle(Action::SelectMask(Some(7)));
+        assert_eq!(fx.open().mask, None);
+    }
+
+    #[test]
+    fn a_missing_mask_model_is_remembered_with_its_reason() {
+        let mut fx = Fixture::new("no-sam");
+        fx.app
+            .handle(Action::Segmenter(Some("모델이 없습니다".into())));
+        assert_eq!(fx.app.mask_problem.as_deref(), Some("모델이 없습니다"));
+        fx.app.handle(Action::Segmenter(None));
+        assert_eq!(fx.app.mask_problem, None);
     }
 }

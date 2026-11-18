@@ -11,6 +11,7 @@ mod heif;
 mod job;
 mod lang;
 mod lut;
+mod mask;
 mod preset;
 mod preview;
 mod project;

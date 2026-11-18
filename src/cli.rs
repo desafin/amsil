@@ -273,6 +273,7 @@ fn run_folder(
             params,
             lut: args.lut.clone().map(|file| (file, args.lut_strength)),
             frame: args.frame,
+            masks: Vec::new(),
         })
         .collect();
     let denoiser = load_denoiser(args.denoise > 0.0)?;
@@ -286,6 +287,7 @@ fn run_folder(
         &photos,
         &settings,
         denoiser.as_ref(),
+        None,
         &AtomicBool::new(false),
         report,
     )
@@ -326,9 +328,9 @@ pub fn run(args: &Args) -> Result<()> {
             export::cores(),
             denoise,
             Look {
-                params: &params_for(args, std::slice::from_ref(&args.input))?[0],
                 lut: lut.as_ref().map(|lut| (lut, args.lut_strength)),
                 frame: args.frame.as_ref(),
+                ..Look::new(&params_for(args, std::slice::from_ref(&args.input))?[0])
             },
             &|_| {},
         )?;

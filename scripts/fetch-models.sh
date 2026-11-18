@@ -51,6 +51,9 @@ fetch_file() { # 폴더 파일 URL SHA-256
 # 노이즈 제거: RawNIND UtNet2 (GPL-3.0, 58MB)
 fetch_dtmodel rawdenoise-nind d71b5f1e727c85a359e6f74dca9e2016c9d8fc3e2f7ac3e9b347d80ceca969af
 
+# 마스크: Segment Anything 2.1 Hiera Small (Apache-2.0, 170MB)
+fetch_dtmodel mask-object-sam21-small 06a629ac1adf40daec47d2191cbdbdac609d93769584a05f65f4276bf784663f
+
 # 사진 분류(프리셋 추천): OpenAI CLIP ViT-B/32 이미지 인코더, 반정밀도 (MIT, 176MB)
 fetch_file clip-vit-b32 vision_model_fp16.onnx \
     "https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/6b7c523703ae26e39be4b03774966f8571c7f523/onnx/vision_model_fp16.onnx" \

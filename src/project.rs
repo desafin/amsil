@@ -6,6 +6,7 @@ use crate::Result;
 use crate::edit::Params;
 use crate::frame::Frame;
 use crate::lang::t;
+use crate::mask::Mask;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -61,6 +62,9 @@ pub struct Edit {
     /// 사진에 두르는 프레임.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frame: Option<Frame>,
+    /// 부분 보정 마스크.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub masks: Vec<Mask>,
 }
 
 /// 사진에 입힐 LUT 파일과 강도.
@@ -85,6 +89,7 @@ impl Default for Edit {
             adjust: Params::default(),
             lut: None,
             frame: None,
+            masks: Vec::new(),
         }
     }
 }
@@ -540,5 +545,49 @@ mod tests {
         let error = Project::load(&path).unwrap_err().to_string();
         std::fs::remove_dir_all(dir).unwrap();
         assert!(error.contains("1:100"), "{error}");
+    }
+
+    #[test]
+    fn masks_are_saved_per_photo() {
+        use crate::mask::{Mask, Point};
+        let dir = temp("masks");
+        let path = dir.join("p.amsil");
+        let mut project = sample();
+        let masks = vec![
+            Mask {
+                points: vec![
+                    Point {
+                        x: 0.25,
+                        y: 0.5,
+                        include: true,
+                    },
+                    Point {
+                        x: 0.75,
+                        y: 0.5,
+                        include: false,
+                    },
+                ],
+                invert: true,
+                adjust: Params {
+                    exposure: -0.5,
+                    ..Params::default()
+                },
+            },
+            Mask::default(),
+        ];
+        project.set_edit(
+            0,
+            "a.ARW",
+            Edit {
+                masks: masks.clone(),
+                ..Edit::default()
+            },
+        );
+        project.save(&path).unwrap();
+        let loaded = Project::load(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(loaded.edit(0, "a.ARW").masks, masks, "{text}");
+        assert!(!toml::to_string(&Edit::default()).unwrap().contains("masks"));
     }
 }

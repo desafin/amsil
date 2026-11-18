@@ -6,6 +6,7 @@ use crate::frame::{Frame, Shot};
 use crate::gpu::{self, Denoiser};
 use crate::lang::t;
 use crate::lut::Lut;
+use crate::mask::{self, Low, Mask, Segmenter};
 use crate::{Result, denoise, develop, heif, job, raw};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -35,6 +36,8 @@ pub struct Photo {
     pub lut: Option<(PathBuf, f32)>,
     /// 사진에 두를 프레임.
     pub frame: Option<Frame>,
+    /// 부분 보정 마스크.
+    pub masks: Vec<Mask>,
 }
 
 /// 배치 전체에 적용되는 설정.
@@ -69,8 +72,7 @@ pub struct Rendered {
     pub exif: Vec<u8>,
 }
 
-/// 읽어 들인 사진: 보정을 적용하기 전의 카메라 RGB와 현상에 필요한 값들.
-/// 사진 한 장에 입힐 것들: 보정 값, LUT, 프레임.
+/// 사진 한 장에 입힐 것들: 보정 값, LUT, 마스크, 프레임.
 #[derive(Clone, Copy)]
 pub struct Look<'a> {
     /// 보정 값 (프리셋 × 강도 + 수동 조정).
@@ -79,8 +81,29 @@ pub struct Look<'a> {
     pub lut: Option<(&'a Lut, f32)>,
     /// 맨 마지막에 두를 프레임.
     pub frame: Option<&'a Frame>,
+    /// 부분 보정 마스크.
+    pub masks: &'a [Mask],
+    /// 마스크가 고르는 영역을 계산할 모델. 마스크가 있는 사진에 필요하다.
+    pub segmenter: Option<&'a Mutex<Segmenter>>,
+    /// 이 번호의 마스크가 고른 영역을 붉게 표시한다 (화면에서 영역을 확인할 때 쓴다).
+    pub overlay: Option<usize>,
 }
 
+impl<'a> Look<'a> {
+    /// LUT도 마스크도 프레임도 없이 보정 값만.
+    pub fn new(params: &'a Params) -> Self {
+        Self {
+            params,
+            lut: None,
+            frame: None,
+            masks: &[],
+            segmenter: None,
+            overlay: None,
+        }
+    }
+}
+
+/// 읽어 들인 사진: 보정을 적용하기 전의 카메라 RGB와 현상에 필요한 값들.
 /// 읽기(디모자익, 노이즈 제거)는 오래 걸리고 보정을 바꿀 때마다 되풀이할 필요가 없어서 따로 둔다.
 pub struct Loaded {
     /// 카메라 RGB (선형, 출력 영역으로 잘린 것).
@@ -96,17 +119,77 @@ pub struct Loaded {
 impl Loaded {
     /// 보정을 적용해 현상하고 바로 세운다. `cam`에는 `self.cam`이나 그것을 줄인 것을 준다.
     /// LUT은 보정 뒤에 입히고, 프레임은 바로 세운 다음에 두른다.
-    pub fn develop(&self, cam: &crate::Image, look: Look) -> crate::Image {
-        let mut image = develop::develop(cam, self.wb, self.xyz_to_cam, look.params);
-        if let Some((lut, strength)) = look.lut {
-            lut.apply(&mut image, strength);
+    /// `areas`는 `look.masks`의 마스크마다 고른 영역이다 (`areas`로 구한다).
+    // ponytail: 마스크마다 보정을 더한 그림을 따로 현상해 영역만큼 섞는다. 마스크가 겹치는 곳에서는
+    // 뒤의 마스크가 앞의 것을 덮는다. 화소마다 보정 값을 달리 주는 방식보다 단순하고, 마스크 하나에 현상 한 번이 더 든다.
+    pub fn develop(&self, cam: &crate::Image, look: Look, areas: &[Low]) -> crate::Image {
+        let upright = |params: &Params| {
+            let mut image = develop::develop(cam, self.wb, self.xyz_to_cam, params);
+            if let Some((lut, strength)) = look.lut {
+                lut.apply(&mut image, strength);
+            }
+            let (transpose, flip_h, flip_v) = self.flips;
+            develop::orient(image, transpose, flip_h, flip_v)
+        };
+        let mut image = upright(look.params);
+        for (index, (mask, area)) in look.masks.iter().zip(areas).enumerate() {
+            let shown = look.overlay == Some(index);
+            if mask.adjust.is_neutral() && !shown {
+                continue;
+            }
+            let alpha = mask::upscale(area, &image, mask.invert);
+            if !mask.adjust.is_neutral() {
+                mask::blend(
+                    &mut image,
+                    &upright(&look.params.plus(&mask.adjust)),
+                    &alpha,
+                );
+            }
+            if shown {
+                mask::tint(&mut image, &alpha);
+            }
         }
-        let (transpose, flip_h, flip_v) = self.flips;
-        let image = develop::orient(image, transpose, flip_h, flip_v);
         match look.frame {
             Some(frame) => crate::frame::apply(&image, frame, &self.shot),
             None => image,
         }
+    }
+
+    /// 마스크마다 고른 영역을 모델로 구한다. 마스크가 없으면 모델도 필요 없다.
+    pub fn areas(&self, look: Look) -> Result<Vec<Low>> {
+        if look.masks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(segmenter) = look.segmenter else {
+            return Err(mask::missing()
+                .unwrap_or_else(|| {
+                    t(
+                        "마스크 모델이 준비되지 않았습니다",
+                        "The mask model is not loaded",
+                    )
+                    .into()
+                })
+                .into());
+        };
+        let mut segmenter = segmenter.lock().unwrap();
+        let embedding = segmenter.embed(&self.mask_picture())?;
+        look.masks
+            .iter()
+            .map(|mask| segmenter.select(&embedding, &mask.points))
+            .collect()
+    }
+
+    /// 마스크 모델에 넣을 그림: 보정 없이 현상해 바로 세운 것 (긴 변 1024 이하).
+    /// 화면과 내보내기가 같은 그림을 써야 같은 영역이 나온다.
+    pub fn mask_picture(&self) -> crate::preview::Pixels {
+        let small = crate::preview::downscale(&self.cam, mask::INPUT);
+        let neutral = Params::default();
+        let image = self.develop(
+            small.as_ref().unwrap_or(&self.cam),
+            Look::new(&neutral),
+            &[],
+        );
+        crate::preview::shrink(&image, mask::INPUT)
     }
 }
 
@@ -165,7 +248,8 @@ pub fn render(
 ) -> Result<Rendered> {
     let timing = Timing::start();
     let loaded = load(input, denoise, progress)?;
-    let image = loaded.develop(&loaded.cam, look);
+    let areas = loaded.areas(look)?;
+    let image = loaded.develop(&loaded.cam, look, &areas);
     timing.mark(t("현상", "develop"));
     progress(0.75);
     Ok(Rendered {
@@ -208,11 +292,13 @@ pub fn convert(
 /// 사진 한 장을 처리하는 데 잡아 둘 메모리(바이트). `size`는 센서의 가로·세로 화소 수.
 /// 프레임을 두르면 그림이 커지는 만큼 더 잡는다. 사진이 가로로 서 있는지 세로로 서 있는지는
 /// 헤더만으로 알 수 없으므로, 둘 중 더 커지는 쪽으로 잡는다.
-pub fn memory_needed((width, height): (usize, usize), frame: Option<&Frame>) -> u64 {
+/// 마스크가 있으면 영역과, 보정을 달리한 그림 한 장만큼(화소당 16바이트) 더 잡는다.
+pub fn memory_needed((width, height): (usize, usize), frame: Option<&Frame>, masked: bool) -> u64 {
     let growth = frame.map_or(1.0, |frame| {
         frame.growth(width, height).max(frame.growth(height, width))
     });
-    ((width * height) as f64 * BYTES_PER_PIXEL as f64 * growth) as u64
+    let masks = if masked { 1.25 } else { 1.0 };
+    ((width * height) as f64 * BYTES_PER_PIXEL as f64 * growth * masks) as u64
 }
 
 /// 논리 코어 수.
@@ -394,6 +480,7 @@ pub fn run(
     photos: &[Photo],
     settings: &Settings,
     denoiser: Option<&Mutex<Denoiser>>,
+    segmenter: Option<&Mutex<Segmenter>>,
     cancel: &AtomicBool,
     mut report: impl FnMut(&Report),
 ) -> Result<(job::Outcome, Warnings)> {
@@ -435,7 +522,7 @@ pub fn run(
     // 실제 입장 제한은 사진마다 따로 계산하므로 안전에는 영향이 없다.
     let per_photo = raw::sensor_size(&tasks[0].input)
         .map_or(24_000_000 * BYTES_PER_PIXEL, |size| {
-            memory_needed(size, photos[0].frame.as_ref())
+            memory_needed(size, photos[0].frame.as_ref(), !photos[0].masks.is_empty())
         });
     let (workers, encoder_threads) = plan(cores(), settings.jobs, limit, per_photo, tasks.len());
     let budget = job::Budget::new(limit, workers);
@@ -447,8 +534,12 @@ pub fn run(
         overwrite: settings.overwrite,
         cancel,
         cost: &|task| {
-            let frame = looks[task.output.as_path()].frame.as_ref();
-            Ok(memory_needed(raw::sensor_size(&task.input)?, frame))
+            let photo = looks[task.output.as_path()];
+            Ok(memory_needed(
+                raw::sensor_size(&task.input)?,
+                photo.frame.as_ref(),
+                !photo.masks.is_empty(),
+            ))
         },
         available: &|| {
             let mut system = sysinfo::System::new().expect("시스템 정보를 읽을 수 없습니다");
@@ -472,9 +563,11 @@ pub fn run(
                 encoder_threads,
                 denoise,
                 Look {
-                    params: &photo.params,
                     lut,
                     frame: photo.frame.as_ref(),
+                    masks: &photo.masks,
+                    segmenter,
+                    ..Look::new(&photo.params)
                 },
                 progress,
             )?;
@@ -495,13 +588,9 @@ mod tests {
     use crate::sample_arw;
     use libheif_rs::HeifContext;
 
-    /// LUT도 프레임도 없이 보정 값만.
+    /// LUT도 마스크도 프레임도 없이 보정 값만.
     fn bare(params: &Params) -> Look<'_> {
-        Look {
-            params,
-            lut: None,
-            frame: None,
-        }
+        Look::new(params)
     }
 
     #[test]
@@ -651,7 +740,7 @@ mod tests {
         .unwrap();
         let loaded = load(&input, None, &|_| {}).unwrap();
         let small = crate::preview::downscale(&loaded.cam, 400).unwrap();
-        let plain = means(&loaded.develop(&small, bare(&Params::default())));
+        let plain = means(&loaded.develop(&small, bare(&Params::default()), &[]));
 
         let same = means(&loaded.develop(
             &small,
@@ -659,6 +748,7 @@ mod tests {
                 lut: Some((&identity, 1.0)),
                 ..bare(&Params::default())
             },
+            &[],
         ));
         assert!(
             (0..3).all(|c| (same[c] - plain[c]).abs() < 1e-3),
@@ -671,6 +761,7 @@ mod tests {
                 lut: Some((&no_red, 1.0)),
                 ..bare(&Params::default())
             },
+            &[],
         ));
         assert!(
             full[0] < 1e-4 && (full[1] - plain[1]).abs() < 1e-3,
@@ -682,6 +773,7 @@ mod tests {
                 lut: Some((&no_red, 0.5)),
                 ..bare(&Params::default())
             },
+            &[],
         ));
         assert!((half[0] - plain[0] / 2.0).abs() < 1e-3, "{half:?}");
     }
@@ -700,6 +792,7 @@ mod tests {
                 params: Params::default(),
                 lut: Some((missing, 1.0)),
                 frame: None,
+                masks: vec![],
             },
             Photo {
                 input,
@@ -708,11 +801,13 @@ mod tests {
                 params: Params::default(),
                 lut: None,
                 frame: None,
+                masks: vec![],
             },
         ];
         let (outcome, _) = run(
             &photos,
             &Settings::default(),
+            None,
             None,
             &AtomicBool::new(false),
             |_| {},
@@ -735,7 +830,7 @@ mod tests {
         let loaded = load(&input, None, &|_| {}).unwrap();
         let small = crate::preview::downscale(&loaded.cam, 400).unwrap();
         let params = Params::default();
-        let plain = loaded.develop(&small, bare(&params));
+        let plain = loaded.develop(&small, bare(&params), &[]);
         let frame = Frame {
             layout: Layout::Band,
             dark: false,
@@ -746,6 +841,7 @@ mod tests {
                 frame: Some(&frame),
                 ..bare(&params)
             },
+            &[],
         );
         // 세로로 찍은 사진이다. 바로 세운 다음 그 아래에 띠가 붙어야 한다.
         assert!(plain.height > plain.width);
@@ -794,21 +890,245 @@ mod tests {
     #[test]
     fn a_frame_raises_the_memory_estimate_by_how_much_it_enlarges_the_picture() {
         use crate::frame::{Frame, Layout};
-        let plain = memory_needed((6080, 4048), None);
+        let plain = memory_needed((6080, 4048), None, false);
         assert_eq!(plain, 6080 * 4048 * BYTES_PER_PIXEL);
         let frame = |layout| Frame {
             layout,
             dark: false,
         };
-        let band = memory_needed((6080, 4048), Some(&frame(Layout::Band)));
+        let band = memory_needed((6080, 4048), Some(&frame(Layout::Band)), false);
         assert!((band as f64 / plain as f64 - 1.1).abs() < 0.01, "{band}");
         // 가로 사진을 세로 9:16에 넣으면 세 배 가까이 커진다. 사진이 어느 쪽으로 서 있는지는
         // 헤더만으로 알 수 없으므로 더 커지는 쪽으로 잡는다.
-        let tall = memory_needed((6080, 4048), Some(&frame(Layout::Ratio(9, 16))));
+        let tall = memory_needed((6080, 4048), Some(&frame(Layout::Ratio(9, 16))), false);
         assert!(tall as f64 / plain as f64 > 2.9, "{tall}");
         assert_eq!(
             tall,
-            memory_needed((4048, 6080), Some(&frame(Layout::Ratio(9, 16))))
+            memory_needed((4048, 6080), Some(&frame(Layout::Ratio(9, 16))), false)
+        );
+    }
+
+    /// 왼쪽 절반을 고른 저해상도 마스크.
+    fn left_half() -> crate::mask::Low {
+        crate::mask::Low {
+            width: 4,
+            height: 4,
+            logits: [8.0, 8.0, -8.0, -8.0].repeat(4),
+        }
+    }
+
+    /// 그림의 가로 `from..to`(0~1) 구간의 채널별 평균.
+    fn strip_means(image: &crate::Image, from: f32, to: f32) -> [f32; 3] {
+        let (x0, x1) = (
+            (from * image.width as f32) as usize,
+            (to * image.width as f32) as usize,
+        );
+        image.planes.each_ref().map(|plane| {
+            let sum: f32 = plane
+                .chunks_exact(image.width)
+                .map(|row| row[x0..x1].iter().sum::<f32>())
+                .sum();
+            sum / ((x1 - x0) * image.height) as f32
+        })
+    }
+
+    #[test]
+    fn a_mask_adjusts_only_the_area_it_selects() {
+        use crate::mask::Mask;
+        let Some(input) = sample_arw() else { return };
+        let loaded = load(&input, None, &|_| {}).unwrap();
+        let small = crate::preview::downscale(&loaded.cam, 400).unwrap();
+        let params = Params::default();
+        let plain = loaded.develop(&small, bare(&params), &[]);
+        // 어둡게 하는 보정으로 본다. 밝게 하면 이미 밝은 하늘은 더 밝아질 여유가 없다.
+        let darker = Mask {
+            adjust: Params {
+                exposure: -1.0,
+                ..Params::default()
+            },
+            ..Mask::default()
+        };
+        let masks = [darker.clone()];
+        let look = Look {
+            masks: &masks,
+            ..bare(&params)
+        };
+        let masked = loaded.develop(&small, look, &[left_half()]);
+        let (left, right) = (0.0..0.3, 0.7..1.0);
+        let change = |range: &std::ops::Range<f32>, image: &crate::Image| {
+            strip_means(image, range.start, range.end)[1]
+                / strip_means(&plain, range.start, range.end)[1]
+        };
+        assert!(
+            change(&left, &masked) < 0.8,
+            "고른 쪽은 어두워진다: {}",
+            change(&left, &masked)
+        );
+        assert!(
+            (change(&right, &masked) - 1.0).abs() < 0.01,
+            "나머지는 그대로: {}",
+            change(&right, &masked)
+        );
+
+        // 뒤집으면 반대쪽이 어두워진다.
+        let masks = [Mask {
+            invert: true,
+            ..darker
+        }];
+        let look = Look {
+            masks: &masks,
+            ..bare(&params)
+        };
+        let inverted = loaded.develop(&small, look, &[left_half()]);
+        assert!((change(&left, &inverted) - 1.0).abs() < 0.01);
+        assert!(change(&right, &inverted) < 0.8);
+    }
+
+    #[test]
+    fn the_selected_area_can_be_shown_in_red() {
+        use crate::mask::Mask;
+        let Some(input) = sample_arw() else { return };
+        let loaded = load(&input, None, &|_| {}).unwrap();
+        let small = crate::preview::downscale(&loaded.cam, 400).unwrap();
+        let params = Params::default();
+        let plain = loaded.develop(&small, bare(&params), &[]);
+        let masks = [Mask::default()];
+        let look = Look {
+            masks: &masks,
+            overlay: Some(0),
+            ..bare(&params)
+        };
+        let shown = loaded.develop(&small, look, &[left_half()]);
+        let (before, after) = (strip_means(&plain, 0.0, 0.3), strip_means(&shown, 0.0, 0.3));
+        assert!(
+            after[0] > before[0] + 0.1 && after[2] < before[2],
+            "{before:?} → {after:?}"
+        );
+        let (before, after) = (strip_means(&plain, 0.7, 1.0), strip_means(&shown, 0.7, 1.0));
+        assert!(
+            (0..3).all(|c| (before[c] - after[c]).abs() < 1e-3),
+            "고르지 않은 쪽은 그대로: {before:?} → {after:?}"
+        );
+    }
+
+    #[test]
+    fn a_photo_with_masks_fails_alone_when_the_mask_model_is_not_there() {
+        use crate::mask::{Mask, Point};
+        let Some(input) = sample_arw() else { return };
+        let dir = std::env::temp_dir().join(format!("amsil-test-nomask-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let photo = |name: &str, masks| Photo {
+            input: input.clone(),
+            output: dir.join(name),
+            denoise: 0.0,
+            params: Params::default(),
+            lut: None,
+            frame: None,
+            masks,
+        };
+        let click = Point {
+            x: 0.5,
+            y: 0.5,
+            include: true,
+        };
+        let masked = vec![Mask {
+            points: vec![click],
+            ..Mask::default()
+        }];
+        let photos = vec![photo("masked.heic", masked), photo("plain.heic", vec![])];
+        let (outcome, _) = run(
+            &photos,
+            &Settings::default(),
+            None,
+            None,
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+        let made = (
+            dir.join("plain.heic").exists(),
+            dir.join("masked.heic").exists(),
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!((outcome.done, outcome.failed.len()), (1, 1));
+        assert!(
+            outcome.failed[0].1.contains("마스크 모델"),
+            "{:?}",
+            outcome.failed
+        );
+        assert_eq!(made, (true, false));
+    }
+
+    #[test]
+    fn masks_raise_the_memory_estimate() {
+        let plain = memory_needed((6080, 4048), None, false);
+        // 마스크 영역과, 보정을 달리한 그림 한 장이 더 필요하다.
+        assert_eq!(memory_needed((6080, 4048), None, true), plain / 4 * 5);
+    }
+
+    #[test]
+    fn a_real_click_brightens_the_building_and_leaves_the_sky() {
+        use crate::mask::{Mask, Point};
+        // 마스크 모델과 샘플 사진이 있을 때만 돈다.
+        let photo =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("DCIM/10361110/DSC04551.ARW");
+        let Ok(segmenter) = crate::mask::load_segmenter() else {
+            eprintln!("마스크 모델이 없어 건너뜀");
+            return;
+        };
+        if !photo.exists() {
+            return;
+        }
+        let segmenter = Mutex::new(segmenter);
+        let loaded = load(&photo, None, &|_| {}).unwrap();
+        let small = crate::preview::downscale(&loaded.cam, 800).unwrap();
+        let params = Params::default();
+        let masks = [Mask {
+            points: vec![Point {
+                x: 0.48,
+                y: 0.35,
+                include: true,
+            }],
+            invert: false,
+            adjust: Params {
+                exposure: 1.0,
+                ..Params::default()
+            },
+        }];
+        let look = Look {
+            masks: &masks,
+            segmenter: Some(&segmenter),
+            ..bare(&params)
+        };
+        let started = Instant::now();
+        let areas = loaded.areas(look).unwrap();
+        let selected = started.elapsed();
+        assert_eq!(areas.len(), 1);
+        let (plain, masked) = (
+            loaded.develop(&small, bare(&params), &[]),
+            loaded.develop(&small, look, &areas),
+        );
+        // 원본 크기에서 마스크가 얼마나 더 걸리는지 (성능을 가늠하는 용도)
+        let started = Instant::now();
+        loaded.develop(&loaded.cam, bare(&params), &[]);
+        let without = started.elapsed();
+        let started = Instant::now();
+        loaded.develop(&loaded.cam, look, &areas);
+        eprintln!(
+            "영역 구하기 {selected:.2?}, 원본 크기 현상: 마스크 없이 {without:.2?}, 마스크 하나 {:.2?}",
+            started.elapsed()
+        );
+        let at = |image: &crate::Image, x: f32, y: f32| {
+            image.planes[1][(y * image.height as f32) as usize * image.width
+                + (x * image.width as f32) as usize]
+        };
+        assert!(
+            at(&masked, 0.48, 0.35) > at(&plain, 0.48, 0.35) * 1.2,
+            "건물은 밝아진다"
+        );
+        assert!(
+            (at(&masked, 0.1, 0.1) - at(&plain, 0.1, 0.1)).abs() < 0.01,
+            "하늘은 그대로"
         );
     }
 }

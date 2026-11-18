@@ -3,6 +3,7 @@
 use crate::app::{Action, Backend, Effect};
 use crate::gpu::Denoiser;
 use crate::lut::Lut;
+use crate::mask::{self, Low, Mask, Point, Segmenter};
 use crate::recommend::{self, Classifier};
 use crate::{export, preview};
 use rayon::prelude::*;
@@ -32,6 +33,10 @@ struct Base {
     loaded: export::Loaded,
     /// 빠른 미리보기용으로 줄인 카메라 RGB. 원본이 이미 작으면 없다.
     small: Option<crate::Image>,
+    /// 마스크 모델의 인코더 출력. 이 사진에 마스크를 처음 쓸 때 만든다.
+    embedding: Mutex<Option<Arc<mask::Embedding>>>,
+    /// 누른 자리들로 이미 구해 둔 영역. 보정 슬라이더를 끄는 동안 다시 계산하지 않게 한다.
+    areas: Mutex<Vec<(Vec<Point>, Low)>>,
 }
 
 #[derive(Clone)]
@@ -52,6 +57,8 @@ pub struct Workers {
     lut: Arc<Mutex<Option<CachedLut>>>,
     /// 사진 분류 모델. 처음 필요할 때 읽는다.
     classifier: Arc<Mutex<Option<Arc<Mutex<Classifier>>>>>,
+    /// 마스크 모델. 처음 필요할 때 읽는다.
+    segmenter: Arc<Mutex<Option<Arc<Mutex<Segmenter>>>>>,
 }
 
 impl Workers {
@@ -67,6 +74,7 @@ impl Workers {
             base: Arc::default(),
             lut: Arc::default(),
             classifier: Arc::default(),
+            segmenter: Arc::default(),
         };
         (workers, rx)
     }
@@ -101,6 +109,8 @@ impl Workers {
             };
             workers.send(Action::Backend(backend));
             workers.send(Action::Recommender(workers.classifier().err()));
+            // 마스크 모델은 크고, 쓰지 않는 사람도 많다. 여기서는 파일이 있는지만 본다.
+            workers.send(Action::Segmenter(mask::missing()));
         });
     }
 
@@ -129,6 +139,61 @@ impl Workers {
         Ok(classifier)
     }
 
+    fn segmenter(&self) -> std::result::Result<Arc<Mutex<Segmenter>>, String> {
+        let mut slot = self.segmenter.lock().unwrap();
+        if let Some(segmenter) = slot.as_ref() {
+            return Ok(segmenter.clone());
+        }
+        let segmenter = Arc::new(Mutex::new(
+            mask::load_segmenter().map_err(|e| e.to_string())?,
+        ));
+        *slot = Some(segmenter.clone());
+        Ok(segmenter)
+    }
+
+    /// 미리보기에서 마스크마다 고른 영역을 구한다. 인코더 출력과 이미 구한 영역은 사진에 붙여 두고 다시 쓴다.
+    fn areas(&self, base: &Base, masks: &[Mask]) -> std::result::Result<Vec<Low>, String> {
+        /// 사진 한 장에 기억해 두는 영역의 수.
+        const REMEMBERED: usize = 16;
+        if masks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let segmenter = self.segmenter()?;
+        let mut segmenter = segmenter.lock().unwrap();
+        let embedding = {
+            let mut slot = base.embedding.lock().unwrap();
+            match slot.as_ref() {
+                Some(embedding) => embedding.clone(),
+                None => {
+                    let embedding = Arc::new(
+                        segmenter
+                            .embed(&base.loaded.mask_picture())
+                            .map_err(|e| e.to_string())?,
+                    );
+                    *slot = Some(embedding.clone());
+                    embedding
+                }
+            }
+        };
+        let mut known = base.areas.lock().unwrap();
+        masks
+            .iter()
+            .map(|mask| {
+                if let Some((_, area)) = known.iter().find(|(points, _)| *points == mask.points) {
+                    return Ok(area.clone());
+                }
+                let area = segmenter
+                    .select(&embedding, &mask.points)
+                    .map_err(|e| e.to_string())?;
+                if known.len() >= REMEMBERED {
+                    known.remove(0);
+                }
+                known.push((mask.points.clone(), area.clone()));
+                Ok(area)
+            })
+            .collect()
+    }
+
     /// 사진을 읽는다. 방금 읽은 사진(같은 노이즈 제거 레벨)이면 다시 읽지 않는다.
     /// 여러 요청이 동시에 와도 한 번만 읽도록, 읽는 동안 잠금을 쥐고 있는다.
     fn base(&self, path: &Path, denoise: f32) -> std::result::Result<Arc<Base>, String> {
@@ -152,6 +217,8 @@ impl Workers {
             denoise,
             loaded,
             small,
+            embedding: Mutex::default(),
+            areas: Mutex::default(),
         });
         *slot = Some(base.clone());
         Ok(base)
@@ -204,6 +271,8 @@ impl Workers {
                 params,
                 lut,
                 frame,
+                masks,
+                overlay,
             } => {
                 self.latest_preview.store(generation, SeqCst);
                 std::thread::spawn(move || {
@@ -222,25 +291,31 @@ impl Workers {
                             None => None,
                         };
                         let look = export::Look {
-                            params: &params,
                             lut: lut.as_ref().map(|(lut, strength)| (&**lut, *strength)),
                             frame: frame.as_ref(),
+                            masks: &masks,
+                            overlay,
+                            ..export::Look::new(&params)
                         };
                         let base = workers.base(&path, denoise)?;
+                        if stale() {
+                            return Ok(());
+                        }
+                        let areas = workers.areas(&base, &masks)?;
                         if stale() {
                             return Ok(());
                         }
                         // 먼저 줄인 사본으로 빨리 보여 주고, 이어서 원본 크기로 다시 만든다.
                         if let Some(small) = &base.small {
                             send(preview::shrink(
-                                &base.loaded.develop(small, look),
+                                &base.loaded.develop(small, look, &areas),
                                 usize::MAX,
                             ));
                             if stale() {
                                 return Ok(());
                             }
                         }
-                        let full = base.loaded.develop(&base.loaded.cam, look);
+                        let full = base.loaded.develop(&base.loaded.cam, look, &areas);
                         if !stale() {
                             send(preview::shrink(
                                 &full,
@@ -270,10 +345,17 @@ impl Workers {
                         } else {
                             None
                         };
+                        // 마스크 모델을 읽지 못하면, 마스크가 있는 사진만 그 이유와 함께 실패로 남는다.
+                        let segmenter = if photos.iter().any(|photo| !photo.masks.is_empty()) {
+                            workers.segmenter().ok()
+                        } else {
+                            None
+                        };
                         export::run(
                             &photos,
                             &settings,
                             denoiser.as_deref(),
+                            segmenter.as_deref(),
                             &workers.cancel,
                             |report| {
                                 workers.send(Action::ExportProgress(*report));
@@ -340,6 +422,7 @@ mod tests {
                 .exists()
         );
 
+        let started = std::time::Instant::now();
         workers.run(Effect::Preview {
             generation: 7,
             index: 0,
@@ -348,12 +431,19 @@ mod tests {
             params: Default::default(),
             lut: None,
             frame: None,
+            masks: Vec::new(),
+            overlay: None,
         });
         // 빠른 작은 미리보기가 먼저 오고, 원본 크기에 가까운 것이 뒤따른다.
-        let seen = wait_for(
+        let mut seen = wait_for(&rx, |action| {
+            matches!(action, Action::PreviewReady { generation: 7, .. })
+        });
+        // 사진을 처음 읽어서 보여 주기까지 걸린 시간
+        let cold = started.elapsed();
+        seen.extend(wait_for(
             &rx,
             |action| matches!(action, Action::PreviewReady { generation: 7, result: Ok(preview), .. } if preview.height == 2048),
-        );
+        ));
         let sizes: Vec<(usize, usize)> = seen
             .iter()
             .filter_map(|action| match action {
@@ -371,6 +461,7 @@ mod tests {
         );
 
         // 같은 사진의 보정만 바꾸면 다시 읽지 않아서 금방 온다.
+        // (다른 테스트가 함께 돌면 전체가 느려지므로, 정해 둔 시간이 아니라 처음 읽을 때와 견준다.)
         let started = std::time::Instant::now();
         let mono = crate::edit::Params {
             mono: 1.0,
@@ -384,6 +475,8 @@ mod tests {
             params: mono,
             lut: None,
             frame: None,
+            masks: Vec::new(),
+            overlay: None,
         });
         let seen = wait_for(&rx, |action| {
             matches!(action, Action::PreviewReady { generation: 8, .. })
@@ -394,10 +487,10 @@ mod tests {
         else {
             panic!("미리보기가 아니다")
         };
+        let warm = started.elapsed();
         assert!(
-            started.elapsed() < Duration::from_millis(400),
-            "{:?}",
-            started.elapsed()
+            warm < cold / 2,
+            "다시 읽은 것처럼 느리다: 처음 {cold:?}, 보정만 바꿨을 때 {warm:?}"
         );
         let px = &quick.rgba[..4];
         assert!(
@@ -418,6 +511,7 @@ mod tests {
             params: Default::default(),
             lut: None,
             frame: None,
+            masks: Vec::new(),
         }];
         workers.run(Effect::Export {
             photos,
@@ -452,6 +546,8 @@ mod tests {
             params: Default::default(),
             lut: None,
             frame: None,
+            masks: Vec::new(),
+            overlay: None,
         });
         workers.run(Effect::Preview {
             generation: 2,
@@ -461,6 +557,8 @@ mod tests {
             params: Default::default(),
             lut: None,
             frame: None,
+            masks: Vec::new(),
+            overlay: None,
         });
         let seen = wait_for(&rx, |action| {
             matches!(action, Action::PreviewReady { generation: 2, .. })
@@ -471,5 +569,63 @@ mod tests {
                 .any(|action| matches!(action, Action::PreviewReady { generation: 1, .. })),
             "옛 요청의 결과는 보내지 않는다"
         );
+    }
+
+    #[test]
+    fn a_preview_marks_the_area_a_mask_selects() {
+        // 마스크 모델과 샘플 사진이 있을 때만 돈다.
+        let photo =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("DCIM/10361110/DSC04551.ARW");
+        if !photo.exists() || mask::missing().is_some() {
+            eprintln!("마스크 모델이나 샘플 사진이 없어 건너뜀");
+            return;
+        }
+        let (workers, rx) = Workers::new(|| {});
+        let tower = Point {
+            x: 0.48,
+            y: 0.35,
+            include: true,
+        };
+        // 첫 번째로 오는 빠른 미리보기에서, 건물(누른 자리)과 하늘의 색을 본다.
+        let colours = |generation: u64, overlay: Option<usize>| {
+            workers.run(Effect::Preview {
+                generation,
+                index: 0,
+                path: photo.clone(),
+                denoise: 0.0,
+                params: Default::default(),
+                lut: None,
+                frame: None,
+                masks: vec![Mask {
+                    points: vec![tower],
+                    ..Mask::default()
+                }],
+                overlay,
+            });
+            let seen = wait_for(
+                &rx,
+                |action| matches!(action, Action::PreviewReady { generation: g, .. } if *g == generation),
+            );
+            let Some(Action::PreviewReady {
+                result: Ok(pixels), ..
+            }) = seen.last()
+            else {
+                panic!("미리보기가 오지 않았다")
+            };
+            let at = |x: f32, y: f32| {
+                let i = ((y * pixels.height as f32) as usize * pixels.width
+                    + (x * pixels.width as f32) as usize)
+                    * 4;
+                [pixels.rgba[i], pixels.rgba[i + 1], pixels.rgba[i + 2]]
+            };
+            (at(0.48, 0.35), at(0.1, 0.1))
+        };
+        let (tower_plain, sky_plain) = colours(1, None);
+        let (tower_shown, sky_shown) = colours(2, Some(0));
+        assert!(
+            tower_shown[0] > tower_plain[0] + 30 && tower_shown[2] < tower_plain[2],
+            "고른 건물은 붉게 표시된다: {tower_plain:?} → {tower_shown:?}"
+        );
+        assert_eq!(sky_shown, sky_plain, "하늘은 그대로");
     }
 }

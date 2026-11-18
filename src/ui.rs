@@ -236,7 +236,7 @@ fn workspace(
         .show(ui, |ui| {
             photo_list(ui, open, view, actions);
         });
-    egui::CentralPanel::default().show(ui, |ui| preview(ui, open, view));
+    egui::CentralPanel::default().show(ui, |ui| preview(ui, open, view, actions));
 
     export_windows(ui.ctx(), open, actions);
     if view.show_backend_help {
@@ -423,6 +423,8 @@ fn edit_panel(
         .auto_shrink(false)
         .show(ui, |ui| {
             look_panel(ui, app, open, env, actions);
+            ui.separator();
+            mask_panel(ui, app, open, actions);
             ui.separator();
             frame_panel(ui, open, actions);
             ui.separator();
@@ -620,8 +622,8 @@ fn look_panel(
     if ui
         .button(t("보정 초기화", "Reset adjustments"))
         .on_hover_text(t(
-            "프리셋, 세부 조정, LUT을 지웁니다 (노이즈 제거와 프레임은 그대로)",
-            "Clears the preset, detail adjustments and LUT (noise reduction and frame stay)",
+            "프리셋, 세부 조정, LUT을 지웁니다 (노이즈 제거, 프레임, 마스크는 그대로)",
+            "Clears the preset, detail adjustments and LUT (noise reduction, frame and masks stay)",
         ))
         .clicked()
     {
@@ -639,6 +641,114 @@ fn hue_names() -> [&'static str; 8] {
             "Red", "Orange", "Yellow", "Green", "Aqua", "Blue", "Purple", "Magenta",
         ],
     )
+}
+
+/// 마스크: 사진의 일부분을 골라 그곳에만 보정을 더한다.
+fn mask_panel(ui: &mut egui::Ui, app: &App, open: &Open, actions: &mut Vec<Action>) {
+    ui.heading(t("마스크", "Masks"));
+    let Some(current) = open.current else {
+        ui.weak(t(
+            "사진을 고르면 일부분만 따로 보정할 수 있습니다",
+            "Pick a photo to adjust just a part of it",
+        ));
+        return;
+    };
+    if let Some(problem) = &app.mask_problem {
+        ui.weak(t("마스크: 모델 없음", "Masks: no model"))
+            .on_hover_text(problem);
+        return;
+    }
+    let masks = open.edit(current).masks;
+    ui.horizontal_wrapped(|ui| {
+        for index in 0..masks.len() {
+            let number = index + 1;
+            let name = t(format!("마스크 {number}"), format!("Mask {number}"));
+            let active = open.mask == Some(index);
+            if ui.selectable_label(active, name).clicked() {
+                // 고쳐 쓰는 마스크를 다시 누르면 고쳐 쓰기를 마친다.
+                actions.push(Action::SelectMask((!active).then_some(index)));
+            }
+        }
+        if ui.button(t("새 마스크", "New mask")).clicked() {
+            actions.push(Action::AddMask);
+        }
+    });
+    let Some(mask) = open.mask.and_then(|index| masks.get(index)) else {
+        return;
+    };
+    ui.weak(t(
+        "사진에서 고를 곳을 누르세요. 빼려면 오른쪽 단추로 누릅니다.",
+        "Click the part of the photo to select. Right-click a part to leave it out.",
+    ));
+    ui.horizontal_wrapped(|ui| {
+        let count = mask.points.len();
+        ui.label(t(format!("점 {count}개"), format!("Points: {count}")));
+        if ui
+            .add_enabled(count > 0, egui::Button::new(t("점 되돌리기", "Undo point")))
+            .clicked()
+        {
+            actions.push(Action::UndoMaskPoint);
+        }
+        if ui.button(t("마스크 지우기", "Delete mask")).clicked() {
+            actions.push(Action::RemoveMask);
+        }
+    });
+    ui.horizontal_wrapped(|ui| {
+        let mut show = open.show_mask;
+        if ui
+            .checkbox(&mut show, t("영역 보기", "Show area"))
+            .on_hover_text(t(
+                "고른 곳을 붉게 표시합니다",
+                "Marks the selected part in red",
+            ))
+            .changed()
+        {
+            actions.push(Action::ShowMask(show));
+        }
+        let mut invert = mask.invert;
+        if ui
+            .checkbox(&mut invert, t("반전", "Invert"))
+            .on_hover_text(t(
+                "고른 곳의 바깥을 보정합니다",
+                "Adjusts everything outside the selected part",
+            ))
+            .changed()
+        {
+            actions.push(Action::SetMaskInvert(invert));
+        }
+    });
+    // 고른 곳에만 더할 보정
+    let mut adjust = mask.adjust;
+    let mut changed = None;
+    let rows = [
+        (t("노출", "Exposure"), &mut adjust.exposure, -3.0..=3.0),
+        (t("대비", "Contrast"), &mut adjust.contrast, -1.0..=1.0),
+        (t("색온도", "Temperature"), &mut adjust.temp, -1.0..=1.0),
+        (t("틴트", "Tint"), &mut adjust.tint, -1.0..=1.0),
+        (t("채도", "Saturation"), &mut adjust.saturation, -1.0..=1.0),
+    ];
+    for (label, value, range) in rows {
+        if let Some(commit) = slider(ui, label, value, range) {
+            changed = Some(commit);
+        }
+    }
+    if let Some(commit) = changed {
+        actions.push(Action::SetMaskAdjust {
+            params: adjust,
+            commit,
+        });
+    }
+}
+
+/// 미리보기에서 누른 곳이 사진의 어디인지. 사진의 왼쪽 위가 (0, 0), 오른쪽 아래가 (1, 1)이다.
+/// `rect`는 화면에서 사진이 그려진 자리다. 사진 밖을 눌렀으면 None.
+fn photo_point(rect: egui::Rect, pos: egui::Pos2) -> Option<(f32, f32)> {
+    rect.contains(pos).then(|| {
+        (
+            (pos.x - rect.min.x) / rect.width(),
+            (pos.y - rect.min.y) / rect.height(),
+        )
+    })
 }
 
 /// 프레임의 모양과 색.
@@ -696,6 +806,7 @@ fn denoise_panel(ui: &mut egui::Ui, app: &App, open: &Open, actions: &mut Vec<Ac
         if ui
             .add(
                 egui::Slider::new(&mut percent, 0.0..=100.0)
+                    .fixed_decimals(0)
                     .suffix("%")
                     .text(t("레벨", "Level")),
             )
@@ -848,7 +959,7 @@ impl Zoom {
     }
 }
 
-fn preview(ui: &mut egui::Ui, open: &Open, view: &mut View) {
+fn preview(ui: &mut egui::Ui, open: &Open, view: &mut View, actions: &mut Vec<Action>) {
     let Some(current) = open.current else {
         ui.centered_and_justified(|ui| {
             ui.weak(t("왼쪽에서 사진을 고르세요", "Pick a photo on the left"))
@@ -908,7 +1019,8 @@ fn preview(ui: &mut egui::Ui, open: &Open, view: &mut View) {
             if response.dragged() {
                 view.zoom.offset += response.drag_delta();
             }
-            if response.double_clicked() {
+            // 마스크를 고쳐 쓰는 동안에는 누르는 것이 자리를 찍는 일이라, 두 번 눌러 확대하는 것은 쉰다.
+            if response.double_clicked() && open.mask.is_none() {
                 // 창에 맞춤 ↔ 100%
                 if view.zoom.scale == 1.0 {
                     view.zoom.zoom_at(actual, pointer.unwrap_or_default(), max);
@@ -924,6 +1036,38 @@ fn preview(ui: &mut egui::Ui, open: &Open, view: &mut View) {
             let mut canvas = ui.new_child(egui::UiBuilder::new().max_rect(area));
             canvas.set_clip_rect(area);
             egui::Image::new(texture).paint_at(&canvas, rect);
+            if let Some(active) = open.mask {
+                // 사진을 누른 자리가 마스크에 더해진다. 오른쪽 단추로 누르면 빼는 자리다.
+                let presses = [
+                    (response.clicked(), true),
+                    (response.secondary_clicked(), false),
+                ];
+                for (pressed, include) in presses {
+                    if pressed
+                        && let Some((x, y)) = response
+                            .interact_pointer_pos()
+                            .and_then(|pos| photo_point(rect, pos))
+                    {
+                        actions.push(Action::AddMaskPoint { x, y, include });
+                    }
+                }
+                // 지금까지 누른 자리를 사진 위에 점으로 보여 준다 (고르는 자리는 초록, 빼는 자리는 빨강).
+                if let Some(mask) = open.edit(current).masks.get(active) {
+                    for point in &mask.points {
+                        let colour = if point.include {
+                            egui::Color32::from_rgb(60, 220, 90)
+                        } else {
+                            egui::Color32::from_rgb(235, 70, 60)
+                        };
+                        canvas.painter().circle(
+                            rect.min + egui::vec2(point.x, point.y) * rect.size(),
+                            5.0,
+                            colour,
+                            egui::Stroke::new(1.5, egui::Color32::WHITE),
+                        );
+                    }
+                }
+            }
             // 지금 배율 (원본 화소 대비)
             let percent = view.zoom.scale / actual * 100.0;
             let corner = egui::Rect::from_min_max(
@@ -1694,6 +1838,9 @@ mod tests {
                 params: &crate::edit::Params::default(),
                 lut: None,
                 frame: None,
+                masks: &[],
+                segmenter: None,
+                overlay: None,
             },
             &|_| {},
         )
@@ -1748,6 +1895,9 @@ mod tests {
                 params: &params,
                 lut: None,
                 frame: None,
+                masks: &[],
+                segmenter: None,
+                overlay: None,
             },
             &|_| {},
         )
@@ -1796,6 +1946,9 @@ mod tests {
                 params: &params,
                 lut: Some((&lut, 0.8)),
                 frame: None,
+                masks: &[],
+                segmenter: None,
+                overlay: None,
             },
             &|_| {},
         )
@@ -1814,6 +1967,42 @@ mod tests {
         });
         shot(&mut harness, "2d-lut.png");
         handle(Action::ResetLook);
+
+        // 마스크: 가운데 건물을 눌러 고른 모습 (모델이 있을 때)
+        if let Ok(segmenter) = crate::mask::load_segmenter() {
+            let segmenter = std::sync::Mutex::new(segmenter);
+            handle(Action::AddMask);
+            handle(Action::AddMaskPoint {
+                x: 0.48,
+                y: 0.35,
+                include: true,
+            });
+            let masks = screen.app.borrow().open.as_ref().unwrap().edit(7).masks;
+            let loaded = crate::export::load(&path, None, &|_| {}).unwrap();
+            let params = crate::edit::Params::default();
+            let look = crate::export::Look {
+                masks: &masks,
+                segmenter: Some(&segmenter),
+                overlay: Some(0),
+                ..crate::export::Look::new(&params)
+            };
+            let areas = loaded.areas(look).unwrap();
+            let shown = loaded.develop(&loaded.cam, look, &areas);
+            let generation = screen
+                .app
+                .borrow()
+                .open
+                .as_ref()
+                .unwrap()
+                .preview_generation();
+            handle(Action::PreviewReady {
+                generation,
+                index: 7,
+                result: Ok(crate::preview::shrink(&shown, 8192)),
+            });
+            shot(&mut harness, "2e-mask.png");
+            handle(Action::RemoveMask);
+        }
 
         // 내보내는 중
         handle(Action::Export {
@@ -1979,6 +2168,17 @@ mod tests {
         harness.run_steps(3);
         harness.get_by_label("By colour").click();
         check(&mut harness, "편집 패널을 다 펼친 모습");
+        handle(Action::AddMask);
+        handle(Action::AddMaskPoint {
+            x: 0.5,
+            y: 0.5,
+            include: true,
+        });
+        check(&mut harness, "마스크를 고치는 중");
+        handle(Action::SelectMask(None));
+        handle(Action::Segmenter(Some("no model".into())));
+        check(&mut harness, "마스크 모델이 없을 때");
+        handle(Action::Segmenter(None));
         harness.get_by_label("CPU (slow)").click();
         check(&mut harness, "CPU 안내");
         handle(Action::Backend(Backend::Unavailable("no model".into())));
@@ -2130,5 +2330,137 @@ mod tests {
         for symbol in ['★', '·', '…', '×', '%'] {
             assert_ne!(font.glyph_id(symbol).0, 0, "{symbol}");
         }
+    }
+
+    #[test]
+    fn a_click_on_the_preview_becomes_a_place_in_the_photo() {
+        let rect = egui::Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(400.0, 200.0));
+        assert_eq!(photo_point(rect, egui::pos2(100.0, 50.0)), Some((0.0, 0.0)));
+        assert_eq!(
+            photo_point(rect, egui::pos2(300.0, 100.0)),
+            Some((0.5, 0.25))
+        );
+        assert_eq!(
+            photo_point(rect, egui::pos2(500.0, 250.0)),
+            Some((1.0, 1.0))
+        );
+        assert_eq!(photo_point(rect, egui::pos2(99.0, 100.0)), None, "사진 밖");
+        assert_eq!(photo_point(rect, egui::pos2(300.0, 251.0)), None);
+    }
+
+    /// 화면의 한 곳을 마우스 단추로 누른다.
+    fn press(harness: &mut Harness<'_>, pos: egui::Pos2, button: egui::PointerButton) {
+        harness.hover_at(pos);
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        harness.run_steps(3);
+    }
+
+    #[test]
+    fn a_mask_is_made_by_clicking_on_the_preview() {
+        let screen = Screen::with_photos("mask");
+        let handle = |action| {
+            screen.app.borrow_mut().handle(action);
+        };
+        handle(Action::Select {
+            index: 0,
+            extend: false,
+        });
+        let masks = || screen.app.borrow().open.as_ref().unwrap().edit(0).masks;
+        let show = |screen: &Screen| {
+            let generation = screen
+                .app
+                .borrow()
+                .open
+                .as_ref()
+                .unwrap()
+                .preview_generation();
+            screen.app.borrow_mut().handle(Action::PreviewReady {
+                generation,
+                index: 0,
+                result: Ok(Pixels {
+                    width: 1500,
+                    height: 1000,
+                    rgba: vec![128; 1500 * 1000 * 4],
+                }),
+            });
+        };
+        show(&screen);
+        let mut harness = screen.harness();
+        harness.run_steps(3);
+        // 마스크를 고쳐 쓰는 중이 아니면 눌러도 점이 생기지 않는다.
+        press(
+            &mut harness,
+            egui::pos2(560.0, 300.0),
+            egui::PointerButton::Primary,
+        );
+        assert!(masks().is_empty());
+
+        harness.get_by_label("새 마스크").click();
+        harness.run_steps(3);
+        show(&screen);
+        harness.run_steps(3);
+        assert_eq!(masks().len(), 1);
+        harness.get_by_label("마스크 1");
+
+        press(
+            &mut harness,
+            egui::pos2(560.0, 300.0),
+            egui::PointerButton::Primary,
+        );
+        show(&screen);
+        press(
+            &mut harness,
+            egui::pos2(600.0, 320.0),
+            egui::PointerButton::Secondary,
+        );
+        show(&screen);
+        let points = masks()[0].points.clone();
+        assert_eq!(points.len(), 2, "{points:?}");
+        assert!(points[0].include && !points[1].include);
+        assert!(
+            points
+                .iter()
+                .all(|p| (0.0..=1.0).contains(&p.x) && (0.0..=1.0).contains(&p.y))
+        );
+        assert!(
+            points[1].x > points[0].x && points[1].y > points[0].y,
+            "{points:?}"
+        );
+        harness.run_steps(3);
+        harness.get_by_label("점 2개");
+
+        harness.get_by_label("점 되돌리기").click();
+        harness.run_steps(3);
+        assert_eq!(masks()[0].points.len(), 1);
+        harness.get_by_label("반전").click();
+        harness.run_steps(3);
+        assert!(masks()[0].invert);
+        harness.get_by_label("마스크 지우기").click();
+        harness.run_steps(3);
+        assert!(masks().is_empty());
+    }
+
+    #[test]
+    fn a_missing_mask_model_is_explained_instead_of_offering_masks() {
+        let screen = Screen::with_photos("no-sam");
+        let handle = |action| {
+            screen.app.borrow_mut().handle(action);
+        };
+        handle(Action::Select {
+            index: 0,
+            extend: false,
+        });
+        handle(Action::Segmenter(Some("마스크 모델이 없습니다".into())));
+        let mut harness = screen.harness();
+        harness.run_steps(3);
+        harness.get_by_label("마스크: 모델 없음");
+        assert!(harness.query_by_label("새 마스크").is_none());
     }
 }
