@@ -1,0 +1,20 @@
+[package]
+name = "amsil"
+version = "0.1.0"
+edition = "2024"
+description = "RAW 사진을 HEIF로 변환하는 도구"
+license = "GPL-3.0-or-later"
+rust-version = "1.95"
+publish = false
+
+[dependencies]
+libheif-rs = { version = "3.0.0", features = ["embedded-libheif"] }
+rawler = "0.8.0"
+rayon = "1.12"
+
+# 이미지 처리 코드는 최적화 없이는 테스트조차 너무 느리다.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
