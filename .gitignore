@@ -3,3 +3,4 @@ target/
 models/
 # 설계 문서와 작업 메모는 공개 저장소에 올리지 않는다
 docs/
+dist/

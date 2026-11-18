@@ -1,0 +1,36 @@
+name: Release
+
+# v0.1.0처럼 v로 시작하는 태그를 올리면, 받아서 바로 쓸 수 있는 묶음을 만들어 릴리스에 올린다.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: 태그와 Cargo.toml의 버전이 같은지 확인
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "태그($GITHUB_REF_NAME)와 Cargo.toml의 버전(v$version)이 다릅니다" >&2
+            exit 1
+          fi
+      - name: 시스템 패키지
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake pkg-config libx265-dev libde265-dev libnuma-dev
+      # Rust 버전은 rust-toolchain.toml이 정한다.
+      - run: cargo build --release --locked
+      - run: cargo test --release --locked
+      - run: scripts/package.sh target/release dist
+      - name: 릴리스에 올리기
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.tar.gz.sha256 \
+            --title "암실 $GITHUB_REF_NAME" --generate-notes

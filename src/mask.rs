@@ -204,8 +204,12 @@ pub fn missing() -> Option<String> {
     }
     let dir = dir.display();
     Some(t(
-        format!("마스크 모델이 없습니다: {dir}\nscripts/fetch-models.sh 를 실행해 받으세요."),
-        format!("The mask model is missing: {dir}\nRun scripts/fetch-models.sh to download it."),
+        format!(
+            "마스크 모델이 없습니다: {dir}\nfetch-models.sh를 실행해 받으세요 (실행 파일 옆이나 저장소의 scripts 폴더에 있습니다)."
+        ),
+        format!(
+            "The mask model is missing: {dir}\nRun fetch-models.sh to download it (next to the program, or in the scripts folder of the repository)."
+        ),
     ))
 }
 

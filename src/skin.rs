@@ -104,8 +104,12 @@ pub fn missing() -> Option<String> {
     }
     let path = path.display();
     Some(t(
-        format!("피부 보정 모델이 없습니다: {path}\nscripts/fetch-models.sh 를 실행해 받으세요."),
-        format!("The skin model is missing: {path}\nRun scripts/fetch-models.sh to download it."),
+        format!(
+            "피부 보정 모델이 없습니다: {path}\nfetch-models.sh를 실행해 받으세요 (실행 파일 옆이나 저장소의 scripts 폴더에 있습니다)."
+        ),
+        format!(
+            "The skin model is missing: {path}\nRun fetch-models.sh to download it (next to the program, or in the scripts folder of the repository)."
+        ),
     ))
 }
 
