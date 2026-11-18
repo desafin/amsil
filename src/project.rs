@@ -4,6 +4,7 @@
 
 use crate::Result;
 use crate::edit::Params;
+use crate::frame::Frame;
 use crate::lang::t;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -57,6 +58,9 @@ pub struct Edit {
     /// 마지막에 입히는 LUT.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lut: Option<LutRef>,
+    /// 사진에 두르는 프레임.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame: Option<Frame>,
 }
 
 /// 사진에 입힐 LUT 파일과 강도.
@@ -80,6 +84,7 @@ impl Default for Edit {
             strength: 1.0,
             adjust: Params::default(),
             lut: None,
+            frame: None,
         }
     }
 }
@@ -500,5 +505,40 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(text.contains("lang = \"en\""), "{text}");
         assert_eq!(loaded.lang, Some(crate::lang::Lang::En));
+    }
+
+    #[test]
+    fn a_frame_is_saved_per_photo() {
+        use crate::frame::{Frame, Layout};
+        let dir = temp("frame");
+        let path = dir.join("p.amsil");
+        let mut project = sample();
+        let frame = Frame {
+            layout: Layout::Ratio(4, 5),
+            dark: true,
+        };
+        project.set_edit(
+            0,
+            "a.ARW",
+            Edit {
+                frame: Some(frame),
+                ..Edit::default()
+            },
+        );
+        project.save(&path).unwrap();
+        assert_eq!(
+            Project::load(&path).unwrap().edit(0, "a.ARW").frame,
+            Some(frame)
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("layout = \"4:5\"") && text.contains("dark = true"),
+            "{text}"
+        );
+        // 손으로 고친 파일에 터무니없는 비율이 있으면 열 때 알린다.
+        std::fs::write(&path, text.replace("4:5", "1:100")).unwrap();
+        let error = Project::load(&path).unwrap_err().to_string();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(error.contains("1:100"), "{error}");
     }
 }

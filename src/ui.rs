@@ -1,6 +1,7 @@
 //! 화면 그리기. 상태(`App`)를 읽어 그리고, 사용자가 한 일을 `Action`으로 돌려준다. 로직은 여기에 두지 않는다.
 
 use crate::app::{Action, App, Backend, ExportState, Open, ReportView};
+use crate::frame::{Frame, Layout as Shape};
 use crate::job::{describe_remaining, describe_resources};
 use crate::lang::{self, Lang, t};
 use crate::preview::Pixels;
@@ -48,11 +49,10 @@ const WHEEL_ZOOM: f32 = 0.005;
 /// 한글 글꼴(나눔고딕)을 등록한다. egui 내장 글꼴에는 한글이 없어서, 시스템에 한글 글꼴이 없는
 /// 컴퓨터에서는 글자가 네모로 나온다. 글꼴을 프로그램에 넣어 어디서나 같은 화면이 나오게 한다.
 pub fn install_fonts(ctx: &egui::Context) {
-    const NANUM_GOTHIC: &[u8] = include_bytes!("../assets/fonts/NanumGothic-Regular.ttf");
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
         "NanumGothic".into(),
-        egui::FontData::from_static(NANUM_GOTHIC).into(),
+        egui::FontData::from_static(crate::frame::FONT).into(),
     );
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
         fonts
@@ -423,6 +423,8 @@ fn edit_panel(
         .show(ui, |ui| {
             look_panel(ui, app, open, env, actions);
             ui.separator();
+            frame_panel(ui, open, actions);
+            ui.separator();
             denoise_panel(ui, app, open, actions);
         });
 }
@@ -589,8 +591,8 @@ fn look_panel(
     if ui
         .button(t("보정 초기화", "Reset adjustments"))
         .on_hover_text(t(
-            "프리셋, 세부 조정, LUT을 지웁니다 (노이즈 제거는 그대로)",
-            "Clears the preset, detail adjustments and LUT (noise reduction stays)",
+            "프리셋, 세부 조정, LUT을 지웁니다 (노이즈 제거와 프레임은 그대로)",
+            "Clears the preset, detail adjustments and LUT (noise reduction and frame stay)",
         ))
         .clicked()
     {
@@ -608,6 +610,53 @@ fn hue_names() -> [&'static str; 8] {
             "Red", "Orange", "Yellow", "Green", "Aqua", "Blue", "Purple", "Magenta",
         ],
     )
+}
+
+/// 프레임의 모양과 색.
+fn frame_panel(ui: &mut egui::Ui, open: &Open, actions: &mut Vec<Action>) {
+    ui.heading(t("프레임", "Frame"));
+    let Some(current) = open.current else {
+        ui.weak(t(
+            "사진을 고르면 촬영 정보를 적은 프레임을 두를 수 있습니다",
+            "Pick a photo to add a frame with its shooting info",
+        ));
+        return;
+    };
+    let frame = open.edit(current).frame;
+    let dark = frame.is_some_and(|frame| frame.dark);
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .selectable_label(frame.is_none(), t("프레임 없음", "No frame"))
+            .clicked()
+        {
+            actions.push(Action::SetFrame(None));
+        }
+        let layouts = [
+            (Shape::Band, t("하단 띠", "Bottom band").to_owned()),
+            (Shape::Border, t("테두리", "Border").to_owned()),
+            (Shape::Ratio(1, 1), "1:1".to_owned()),
+            (Shape::Ratio(4, 5), "4:5".to_owned()),
+            (Shape::Ratio(9, 16), "9:16".to_owned()),
+        ];
+        for (layout, name) in layouts {
+            let chosen = frame.is_some_and(|frame| frame.layout == layout);
+            if ui.selectable_label(chosen, name).clicked() {
+                actions.push(Action::SetFrame(Some(Frame { layout, dark })));
+            }
+        }
+    });
+    if let Some(frame) = frame {
+        ui.horizontal(|ui| {
+            for (choice, name) in [(false, t("흰색", "White")), (true, t("검정", "Black"))] {
+                if ui.selectable_label(frame.dark == choice, name).clicked() {
+                    actions.push(Action::SetFrame(Some(Frame {
+                        dark: choice,
+                        ..frame
+                    })));
+                }
+            }
+        });
+    }
 }
 
 fn denoise_panel(ui: &mut egui::Ui, app: &App, open: &Open, actions: &mut Vec<Action>) {
@@ -1597,9 +1646,17 @@ mod tests {
             extend: true,
         });
         let path = screen.app.borrow().open.as_ref().unwrap().photo_path(7);
-        let rendered =
-            crate::export::render(&path, None, &crate::edit::Params::default(), None, &|_| {})
-                .unwrap();
+        let rendered = crate::export::render(
+            &path,
+            None,
+            crate::export::Look {
+                params: &crate::edit::Params::default(),
+                lut: None,
+                frame: None,
+            },
+            &|_| {},
+        )
+        .unwrap();
         let generation = screen
             .app
             .borrow()
@@ -1643,7 +1700,17 @@ mod tests {
             let app = screen.app.borrow();
             app.open.as_ref().unwrap().params(7, &app.presets)
         };
-        let looked = crate::export::render(&path, None, &params, None, &|_| {}).unwrap();
+        let looked = crate::export::render(
+            &path,
+            None,
+            crate::export::Look {
+                params: &params,
+                lut: None,
+                frame: None,
+            },
+            &|_| {},
+        )
+        .unwrap();
         let generation = screen
             .app
             .borrow()
@@ -1681,8 +1748,17 @@ mod tests {
         });
         let lut = crate::lut::Lut::load(&cube).unwrap();
         let params = crate::edit::Params::default();
-        let toned =
-            crate::export::render(&path, None, &params, Some((&lut, 0.8)), &|_| {}).unwrap();
+        let toned = crate::export::render(
+            &path,
+            None,
+            crate::export::Look {
+                params: &params,
+                lut: Some((&lut, 0.8)),
+                frame: None,
+            },
+            &|_| {},
+        )
+        .unwrap();
         let generation = screen
             .app
             .borrow()
@@ -1829,6 +1905,10 @@ mod tests {
         });
         handle(Action::SetPreset(Some("food".into())));
         handle(Action::SetLut(Some("/luts/film.cube".into())));
+        handle(Action::SetFrame(Some(crate::frame::Frame {
+            layout: crate::frame::Layout::Band,
+            dark: false,
+        })));
         let generation = screen
             .app
             .borrow()
@@ -1898,5 +1978,42 @@ mod tests {
         check(&mut harness, "내보내기 결과");
         handle(Action::ExportFinished(Err("boom".into())));
         check(&mut harness, "내보내기 실패");
+    }
+
+    #[test]
+    fn a_frame_is_chosen_recoloured_and_removed() {
+        use crate::frame::{Frame, Layout};
+        let screen = Screen::with_photos("frame");
+        screen.app.borrow_mut().handle(Action::Select {
+            index: 0,
+            extend: false,
+        });
+        let frame = || screen.app.borrow().open.as_ref().unwrap().edit(0).frame;
+        let mut harness = screen.harness();
+        harness.run_steps(3);
+        harness.get_by_label("하단 띠").click();
+        harness.run_steps(3);
+        assert_eq!(
+            frame(),
+            Some(Frame {
+                layout: Layout::Band,
+                dark: false
+            })
+        );
+        harness.get_by_label("검정").click();
+        harness.run_steps(3);
+        harness.get_by_label("4:5").click();
+        harness.run_steps(3);
+        assert_eq!(
+            frame(),
+            Some(Frame {
+                layout: Layout::Ratio(4, 5),
+                dark: true
+            }),
+            "모양을 바꿔도 색은 그대로"
+        );
+        harness.get_by_label("프레임 없음").click();
+        harness.run_steps(3);
+        assert_eq!(frame(), None);
     }
 }

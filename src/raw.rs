@@ -1,6 +1,7 @@
 //! RAW 파일을 읽어 카메라 RGB와 현상에 필요한 값들을 꺼낸다.
 
 use crate::denoise::{Packed, pack_rggb};
+use crate::frame::Shot;
 use crate::lang::t;
 use crate::{Image, Result};
 use rawler::RawImage;
@@ -28,6 +29,8 @@ pub struct Raw {
     pub flips: (bool, bool, bool),
     /// 출력 파일에 넣을 EXIF (TIFF 형식). 픽셀을 돌려서 내보내므로 방향은 1로 고쳐 둔다.
     pub exif: Vec<u8>,
+    /// 프레임에 적을 촬영 정보.
+    pub shot: Shot,
 }
 
 impl Raw {
@@ -145,11 +148,11 @@ pub fn embedded_preview(path: &Path) -> Result<Option<image::DynamicImage>> {
     }))
 }
 
-/// 센서의 화소 수. 화소 데이터를 풀지 않고 헤더만 읽는다 (메모리 사용량을 미리 가늠하는 데 쓴다).
-pub fn pixel_count(path: &Path) -> Result<u64> {
+/// 센서의 가로·세로 화소 수. 화소 데이터를 풀지 않고 헤더만 읽는다 (메모리 사용량을 미리 가늠하는 데 쓴다).
+pub fn sensor_size(path: &Path) -> Result<(usize, usize)> {
     let source = RawSource::new(path)?;
     let image = decoder(&source)?.raw_image(&source, &RawDecodeParams::default(), true)?;
-    Ok((image.width * image.height) as u64)
+    Ok((image.width, image.height))
 }
 
 /// 파일 형식에 맞는 디코더를 찾는다.
@@ -161,6 +164,41 @@ fn decoder(source: &RawSource) -> Result<Box<dyn rawler::decoders::Decoder>> {
         )
         .into()
     })
+}
+
+/// 프레임에 적을 촬영 정보를 꺼낸다.
+fn shot(metadata: &rawler::decoders::RawMetadata) -> Shot {
+    let exif = &metadata.exif;
+    let ratio = |r: &rawler::formats::tiff::Rational| (r.d != 0).then(|| r.n as f32 / r.d as f32);
+    let (make, model) = (metadata.make.trim(), metadata.model.trim());
+    // 기종 이름에 제조사가 이미 들어 있으면(예: "Canon EOS R5") 되풀이하지 않는다.
+    let camera = if model.to_lowercase().starts_with(&make.to_lowercase()) {
+        model.to_owned()
+    } else {
+        format!("{make} {model}")
+    };
+    let lens = exif
+        .lens_model
+        .clone()
+        .or_else(|| metadata.lens.as_ref().map(|lens| lens.lens_name.clone()))
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty());
+    Shot {
+        camera,
+        lens,
+        focal_mm: exif.focal_length.as_ref().and_then(ratio),
+        f_number: exif.fnumber.as_ref().and_then(ratio),
+        exposure: exif.exposure_time.as_ref().map(|r| (r.n, r.d)),
+        iso: exif
+            .iso_speed_ratings
+            .map(u32::from)
+            .or(exif.iso_speed)
+            .filter(|&iso| iso > 0),
+        date: exif
+            .date_time_original
+            .clone()
+            .or_else(|| exif.create_date.clone()),
+    }
 }
 
 pub fn decode(path: &Path) -> Result<Raw> {
@@ -218,6 +256,7 @@ pub fn decode(path: &Path) -> Result<Raw> {
         xyz_to_cam,
         flips,
         exif: exif.into_inner(),
+        shot: shot(&metadata),
     })
 }
 
@@ -239,7 +278,7 @@ mod tests {
         std::fs::write(&path, [0x5a; 4096]).unwrap();
         let (decoded, counted) = (
             decode(&path).err().unwrap(),
-            pixel_count(&path).err().unwrap(),
+            sensor_size(&path).err().unwrap(),
         );
         std::fs::remove_file(&path).unwrap();
         for error in [decoded.to_string(), counted.to_string()] {
@@ -248,11 +287,11 @@ mod tests {
     }
 
     #[test]
-    fn pixel_count_is_the_sensor_size() {
+    fn the_sensor_size_is_read_from_the_header() {
         let Some(path) = crate::sample_arw() else {
             return;
         };
-        assert_eq!(pixel_count(&path).unwrap(), 6080 * 4048);
+        assert_eq!(sensor_size(&path).unwrap(), (6080, 4048));
     }
 
     #[test]
@@ -321,5 +360,20 @@ mod tests {
             );
             assert!(cropped.planes[0][i] > 0.0);
         }
+    }
+
+    #[test]
+    fn reads_the_shot_info_for_the_frame() {
+        let Some(path) = crate::sample_arw() else {
+            return;
+        };
+        let shot = decode(&path).unwrap().shot;
+        assert_eq!(shot.camera, "Sony DSLR-A900");
+        assert_eq!(
+            (shot.focal_mm, shot.f_number, shot.exposure, shot.iso),
+            (Some(55.0), Some(2.8), Some((1, 60)), Some(200))
+        );
+        assert_eq!(shot.date.as_deref(), Some("2026:11:07 13:27:19"));
+        eprintln!("렌즈: {:?}", shot.lens);
     }
 }

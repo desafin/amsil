@@ -6,6 +6,7 @@
 
 use crate::edit::Params;
 use crate::export::{self, Report};
+use crate::frame::Frame;
 use crate::job::Outcome;
 use crate::lang::{self, Lang, t};
 use crate::preset::{self, Preset};
@@ -141,7 +142,9 @@ pub enum Action {
         value: f32,
         commit: bool,
     },
-    /// 프리셋, 수동 조정, LUT을 지운다 (노이즈 제거는 그대로).
+    /// 선택한 사진들에 두를 프레임을 정한다 (None이면 없앤다).
+    SetFrame(Option<Frame>),
+    /// 프리셋, 수동 조정, LUT을 지운다 (노이즈 제거와 프레임은 그대로).
     ResetLook,
     SetExportFolder(PathBuf),
     SetQuality(u8),
@@ -188,6 +191,8 @@ pub enum Effect {
         params: Params,
         /// 마지막에 입힐 LUT 파일과 강도.
         lut: Option<(PathBuf, f32)>,
+        /// 사진에 두를 프레임.
+        frame: Option<Frame>,
     },
     Export {
         photos: Vec<export::Photo>,
@@ -379,10 +384,14 @@ impl App {
                     }
                 })?;
             }
+            Action::SetFrame(frame) => {
+                open.change_look(true, &self.presets, &mut effects, |edit| edit.frame = frame)?;
+            }
             Action::ResetLook => {
                 open.change_look(true, &self.presets, &mut effects, |edit| {
                     *edit = Edit {
                         denoise: edit.denoise,
+                        frame: edit.frame,
                         ..Edit::default()
                     };
                 })?;
@@ -421,6 +430,7 @@ impl App {
                             denoise: open.edit(index).denoise,
                             params: open.params(index, &self.presets),
                             lut: open.lut(index),
+                            frame: open.edit(index).frame,
                         }
                     })
                     .collect();
@@ -629,6 +639,7 @@ impl Open {
             denoise: self.edit(index).denoise,
             params: self.params(index, presets),
             lut: self.lut(index),
+            frame: self.edit(index).frame,
         }
     }
 
@@ -1265,6 +1276,7 @@ mod tests {
                     denoise: 0.0,
                     params: Params::default(),
                     lut: None,
+                    frame: None,
                 },
                 export::Photo {
                     input: src.join("c.ARW"),
@@ -1272,6 +1284,7 @@ mod tests {
                     denoise: 0.0,
                     params: Params::default(),
                     lut: None,
+                    frame: None,
                 },
                 export::Photo {
                     input: src.join("sub/b.ARW"),
@@ -1279,6 +1292,7 @@ mod tests {
                     denoise: 0.5,
                     params: Params::default(),
                     lut: None,
+                    frame: None,
                 },
             ]
         );
@@ -1477,5 +1491,51 @@ mod tests {
             only_selected: false,
         });
         assert_eq!(fx.app.notice.as_deref(), Some("출력 폴더를 먼저 정하세요"));
+    }
+
+    #[test]
+    fn a_frame_is_applied_to_selected_photos_previewed_and_exported() {
+        use crate::frame::{Frame, Layout};
+        let mut fx = Fixture::with_photos("frame");
+        let frame = Frame {
+            layout: Layout::Band,
+            dark: false,
+        };
+        fx.app.handle(Action::Select {
+            index: 0,
+            extend: false,
+        });
+        let effects = fx.app.handle(Action::SetFrame(Some(frame)));
+        assert_eq!(fx.open().edit(0).frame, Some(frame));
+        assert_eq!(fx.open().edit(1).frame, None, "고르지 않은 사진은 그대로");
+        let [Effect::Preview { frame: shown, .. }] = &effects[..] else {
+            panic!("{effects:?}")
+        };
+        assert_eq!(*shown, Some(frame));
+        assert_eq!(
+            Project::load(&fx.open().path)
+                .unwrap()
+                .edit(0, "a.ARW")
+                .frame,
+            Some(frame)
+        );
+
+        // 보정 초기화는 색 보정만 지운다. 프레임은 남는다.
+        fx.app.handle(Action::ResetLook);
+        assert_eq!(fx.open().edit(0).frame, Some(frame));
+
+        fx.app.handle(Action::SetExportFolder(fx.dir.join("결과")));
+        let effects = fx.app.handle(Action::Export {
+            only_selected: false,
+        });
+        let [Effect::Export { photos, .. }] = &effects[..] else {
+            panic!("{effects:?}")
+        };
+        assert_eq!(photos[0].frame, Some(frame));
+        assert_eq!(photos[1].frame, None);
+        fx.app.handle(Action::CancelExport);
+
+        fx.app.handle(Action::SetFrame(None));
+        assert_eq!(fx.open().edit(0).frame, None);
     }
 }

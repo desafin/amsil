@@ -8,6 +8,7 @@ rust-version = "1.95"
 publish = false
 
 [dependencies]
+ab_glyph = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 eframe = "0.37"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }

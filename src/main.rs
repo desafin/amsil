@@ -4,6 +4,7 @@ mod denoise;
 mod develop;
 mod edit;
 mod export;
+mod frame;
 mod gpu;
 mod gui;
 mod heif;

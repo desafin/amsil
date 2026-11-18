@@ -167,6 +167,7 @@ impl Workers {
                 denoise,
                 params,
                 lut,
+                frame,
             } => {
                 self.latest_preview.store(generation, SeqCst);
                 std::thread::spawn(move || {
@@ -184,7 +185,11 @@ impl Workers {
                             Some((file, strength)) => Some((workers.lut(file)?, *strength)),
                             None => None,
                         };
-                        let lut = lut.as_ref().map(|(lut, strength)| (&**lut, *strength));
+                        let look = export::Look {
+                            params: &params,
+                            lut: lut.as_ref().map(|(lut, strength)| (&**lut, *strength)),
+                            frame: frame.as_ref(),
+                        };
                         let base = workers.base(&path, denoise)?;
                         if stale() {
                             return Ok(());
@@ -192,14 +197,14 @@ impl Workers {
                         // 먼저 줄인 사본으로 빨리 보여 주고, 이어서 원본 크기로 다시 만든다.
                         if let Some(small) = &base.small {
                             send(preview::shrink(
-                                &base.loaded.develop(small, &params, lut),
+                                &base.loaded.develop(small, look),
                                 usize::MAX,
                             ));
                             if stale() {
                                 return Ok(());
                             }
                         }
-                        let full = base.loaded.develop(&base.loaded.cam, &params, lut);
+                        let full = base.loaded.develop(&base.loaded.cam, look);
                         if !stale() {
                             send(preview::shrink(
                                 &full,
@@ -298,6 +303,7 @@ mod tests {
             denoise: 0.0,
             params: Default::default(),
             lut: None,
+            frame: None,
         });
         // 빠른 작은 미리보기가 먼저 오고, 원본 크기에 가까운 것이 뒤따른다.
         let seen = wait_for(
@@ -333,6 +339,7 @@ mod tests {
             denoise: 0.0,
             params: mono,
             lut: None,
+            frame: None,
         });
         let seen = wait_for(&rx, |action| {
             matches!(action, Action::PreviewReady { generation: 8, .. })
@@ -366,6 +373,7 @@ mod tests {
             denoise: 0.0,
             params: Default::default(),
             lut: None,
+            frame: None,
         }];
         workers.run(Effect::Export {
             photos,
@@ -399,6 +407,7 @@ mod tests {
             denoise: 0.0,
             params: Default::default(),
             lut: None,
+            frame: None,
         });
         workers.run(Effect::Preview {
             generation: 2,
@@ -407,6 +416,7 @@ mod tests {
             denoise: 0.0,
             params: Default::default(),
             lut: None,
+            frame: None,
         });
         let seen = wait_for(&rx, |action| {
             matches!(action, Action::PreviewReady { generation: 2, .. })

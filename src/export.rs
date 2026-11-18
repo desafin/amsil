@@ -2,6 +2,7 @@
 //! 명령행과 GUI가 함께 쓴다.
 
 use crate::edit::Params;
+use crate::frame::{Frame, Shot};
 use crate::gpu::{self, Denoiser};
 use crate::lang::t;
 use crate::lut::Lut;
@@ -32,6 +33,8 @@ pub struct Photo {
     pub params: Params,
     /// 마지막에 입힐 LUT 파일과 강도.
     pub lut: Option<(PathBuf, f32)>,
+    /// 사진에 두를 프레임.
+    pub frame: Option<Frame>,
 }
 
 /// 배치 전체에 적용되는 설정.
@@ -67,6 +70,17 @@ pub struct Rendered {
 }
 
 /// 읽어 들인 사진: 보정을 적용하기 전의 카메라 RGB와 현상에 필요한 값들.
+/// 사진 한 장에 입힐 것들: 보정 값, LUT, 프레임.
+#[derive(Clone, Copy)]
+pub struct Look<'a> {
+    /// 보정 값 (프리셋 × 강도 + 수동 조정).
+    pub params: &'a Params,
+    /// 보정 뒤에 입힐 LUT과 강도.
+    pub lut: Option<(&'a Lut, f32)>,
+    /// 맨 마지막에 두를 프레임.
+    pub frame: Option<&'a Frame>,
+}
+
 /// 읽기(디모자익, 노이즈 제거)는 오래 걸리고 보정을 바꿀 때마다 되풀이할 필요가 없어서 따로 둔다.
 pub struct Loaded {
     /// 카메라 RGB (선형, 출력 영역으로 잘린 것).
@@ -75,23 +89,24 @@ pub struct Loaded {
     xyz_to_cam: [[f32; 3]; 3],
     flips: (bool, bool, bool),
     pub exif: Vec<u8>,
+    /// 프레임에 적을 촬영 정보.
+    shot: Shot,
 }
 
 impl Loaded {
     /// 보정을 적용해 현상하고 바로 세운다. `cam`에는 `self.cam`이나 그것을 줄인 것을 준다.
-    /// `lut`이 있으면 마지막에 그 강도로 입힌다.
-    pub fn develop(
-        &self,
-        cam: &crate::Image,
-        params: &Params,
-        lut: Option<(&Lut, f32)>,
-    ) -> crate::Image {
-        let mut image = develop::develop(cam, self.wb, self.xyz_to_cam, params);
-        if let Some((lut, strength)) = lut {
+    /// LUT은 보정 뒤에 입히고, 프레임은 바로 세운 다음에 두른다.
+    pub fn develop(&self, cam: &crate::Image, look: Look) -> crate::Image {
+        let mut image = develop::develop(cam, self.wb, self.xyz_to_cam, look.params);
+        if let Some((lut, strength)) = look.lut {
             lut.apply(&mut image, strength);
         }
         let (transpose, flip_h, flip_v) = self.flips;
-        develop::orient(image, transpose, flip_h, flip_v)
+        let image = develop::orient(image, transpose, flip_h, flip_v);
+        match look.frame {
+            Some(frame) => crate::frame::apply(&image, frame, &self.shot),
+            None => image,
+        }
     }
 }
 
@@ -137,6 +152,7 @@ pub fn load(
         xyz_to_cam: raw.xyz_to_cam,
         flips: raw.flips,
         exif: raw.exif,
+        shot: raw.shot,
     })
 }
 
@@ -144,13 +160,12 @@ pub fn load(
 pub fn render(
     input: &Path,
     denoise: Option<(&Mutex<Denoiser>, f32)>,
-    params: &Params,
-    lut: Option<(&Lut, f32)>,
+    look: Look,
     progress: &dyn Fn(f32),
 ) -> Result<Rendered> {
     let timing = Timing::start();
     let loaded = load(input, denoise, progress)?;
-    let image = loaded.develop(&loaded.cam, params, lut);
+    let image = loaded.develop(&loaded.cam, look);
     timing.mark(t("현상", "develop"));
     progress(0.75);
     Ok(Rendered {
@@ -161,19 +176,17 @@ pub fn render(
 
 /// RAW 한 장을 HEIF로 바꾼다. `progress`에는 진행 정도(0~1)를 알린다.
 /// 알려야 할 일이 있으면(품질을 낮춘 경우) 그 문구를 돌려준다.
-#[allow(clippy::too_many_arguments)] // ponytail: 인자가 더 늘면 보정·LUT을 한 구조체로 묶는다
 pub fn convert(
     input: &Path,
     output: &Path,
     quality: u8,
     encoder_threads: usize,
     denoise: Option<(&Mutex<Denoiser>, f32)>,
-    params: &Params,
-    lut: Option<(&Lut, f32)>,
+    look: Look,
     progress: &dyn Fn(f32),
 ) -> Result<Option<String>> {
     let timing = Timing::start();
-    let Rendered { image, exif } = render(input, denoise, params, lut, progress)?;
+    let Rendered { image, exif } = render(input, denoise, look, progress)?;
     let encoded = heif::encode(&image, quality, Some(&exif), encoder_threads)?;
     timing.mark(t("인코딩", "encode"));
     progress(0.98);
@@ -190,6 +203,16 @@ pub fn convert(
             format!("The file got too large, so quality was lowered from {quality} to {lowered}"),
         )
     }))
+}
+
+/// 사진 한 장을 처리하는 데 잡아 둘 메모리(바이트). `size`는 센서의 가로·세로 화소 수.
+/// 프레임을 두르면 그림이 커지는 만큼 더 잡는다. 사진이 가로로 서 있는지 세로로 서 있는지는
+/// 헤더만으로 알 수 없으므로, 둘 중 더 커지는 쪽으로 잡는다.
+pub fn memory_needed((width, height): (usize, usize), frame: Option<&Frame>) -> u64 {
+    let growth = frame.map_or(1.0, |frame| {
+        frame.growth(width, height).max(frame.growth(height, width))
+    });
+    ((width * height) as f64 * BYTES_PER_PIXEL as f64 * growth) as u64
 }
 
 /// 논리 코어 수.
@@ -410,7 +433,10 @@ pub fn run(
     };
     // ponytail: 첫 사진의 크기로 전체를 가늠한다. 크기가 제각각인 폴더에서는 어긋날 수 있지만
     // 실제 입장 제한은 사진마다 따로 계산하므로 안전에는 영향이 없다.
-    let per_photo = raw::pixel_count(&tasks[0].input).unwrap_or(24_000_000) * BYTES_PER_PIXEL;
+    let per_photo = raw::sensor_size(&tasks[0].input)
+        .map_or(24_000_000 * BYTES_PER_PIXEL, |size| {
+            memory_needed(size, photos[0].frame.as_ref())
+        });
     let (workers, encoder_threads) = plan(cores(), settings.jobs, limit, per_photo, tasks.len());
     let budget = job::Budget::new(limit, workers);
     let warnings = Mutex::new(Vec::new());
@@ -420,7 +446,10 @@ pub fn run(
         budget: &budget,
         overwrite: settings.overwrite,
         cancel,
-        cost: &|task| Ok(raw::pixel_count(&task.input)? * BYTES_PER_PIXEL),
+        cost: &|task| {
+            let frame = looks[task.output.as_path()].frame.as_ref();
+            Ok(memory_needed(raw::sensor_size(&task.input)?, frame))
+        },
         available: &|| {
             let mut system = sysinfo::System::new().expect("시스템 정보를 읽을 수 없습니다");
             system.refresh_memory();
@@ -442,8 +471,11 @@ pub fn run(
                 settings.quality,
                 encoder_threads,
                 denoise,
-                &photo.params,
-                lut,
+                Look {
+                    params: &photo.params,
+                    lut,
+                    frame: photo.frame.as_ref(),
+                },
                 progress,
             )?;
             if let Some(warning) = warning {
@@ -463,6 +495,15 @@ mod tests {
     use crate::sample_arw;
     use libheif_rs::HeifContext;
 
+    /// LUT도 프레임도 없이 보정 값만.
+    fn bare(params: &Params) -> Look<'_> {
+        Look {
+            params,
+            lut: None,
+            frame: None,
+        }
+    }
+
     #[test]
     fn converts_portrait_arw_to_upright_10bit_heic() {
         let Some(input) = sample_arw() else { return };
@@ -476,8 +517,7 @@ mod tests {
             55,
             8,
             None,
-            &Params::default(),
-            None,
+            bare(&Params::default()),
             &|_| {},
         )
         .unwrap();
@@ -530,8 +570,7 @@ mod tests {
             55,
             8,
             None,
-            &Params::default(),
-            None,
+            bare(&Params::default()),
             &|_| {},
         )
         .unwrap();
@@ -541,8 +580,7 @@ mod tests {
             55,
             8,
             Some((&Mutex::new(model), 1.0)),
-            &Params::default(),
-            None,
+            bare(&Params::default()),
             &|_| {},
         )
         .unwrap();
@@ -613,20 +651,38 @@ mod tests {
         .unwrap();
         let loaded = load(&input, None, &|_| {}).unwrap();
         let small = crate::preview::downscale(&loaded.cam, 400).unwrap();
-        let plain = means(&loaded.develop(&small, &Params::default(), None));
+        let plain = means(&loaded.develop(&small, bare(&Params::default())));
 
-        let same = means(&loaded.develop(&small, &Params::default(), Some((&identity, 1.0))));
+        let same = means(&loaded.develop(
+            &small,
+            Look {
+                lut: Some((&identity, 1.0)),
+                ..bare(&Params::default())
+            },
+        ));
         assert!(
             (0..3).all(|c| (same[c] - plain[c]).abs() < 1e-3),
             "{same:?} 대 {plain:?}"
         );
 
-        let full = means(&loaded.develop(&small, &Params::default(), Some((&no_red, 1.0))));
+        let full = means(&loaded.develop(
+            &small,
+            Look {
+                lut: Some((&no_red, 1.0)),
+                ..bare(&Params::default())
+            },
+        ));
         assert!(
             full[0] < 1e-4 && (full[1] - plain[1]).abs() < 1e-3,
             "{full:?}"
         );
-        let half = means(&loaded.develop(&small, &Params::default(), Some((&no_red, 0.5))));
+        let half = means(&loaded.develop(
+            &small,
+            Look {
+                lut: Some((&no_red, 0.5)),
+                ..bare(&Params::default())
+            },
+        ));
         assert!((half[0] - plain[0] / 2.0).abs() < 1e-3, "{half:?}");
     }
 
@@ -643,6 +699,7 @@ mod tests {
                 denoise: 0.0,
                 params: Params::default(),
                 lut: Some((missing, 1.0)),
+                frame: None,
             },
             Photo {
                 input,
@@ -650,6 +707,7 @@ mod tests {
                 denoise: 0.0,
                 params: Params::default(),
                 lut: None,
+                frame: None,
             },
         ];
         let (outcome, _) = run(
@@ -668,5 +726,89 @@ mod tests {
         );
         assert!(dir.join("plain.heic").exists() && !dir.join("with-lut.heic").exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_frame_goes_round_the_upright_picture() {
+        use crate::frame::{Frame, Layout};
+        let Some(input) = sample_arw() else { return };
+        let loaded = load(&input, None, &|_| {}).unwrap();
+        let small = crate::preview::downscale(&loaded.cam, 400).unwrap();
+        let params = Params::default();
+        let plain = loaded.develop(&small, bare(&params));
+        let frame = Frame {
+            layout: Layout::Band,
+            dark: false,
+        };
+        let framed = loaded.develop(
+            &small,
+            Look {
+                frame: Some(&frame),
+                ..bare(&params)
+            },
+        );
+        // 세로로 찍은 사진이다. 바로 세운 다음 그 아래에 띠가 붙어야 한다.
+        assert!(plain.height > plain.width);
+        assert_eq!(
+            (framed.width, framed.height),
+            frame.size(plain.width, plain.height)
+        );
+        assert_eq!(framed.width, plain.width);
+        assert_eq!(
+            framed.planes[0][..plain.width],
+            plain.planes[0][..plain.width]
+        );
+        assert_eq!(framed.planes[0].last(), Some(&1.0), "맨 아래는 흰 띠");
+        let band = &framed.planes[0][plain.width * plain.height..];
+        assert!(
+            band.iter().any(|&v| v < 0.5),
+            "띠에 촬영 정보가 적혀 있어야 한다"
+        );
+    }
+
+    #[test]
+    fn a_framed_photo_is_exported_at_the_framed_size() {
+        use crate::frame::{Frame, Layout};
+        let Some(input) = sample_arw() else { return };
+        let dir = std::env::temp_dir().join(format!("amsil-test-frame-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let output = dir.join("framed.heic");
+        let (params, frame) = (
+            Params::default(),
+            Frame {
+                layout: Layout::Band,
+                dark: true,
+            },
+        );
+        let look = Look {
+            frame: Some(&frame),
+            ..bare(&params)
+        };
+        convert(&input, &output, 55, 8, None, look, &|_| {}).unwrap();
+        let ((width, height), _) = stats(&output);
+        std::fs::remove_dir_all(&dir).unwrap();
+        // 4032×6048 사진 아래에 짧은 변의 10%(404)짜리 띠
+        assert_eq!((width, height), (4032, 6048 + 404));
+    }
+
+    #[test]
+    fn a_frame_raises_the_memory_estimate_by_how_much_it_enlarges_the_picture() {
+        use crate::frame::{Frame, Layout};
+        let plain = memory_needed((6080, 4048), None);
+        assert_eq!(plain, 6080 * 4048 * BYTES_PER_PIXEL);
+        let frame = |layout| Frame {
+            layout,
+            dark: false,
+        };
+        let band = memory_needed((6080, 4048), Some(&frame(Layout::Band)));
+        assert!((band as f64 / plain as f64 - 1.1).abs() < 0.01, "{band}");
+        // 가로 사진을 세로 9:16에 넣으면 세 배 가까이 커진다. 사진이 어느 쪽으로 서 있는지는
+        // 헤더만으로 알 수 없으므로 더 커지는 쪽으로 잡는다.
+        let tall = memory_needed((6080, 4048), Some(&frame(Layout::Ratio(9, 16))));
+        assert!(tall as f64 / plain as f64 > 2.9, "{tall}");
+        assert_eq!(
+            tall,
+            memory_needed((4048, 6080), Some(&frame(Layout::Ratio(9, 16))))
+        );
     }
 }
