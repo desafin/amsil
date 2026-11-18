@@ -5,6 +5,7 @@ use crate::frame::{Frame, Layout as Shape};
 use crate::job::{describe_remaining, describe_resources};
 use crate::lang::{self, Lang, t};
 use crate::preview::Pixels;
+use crate::project::Theme;
 use crate::recommend;
 use eframe::egui::{self, Align, Key, Layout, Panel, RichText, TextureHandle, TextureOptions};
 use std::collections::HashMap;
@@ -69,6 +70,7 @@ pub fn install_fonts(ctx: &egui::Context) {
 
 /// 한 프레임을 그리고, 이번 프레임에 사용자가 한 일을 돌려준다.
 pub fn draw(ui: &mut egui::Ui, app: &App, view: &mut View, env: &mut dyn Env) -> Vec<Action> {
+    apply_theme(ui.ctx(), app.config.theme);
     let mut actions = Vec::new();
     if ui.input(|input| input.key_pressed(Key::F12)) {
         env.screenshot(ui.ctx());
@@ -96,13 +98,46 @@ fn app_name() -> &'static str {
     t("암실", "Amsil")
 }
 
+/// 놓는 차례를 화면에 보일 차례로 맞춘다. 오른쪽부터 채우는 자리에서는 뒤의 것이 왼쪽에 오므로 뒤집는다.
+fn in_reading_order<T, const N: usize>(ui: &egui::Ui, mut items: [T; N]) -> [T; N] {
+    if ui.layout().main_dir() == egui::Direction::RightToLeft {
+        items.reverse();
+    }
+    items
+}
+
 /// 언어를 고르는 단추. 지금 언어를 못 읽는 사람도 찾을 수 있게, 각 언어의 이름은 그 언어로 적는다.
-/// 오른쪽부터 채우는 자리에 놓으므로 뒤의 것이 왼쪽에 온다 (화면에는 "한국어 English" 순서).
 fn language_buttons(ui: &mut egui::Ui, actions: &mut Vec<Action>) {
-    for (choice, name) in [(Lang::En, "English"), (Lang::Ko, "한국어")] {
+    for (choice, name) in in_reading_order(ui, [(Lang::Ko, "한국어"), (Lang::En, "English")]) {
         let chosen = lang::current() == choice;
         if ui.selectable_label(chosen, name).clicked() && !chosen {
             actions.push(Action::SetLanguage(choice));
+        }
+    }
+}
+
+/// 고른 밝기 모드를 화면에 적용한다. 고른 적이 없으면 시스템의 설정을 따른다.
+fn apply_theme(ctx: &egui::Context, theme: Option<Theme>) {
+    let wanted = match theme {
+        Some(Theme::Light) => egui::ThemePreference::Light,
+        Some(Theme::Dark) => egui::ThemePreference::Dark,
+        None => egui::ThemePreference::System,
+    };
+    if ctx.options(|options| options.theme_preference) != wanted {
+        ctx.set_theme(wanted);
+    }
+}
+
+/// 라이트 모드와 다크 모드를 고르는 단추. 지금 화면에 적용된 쪽이 눌려 보인다.
+fn theme_buttons(ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+    let choices = [
+        (Theme::Light, egui::Theme::Light, t("라이트", "Light")),
+        (Theme::Dark, egui::Theme::Dark, t("다크", "Dark")),
+    ];
+    for (choice, shown, name) in in_reading_order(ui, choices) {
+        let chosen = ui.ctx().theme() == shown;
+        if ui.selectable_label(chosen, name).clicked() && !chosen {
+            actions.push(Action::SetTheme(choice));
         }
     }
 }
@@ -125,6 +160,8 @@ fn start_screen(ui: &mut egui::Ui, app: &App, env: &mut dyn Env, actions: &mut V
     Panel::top("language").show(ui, |ui| {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             language_buttons(ui, actions);
+            ui.separator();
+            theme_buttons(ui, actions);
             ui.separator();
             log_button(ui, env, actions);
         });
@@ -202,7 +239,8 @@ fn workspace(
     }
 
     Panel::top("top").show(ui, |ui| {
-        ui.horizontal(|ui| {
+        // 창이 좁으면 다음 줄로 넘어가게 한다 (한 줄에 억지로 넣으면 단추가 서로 겹친다).
+        ui.horizontal_wrapped(|ui| {
             ui.strong(&open.project.name);
             ui.separator();
             if ui.button(t("폴더 가져오기", "Import folder")).clicked()
@@ -229,13 +267,14 @@ fn workspace(
             {
                 actions.push(Action::CloseProject);
             }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                language_buttons(ui, actions);
-                ui.separator();
-                log_button(ui, env, actions);
-                ui.separator();
-                backend_label(ui, app, view)
-            });
+            ui.separator();
+            backend_label(ui, app, view);
+            ui.separator();
+            log_button(ui, env, actions);
+            ui.separator();
+            theme_buttons(ui, actions);
+            ui.separator();
+            language_buttons(ui, actions);
         });
     });
 
@@ -245,7 +284,10 @@ fn workspace(
     // 창이 세로로 길면 편집 패널을 아래로 내린다.
     let portrait = ui.available_width() < ui.available_height();
     if portrait {
-        Panel::bottom("edit").show(ui, |ui| edit_panel(ui, app, open, env, actions));
+        Panel::bottom("edit")
+            .resizable(true)
+            .default_size(ui.available_height() * 0.35)
+            .show(ui, |ui| edit_panel(ui, app, open, env, actions));
     } else {
         Panel::right("edit")
             .default_size(240.0)
@@ -388,7 +430,8 @@ fn export_bar(
     actions: &mut Vec<Action>,
 ) {
     let exporting = matches!(open.export, ExportState::Running { .. });
-    ui.horizontal(|ui| {
+    // 창이 좁으면 다음 줄로 넘어가게 한다.
+    ui.horizontal_wrapped(|ui| {
         if ui
             .add_enabled(
                 !exporting,
@@ -426,7 +469,12 @@ fn export_bar(
                     .text(t("품질", "Quality")),
             )
             .on_hover_text(guide);
-        ui.weak(quality_hint(quality)).on_hover_text(guide);
+        // 짧은 안내가 두 줄로 쪼개지지 않게 한다 (자리가 모자라면 통째로 다음 줄로 간다).
+        ui.add(
+            egui::Label::new(RichText::new(quality_hint(quality)).weak())
+                .wrap_mode(egui::TextWrapMode::Extend),
+        )
+        .on_hover_text(guide);
         // 끄는 동안에는 화면에서만 바꾸고, 놓을 때 한 번 저장한다.
         if slider.dragged() {
             view.quality = Some(quality);
@@ -434,30 +482,29 @@ fn export_bar(
             view.quality = None;
             actions.push(Action::SetQuality(quality));
         }
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if exporting {
-                if ui.button(t("취소", "Cancel")).clicked() {
-                    actions.push(Action::CancelExport);
-                }
-            } else {
-                if ui.button(t("전체 내보내기", "Export all")).clicked() {
-                    actions.push(Action::Export {
-                        only_selected: false,
-                    });
-                }
-                if ui
-                    .add_enabled(
-                        !open.selected.is_empty(),
-                        egui::Button::new(t("선택 내보내기", "Export selected")),
-                    )
-                    .clicked()
-                {
-                    actions.push(Action::Export {
-                        only_selected: true,
-                    });
-                }
+        ui.separator();
+        if exporting {
+            if ui.button(t("취소", "Cancel")).clicked() {
+                actions.push(Action::CancelExport);
             }
-        });
+        } else {
+            if ui
+                .add_enabled(
+                    !open.selected.is_empty(),
+                    egui::Button::new(t("선택 내보내기", "Export selected")),
+                )
+                .clicked()
+            {
+                actions.push(Action::Export {
+                    only_selected: true,
+                });
+            }
+            if ui.button(t("전체 내보내기", "Export all")).clicked() {
+                actions.push(Action::Export {
+                    only_selected: false,
+                });
+            }
+        }
     });
 }
 
@@ -1432,29 +1479,32 @@ mod tests {
         }
 
         fn harness(&self) -> Harness<'_> {
+            self.harness_sized(egui::vec2(1100.0, 700.0))
+        }
+
+        /// 창 크기를 정해서 띄운다.
+        fn harness_sized(&self, size: egui::Vec2) -> Harness<'_> {
             let mut view = View::default();
             let mut fonts_installed = false;
-            Harness::builder()
-                .with_size(egui::vec2(1100.0, 700.0))
-                .build_ui(move |ui| {
-                    // 글꼴은 다음 프레임부터 적용된다. 첫 프레임에는 아무것도 그리지 않는다.
-                    if !fonts_installed {
-                        install_fonts(ui.ctx());
-                        fonts_installed = true;
-                        ui.ctx().request_repaint();
-                        return;
-                    }
-                    let actions = draw(
-                        ui,
-                        &self.app.borrow(),
-                        &mut view,
-                        &mut *self.env.borrow_mut(),
-                    );
-                    for action in actions {
-                        self.seen.borrow_mut().push(name_of(&action));
-                        self.app.borrow_mut().handle(action);
-                    }
-                })
+            Harness::builder().with_size(size).build_ui(move |ui| {
+                // 글꼴은 다음 프레임부터 적용된다. 첫 프레임에는 아무것도 그리지 않는다.
+                if !fonts_installed {
+                    install_fonts(ui.ctx());
+                    fonts_installed = true;
+                    ui.ctx().request_repaint();
+                    return;
+                }
+                let actions = draw(
+                    ui,
+                    &self.app.borrow(),
+                    &mut view,
+                    &mut *self.env.borrow_mut(),
+                );
+                for action in actions {
+                    self.seen.borrow_mut().push(name_of(&action));
+                    self.app.borrow_mut().handle(action);
+                }
+            })
         }
     }
 
@@ -2159,8 +2209,25 @@ mod tests {
         harness.run_steps(4);
         harness.get_by_label("By colour").click();
         shot(&mut harness, "5-english.png");
+
+        // 라이트 모드 (한국어로 돌아와서)
+        handle(Action::SetLanguage(crate::lang::Lang::Ko));
+        handle(Action::SetTheme(Theme::Light));
+        shot(&mut harness, "6-light.png");
+
+        // 좁고 긴 창 (가장 작은 크기에 가까운 640×800)
+        let mut narrow = screen.harness_sized(egui::vec2(640.0, 800.0));
+        narrow.run_steps(6);
+        narrow
+            .render()
+            .unwrap()
+            .save(out.join("7-narrow.png"))
+            .unwrap();
+        drop(narrow);
+
         handle(Action::CloseProject);
-        shot(&mut harness, "5b-english-start.png");
+        shot(&mut harness, "6b-light-start.png");
+        handle(Action::SetTheme(Theme::Dark));
     }
 
     /// 화면에 나온 글자 가운데 한글이 든 것. 언어 단추의 "한국어"는 뺀다.
@@ -2635,5 +2702,103 @@ mod tests {
         harness.run_steps(3);
         assert_eq!(screen.env.borrow().logs_opened, 2);
         harness.get_by_label("로그 파일: /tmp/amsil/log.txt");
+    }
+
+    #[test]
+    fn light_and_dark_mode_are_switched_from_either_screen() {
+        use crate::project::Theme;
+        let screen = Screen::new("theme");
+        screen.env.borrow_mut().path = Some(screen.dir.join("trip.amsil"));
+        let theme = || screen.app.borrow().config.theme;
+        let mut harness = screen.harness();
+        harness.run_steps(3);
+        harness.get_by_label("라이트").click();
+        harness.run_steps(3);
+        assert_eq!(theme(), Some(Theme::Light));
+        assert_eq!(
+            harness.ctx.theme(),
+            egui::Theme::Light,
+            "화면이 밝아져야 한다"
+        );
+
+        harness.get_by_label("새 프로젝트").click();
+        harness.run_steps(3);
+        assert_eq!(
+            harness.ctx.theme(),
+            egui::Theme::Light,
+            "작업 화면에서도 그대로"
+        );
+        harness.get_by_label("다크").click();
+        harness.run_steps(3);
+        assert_eq!(theme(), Some(Theme::Dark));
+        assert_eq!(harness.ctx.theme(), egui::Theme::Dark);
+    }
+
+    #[test]
+    fn buttons_do_not_overlap_in_a_narrow_window() {
+        // 가장 작은 창 크기(640)에서, 두 언어 모두, 위쪽과 아래쪽 줄의 단추들이 서로 겹치지 않아야 한다.
+        for (language, labels) in [
+            (
+                crate::lang::Lang::Ko,
+                [
+                    "폴더 가져오기",
+                    "스크린샷",
+                    "프로젝트 닫기",
+                    "로그 열기",
+                    "라이트",
+                    "다크",
+                    "한국어",
+                    "English",
+                    "출력 폴더…",
+                    "권장 범위",
+                    "선택 내보내기",
+                    "전체 내보내기",
+                ],
+            ),
+            (
+                crate::lang::Lang::En,
+                [
+                    "Import folder",
+                    "Screenshot",
+                    "Close project",
+                    "Open log",
+                    "Light",
+                    "Dark",
+                    "한국어",
+                    "English",
+                    "Output folder…",
+                    "Recommended",
+                    "Export selected",
+                    "Export all",
+                ],
+            ),
+        ] {
+            let screen = Screen::with_photos("narrow");
+            let handle = |action| {
+                screen.app.borrow_mut().handle(action);
+            };
+            handle(Action::SetLanguage(language));
+            handle(Action::SetExportFolder(
+                "/home/user/Pictures/a rather long folder name".into(),
+            ));
+            let mut harness = screen.harness_sized(egui::vec2(640.0, 800.0));
+            harness.run_steps(4);
+            let rects: Vec<(&str, egui::Rect)> = labels
+                .iter()
+                .map(|label| (*label, harness.get_by_label(label).rect()))
+                .collect();
+            for (i, (a, first)) in rects.iter().enumerate() {
+                assert!(
+                    first.min.x >= 0.0 && first.max.x <= 640.0,
+                    "{a}: 창 밖으로 나갔다 {first:?}"
+                );
+                for (b, second) in &rects[i + 1..] {
+                    assert!(
+                        !first.shrink(1.0).intersects(second.shrink(1.0)),
+                        "{a}와 {b}가 겹친다: {first:?} {second:?}"
+                    );
+                }
+            }
+        }
     }
 }

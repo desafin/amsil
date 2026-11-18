@@ -465,11 +465,15 @@ mod tests {
                 .exists()
         );
 
-        let started = std::time::Instant::now();
+        // 미리보기는 사진의 사본으로 한다 (아래에서 지워 본다).
+        let dir = std::env::temp_dir().join(format!("amsil-worker-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let copy = dir.join("copy.ARW");
+        std::fs::copy(&sample, &copy).unwrap();
         workers.run(Effect::Preview {
             generation: 7,
             index: 0,
-            path: sample.clone(),
+            path: copy.clone(),
             denoise: 0.0,
             params: Default::default(),
             lut: None,
@@ -482,8 +486,6 @@ mod tests {
         let mut seen = wait_for(&rx, |action| {
             matches!(action, Action::PreviewReady { generation: 7, .. })
         });
-        // 사진을 처음 읽어서 보여 주기까지 걸린 시간
-        let cold = started.elapsed();
         seen.extend(wait_for(
             &rx,
             |action| matches!(action, Action::PreviewReady { generation: 7, result: Ok(preview), .. } if preview.height == 2048),
@@ -504,9 +506,9 @@ mod tests {
             "세로 사진: 긴 변 1200짜리가 먼저, 2048짜리가 나중"
         );
 
-        // 같은 사진의 보정만 바꾸면 다시 읽지 않아서 금방 온다.
-        // (다른 테스트가 함께 돌면 전체가 느려지므로, 정해 둔 시간이 아니라 처음 읽을 때와 견준다.)
-        let started = std::time::Instant::now();
+        // 같은 사진의 보정만 바꾸면 파일을 다시 읽지 않는다. 파일을 지워도 미리보기가 나오는 것으로 확인한다.
+        // (걸린 시간으로 재면 다른 테스트가 함께 돌 때 흔들린다.)
+        std::fs::remove_file(&copy).unwrap();
         let mono = crate::edit::Params {
             mono: 1.0,
             ..Default::default()
@@ -514,7 +516,7 @@ mod tests {
         workers.run(Effect::Preview {
             generation: 8,
             index: 0,
-            path: sample.clone(),
+            path: copy.clone(),
             denoise: 0.0,
             params: mono,
             lut: None,
@@ -530,13 +532,8 @@ mod tests {
             result: Ok(quick), ..
         } = seen.last().unwrap()
         else {
-            panic!("미리보기가 아니다")
+            panic!("보정만 바꿨는데 (지운) 사진 파일을 다시 읽으려 했다")
         };
-        let warm = started.elapsed();
-        assert!(
-            warm < cold / 2,
-            "다시 읽은 것처럼 느리다: 처음 {cold:?}, 보정만 바꿨을 때 {warm:?}"
-        );
         let px = &quick.rgba[..4];
         assert!(
             px[0].abs_diff(px[1]) <= 1 && px[1].abs_diff(px[2]) <= 1,
@@ -547,7 +544,6 @@ mod tests {
             |action| matches!(action, Action::PreviewReady { generation: 8, result: Ok(preview), .. } if preview.height == 2048),
         );
 
-        let dir = std::env::temp_dir().join(format!("amsil-worker-{}", std::process::id()));
         let output = dir.join("sub/out.heic");
         let photos = vec![export::Photo {
             input: sample,

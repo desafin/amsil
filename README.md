@@ -56,13 +56,17 @@ target/release/amsil
 - 1MB를 넘으면 다음에 켤 때 `log.old.txt`로 옮기고 새로 시작한다 (이전 것은 하나만 남긴다).
 - 사진 파일의 경로가 들어 있다. 다른 사람에게 보낼 때는 한번 훑어본다.
 
+### 라이트 모드와 다크 모드
+
+창 위쪽의 [라이트] [다크]로 화면의 밝기를 고른다. 고른 모드는 저장되어 다음에 켤 때도 유지된다. 고른 적이 없으면 시스템의 설정을 따른다.
+
 ### 언어 (한국어 / English)
 
-창 오른쪽 위의 [한국어] [English]를 누르면 바로 바뀌고, 다음에 켤 때도 유지된다. 명령행 도구의 메시지도 같은 언어로 나온다.
+창 위쪽의 [한국어] [English]를 누르면 바로 바뀌고, 다음에 켤 때도 유지된다. 명령행 도구의 메시지도 같은 언어로 나온다.
 
 고른 적이 없으면 시스템 언어를 따른다. `LANG` 등이 한국어 로캘(`ko_KR.UTF-8`)이면 한국어, 그 밖에는 영어다.
 
-The interface is available in Korean and English. Use the [한국어] / [English] buttons at the top right of the window; the choice is saved and also applies to command-line messages.
+The interface is available in Korean and English. Use the [한국어] / [English] buttons at the top of the window; the choice is saved and also applies to command-line messages.
 
 ### 명령행으로 쓰기
 

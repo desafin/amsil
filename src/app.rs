@@ -13,7 +13,7 @@ use crate::log;
 use crate::mask::{Mask, Point};
 use crate::preset::{self, Preset};
 use crate::preview::Pixels;
-use crate::project::{Config, Edit, Folder, LutRef, Project};
+use crate::project::{Config, Edit, Folder, LutRef, Project, Theme};
 use crate::recommend::{self, Guess};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -208,6 +208,8 @@ pub enum Action {
     SetLanguage(Lang),
     /// 화면 쪽에서 알릴 것이 생겼다 (상태 줄에 보여 준다).
     Notify(String),
+    /// 화면을 밝게 또는 어둡게.
+    SetTheme(Theme),
 
     Thumbnail {
         index: usize,
@@ -350,6 +352,11 @@ impl App {
                 self.notice = Some(text);
                 return Ok(Vec::new());
             }
+            Action::SetTheme(theme) => {
+                self.config.theme = Some(theme);
+                self.config.save(&self.config_path)?;
+                return Ok(Vec::new());
+            }
             Action::SetLanguage(chosen) => {
                 lang::set(chosen);
                 self.config.lang = Some(chosen);
@@ -370,6 +377,7 @@ impl App {
             | Action::SaveScreenshot(_)
             | Action::SetLanguage(_)
             | Action::Notify(_)
+            | Action::SetTheme(_)
             | Action::Recommender(_)
             | Action::Segmenter(_)
             | Action::SkinModel(_)
@@ -2079,5 +2087,23 @@ mod tests {
         fx.app
             .handle(Action::Notify("로그 파일: /tmp/log.txt".into()));
         assert_eq!(fx.app.notice.as_deref(), Some("로그 파일: /tmp/log.txt"));
+    }
+
+    #[test]
+    fn choosing_light_or_dark_mode_is_saved() {
+        use crate::project::Theme;
+        let mut fx = Fixture::new("theme");
+        // 프로젝트를 열기 전(시작 화면)에도 바꿀 수 있다.
+        assert!(fx.app.handle(Action::SetTheme(Theme::Light)).is_empty());
+        assert_eq!(fx.app.config.theme, Some(Theme::Light));
+        assert_eq!(
+            Config::load(&fx.dir.join("config/config.toml")).theme,
+            Some(Theme::Light)
+        );
+        fx.app.handle(Action::SetTheme(Theme::Dark));
+        assert_eq!(
+            Config::load(&fx.dir.join("config/config.toml")).theme,
+            Some(Theme::Dark)
+        );
     }
 }

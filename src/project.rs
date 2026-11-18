@@ -225,9 +225,20 @@ pub struct Config {
     /// 화면에서 고른 언어. 고른 적이 없으면 시스템 언어를 따른다.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lang: Option<crate::lang::Lang>,
+    /// 화면에서 고른 밝기 모드. 고른 적이 없으면 시스템의 설정을 따른다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<Theme>,
     /// 최근에 연 프로젝트. 최신이 맨 앞.
     #[serde(default)]
     pub recent: Vec<PathBuf>,
+}
+
+/// 화면의 밝기 모드.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Theme {
+    Light,
+    Dark,
 }
 
 /// 최근 프로젝트 목록의 최대 길이.
@@ -615,5 +626,20 @@ mod tests {
         assert!(text.contains("skin = 0.5"), "{text}");
         assert_eq!(loaded.edit(0, "a.ARW").skin, 0.5);
         assert!(!toml::to_string(&Edit::default()).unwrap().contains("skin"));
+    }
+
+    #[test]
+    fn the_chosen_theme_is_saved_and_absent_until_chosen() {
+        let dir = std::env::temp_dir().join(format!("amsil-config-theme-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        let mut config = Config::load(&path);
+        assert_eq!(config.theme, None, "고르기 전에는 시스템의 모드를 따른다");
+        config.theme = Some(Theme::Light);
+        config.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let loaded = Config::load(&path);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(text.contains("theme = \"light\""), "{text}");
+        assert_eq!(loaded.theme, Some(Theme::Light));
     }
 }
