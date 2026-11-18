@@ -17,6 +17,8 @@ use std::time::Instant;
 
 /// libheif의 품질 값. A900 사진으로 재 보니 55가 JPEG q90 수준이고 70부터는 JPEG보다 파일이 커진다.
 pub const QUALITY: u8 = 55;
+/// 고를 수 있는 품질의 범위.
+pub const QUALITY_RANGE: std::ops::RangeInclusive<u8> = 40..=100;
 
 /// 사진 한 장을 처리하는 데 드는 메모리의 추정값 (센서 화소당 바이트).
 // ponytail: 실측으로 정한 상수 (A900 기준 장당 최대 53바이트/화소). 다른 카메라에서 틀려도 시스템 여유 메모리 감시가 받쳐 준다.

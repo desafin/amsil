@@ -37,6 +37,8 @@ pub struct Args {
     frame: Option<Frame>,
     /// 피부 보정의 세기 (0~1). 0이면 끈다.
     skin: f32,
+    /// 출력 품질.
+    quality: u8,
 }
 
 /// 사용법 안내.
@@ -54,6 +56,7 @@ pub fn usage() -> &'static str {
   --frame=모양         촬영 정보를 적은 프레임: band(아래 띠), border(테두리), 4:5 같은 비율
   --frame-black        프레임을 검은색으로 (기본은 흰색)
   --skin[=세기]        인물의 피부를 고르게 다듬는다 (실험 기능. 세기 0~1, 생략하면 0.5)
+  --quality=N          출력 품질 (40~100, 기본 55. 55가 JPEG 90 수준이다)
   --overwrite          이미 있는 출력 파일도 다시 만든다 (기본은 건너뜀)
   --jobs=N             동시에 처리할 장수 (기본: CPU 코어 수)
   --memory=GB          사용할 메모리 한도 (기본: 남은 메모리의 70%)",
@@ -69,6 +72,7 @@ Options:
   --frame=LAYOUT       frame with the shooting info: band (strip below), border, or a ratio such as 4:5
   --frame-black        black frame (white by default)
   --skin[=AMOUNT]      even out skin in portraits (experimental; 0 to 1, 0.5 when no amount is given)
+  --quality=N          output quality (40 to 100, default 55; 55 is about JPEG 90)
   --overwrite          redo output files that already exist (skipped by default)
   --jobs=N             photos to process at once (default: number of CPU cores)
   --memory=GB          memory limit (default: 70% of the available memory)",
@@ -81,6 +85,7 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> std::result::Resu
     let (mut lut, mut lut_strength) = (None, 1.0);
     let (mut layout, mut frame_black) = (None::<Layout>, false);
     let mut skin = 0.0;
+    let mut quality = export::QUALITY;
     let mut paths = Vec::new();
     for arg in args {
         let Some(option) = arg.to_str().filter(|text| text.starts_with("--")) else {
@@ -140,6 +145,16 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> std::result::Resu
             }
             ("--frame", Some(value)) => layout = Some(value.parse()?),
             ("--frame-black", None) => frame_black = true,
+            ("--quality", Some(value)) => {
+                quality = value
+                    .parse()
+                    .ok()
+                    .filter(|quality| export::QUALITY_RANGE.contains(quality))
+                    .ok_or(t(
+                        "품질은 40에서 100 사이의 정수여야 합니다",
+                        "The quality must be a whole number from 40 to 100",
+                    ))?;
+            }
             ("--skin", None) => skin = 0.5,
             ("--skin", Some(value)) => {
                 skin = value
@@ -184,6 +199,7 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> std::result::Resu
             lut_strength,
             frame,
             skin,
+            quality,
         }),
         Err(_) => Err(t(
             "입력과 출력을 하나씩 지정해야 합니다",
@@ -305,10 +321,10 @@ fn run_folder(
     let denoiser = load_denoiser(args.denoise > 0.0)?;
     let skin_finder = load_skin_finder(args.skin > 0.0)?;
     let settings = Settings {
+        quality: args.quality,
         overwrite: args.overwrite,
         jobs: args.jobs,
         memory_gb: args.memory_gb,
-        ..Settings::default()
     };
     export::run(
         &photos,
@@ -353,7 +369,7 @@ pub fn run(args: &Args) -> Result<()> {
         let warning = export::convert(
             &args.input,
             &args.output,
-            export::QUALITY,
+            args.quality,
             export::cores(),
             denoise,
             Look {
@@ -530,6 +546,7 @@ mod tests {
             lut_strength: 1.0,
             frame: None,
             skin: 0.0,
+            quality: export::QUALITY,
         };
 
         let mut last = None;
@@ -651,5 +668,21 @@ mod tests {
         assert_eq!(args(&["--skin=0.8", "in", "out"]).unwrap().skin, 0.8);
         assert!(args(&["--skin=2", "in", "out"]).is_err());
         assert!(usage().contains("--skin"));
+    }
+
+    #[test]
+    fn parses_the_quality() {
+        assert_eq!(args(&["in", "out"]).unwrap().quality, 55);
+        assert_eq!(args(&["--quality=90", "in", "out"]).unwrap().quality, 90);
+        assert_eq!(args(&["--quality=100", "in", "out"]).unwrap().quality, 100);
+        for bad in [
+            "--quality=101",
+            "--quality=10",
+            "--quality=abc",
+            "--quality",
+        ] {
+            assert!(args(&[bad, "in", "out"]).is_err(), "{bad}");
+        }
+        assert!(usage().contains("--quality"));
     }
 }

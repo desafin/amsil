@@ -348,6 +348,18 @@ fn resources(report: &ReportView) -> String {
     )
 }
 
+/// 고른 품질이 무엇을 뜻하는지 한마디로. 기준은 2,400만 화소 사진으로 잰 용량이다.
+fn quality_hint(quality: u8) -> &'static str {
+    match quality {
+        ..=60 => t("권장 범위", "Recommended"),
+        61..=75 => t("용량이 2~3배", "2–3× the size"),
+        _ => t(
+            "16MB를 넘으면 자동으로 낮춤",
+            "Lowered automatically above 16 MB",
+        ),
+    }
+}
+
 fn export_bar(
     ui: &mut egui::Ui,
     open: &Open,
@@ -373,11 +385,28 @@ fn export_bar(
         };
         ui.separator();
         let mut quality = view.quality.unwrap_or(open.project.export.quality);
-        // 슬라이더에 이름을 붙여 둔다 (화면 낭독기와 테스트가 이 이름으로 찾는다).
-        let slider = ui.add_enabled(
-            !exporting,
-            egui::Slider::new(&mut quality, 40..=75).text(t("품질", "Quality")),
+        // 품질은 끝까지 올릴 수 있게 두고, 값마다 무엇을 치르는지 옆에 알려 준다.
+        let guide = t(
+            "55를 권장합니다 (JPEG 90 수준의 화질).\n\
+             75면 용량이 55의 2~3배가 되어 카메라 JPEG보다 커집니다.\n\
+             그보다 높이면, 16MB를 넘는 사진은 열지 못하는 뷰어가 있어 품질을 자동으로 낮춥니다. \
+             낮추는 만큼 다시 인코딩하므로 오래 걸립니다.\n\
+             95 이상은 결과가 같습니다.",
+            "55 is recommended (about the quality of JPEG 90).\n\
+             At 75 files are 2–3 times the size at 55, larger than the camera JPEG.\n\
+             Above that, photos over 16 MB cannot be opened by some viewers, so their quality is \
+             lowered automatically. Each step down is another encode, so it takes longer.\n\
+             95 and above give the same result.",
         );
+        // 슬라이더에 이름을 붙여 둔다 (화면 낭독기와 테스트가 이 이름으로 찾는다).
+        let slider = ui
+            .add_enabled(
+                !exporting,
+                egui::Slider::new(&mut quality, crate::export::QUALITY_RANGE)
+                    .text(t("품질", "Quality")),
+            )
+            .on_hover_text(guide);
+        ui.weak(quality_hint(quality)).on_hover_text(guide);
         // 끄는 동안에는 화면에서만 바꾸고, 놓을 때 한 번 저장한다.
         if slider.dragged() {
             view.quality = Some(quality);
@@ -2370,7 +2399,7 @@ mod tests {
         use ab_glyph::Font;
         // 글꼴에 없는 글자는 화면에 네모로 나온다.
         let font = ab_glyph::FontRef::try_from_slice(crate::frame::FONT).unwrap();
-        for symbol in ['★', '·', '…', '×', '%'] {
+        for symbol in ['★', '·', '…', '×', '%', '–', '~'] {
             assert_ne!(font.glyph_id(symbol).0, 0, "{symbol}");
         }
     }
@@ -2525,5 +2554,37 @@ mod tests {
         harness.run_steps(3);
         harness.get_by_label("피부 보정: 모델 없음");
         assert_eq!(harness.query_all_by_label("피부 보정 세기").count(), 0);
+    }
+
+    #[test]
+    fn the_quality_slider_goes_to_the_top_and_says_what_each_range_costs() {
+        let screen = Screen::with_photos("quality-hint");
+        let mut harness = screen.harness();
+        // 기본값(55)은 권장 범위다.
+        harness.run_steps(3);
+        harness.get_by_label("권장 범위");
+        for (quality, hint) in [
+            (60, "권장 범위"),
+            (70, "용량이 2~3배"),
+            (75, "용량이 2~3배"),
+            (76, "16MB를 넘으면 자동으로 낮춤"),
+            (100, "16MB를 넘으면 자동으로 낮춤"),
+        ] {
+            screen.app.borrow_mut().handle(Action::SetQuality(quality));
+            harness.run_steps(3);
+            harness.get_by_label(hint);
+        }
+        assert_eq!(
+            screen
+                .app
+                .borrow()
+                .open
+                .as_ref()
+                .unwrap()
+                .project
+                .export
+                .quality,
+            100
+        );
     }
 }

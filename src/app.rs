@@ -558,7 +558,8 @@ impl App {
                 open.save()?;
             }
             Action::SetQuality(quality) => {
-                open.project.export.quality = quality;
+                let range = export::QUALITY_RANGE;
+                open.project.export.quality = quality.clamp(*range.start(), *range.end());
                 open.save()?;
             }
             Action::Export { only_selected } => {
@@ -891,7 +892,12 @@ impl Open {
             report: None,
         };
         let settings = export::Settings {
-            quality: self.project.export.quality,
+            // 손으로 고친 프로젝트 파일에 범위 밖의 값이 있을 수 있다.
+            quality: self
+                .project
+                .export
+                .quality
+                .clamp(*export::QUALITY_RANGE.start(), *export::QUALITY_RANGE.end()),
             overwrite,
             ..export::Settings::default()
         };
@@ -2035,5 +2041,17 @@ mod tests {
         assert_eq!(fx.app.skin_problem.as_deref(), Some("모델이 없습니다"));
         fx.app.handle(Action::SkinModel(None));
         assert_eq!(fx.app.skin_problem, None);
+    }
+
+    #[test]
+    fn quality_is_kept_within_the_supported_range() {
+        let mut fx = Fixture::with_photos("quality-range");
+        let quality = |fx: &Fixture| fx.open().project.export.quality;
+        fx.app.handle(Action::SetQuality(100));
+        assert_eq!(quality(&fx), 100, "끝까지 올릴 수 있다");
+        fx.app.handle(Action::SetQuality(200));
+        assert_eq!(quality(&fx), 100);
+        fx.app.handle(Action::SetQuality(3));
+        assert_eq!(quality(&fx), 40);
     }
 }
