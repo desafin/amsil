@@ -9,6 +9,7 @@ use crate::export::{self, Report};
 use crate::frame::Frame;
 use crate::job::Outcome;
 use crate::lang::{self, Lang, t};
+use crate::log;
 use crate::mask::{Mask, Point};
 use crate::preset::{self, Preset};
 use crate::preview::Pixels;
@@ -205,6 +206,8 @@ pub enum Action {
     SaveScreenshot(Pixels),
     /// 화면과 메시지의 언어를 바꾼다.
     SetLanguage(Lang),
+    /// 화면 쪽에서 알릴 것이 생겼다 (상태 줄에 보여 준다).
+    Notify(String),
 
     Thumbnail {
         index: usize,
@@ -284,6 +287,8 @@ impl App {
         match self.try_handle(action) {
             Ok(effects) => effects,
             Err(error) => {
+                // 화면에 띄운 오류는 로그에도 남긴다 (알림은 다음 알림에 덮여 사라진다).
+                log::error(error.to_string());
                 self.notice = Some(error.to_string());
                 Vec::new()
             }
@@ -309,18 +314,26 @@ impl App {
                 return self.enter(path, project);
             }
             Action::Backend(backend) => {
+                match &backend {
+                    Backend::Unknown => {}
+                    Backend::Gpu => log::info(t("AI 실행: GPU", "AI backend: GPU")),
+                    Backend::Cpu(notice) | Backend::Unavailable(notice) => log::warn(notice),
+                }
                 self.backend = backend;
                 return Ok(Vec::new());
             }
             Action::Recommender(problem) => {
+                problem.iter().for_each(log::warn);
                 self.recommend_problem = problem;
                 return Ok(Vec::new());
             }
             Action::Segmenter(problem) => {
+                problem.iter().for_each(log::warn);
                 self.mask_problem = problem;
                 return Ok(Vec::new());
             }
             Action::SkinModel(problem) => {
+                problem.iter().for_each(log::warn);
                 self.skin_problem = problem;
                 return Ok(Vec::new());
             }
@@ -331,6 +344,10 @@ impl App {
                     format!("스크린샷을 저장했습니다: {path}"),
                     format!("Screenshot saved: {path}"),
                 ));
+                return Ok(Vec::new());
+            }
+            Action::Notify(text) => {
+                self.notice = Some(text);
                 return Ok(Vec::new());
             }
             Action::SetLanguage(chosen) => {
@@ -352,6 +369,7 @@ impl App {
             | Action::OpenProject(_)
             | Action::SaveScreenshot(_)
             | Action::SetLanguage(_)
+            | Action::Notify(_)
             | Action::Recommender(_)
             | Action::Segmenter(_)
             | Action::SkinModel(_)
@@ -2053,5 +2071,13 @@ mod tests {
         assert_eq!(quality(&fx), 100);
         fx.app.handle(Action::SetQuality(3));
         assert_eq!(quality(&fx), 40);
+    }
+
+    #[test]
+    fn a_notification_from_the_screen_is_shown_as_the_notice() {
+        let mut fx = Fixture::new("notify");
+        fx.app
+            .handle(Action::Notify("로그 파일: /tmp/log.txt".into()));
+        assert_eq!(fx.app.notice.as_deref(), Some("로그 파일: /tmp/log.txt"));
     }
 }

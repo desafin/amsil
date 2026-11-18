@@ -11,6 +11,8 @@ fn complaint(config_home: &Path, locale: &str) -> String {
         .env_remove("LC_MESSAGES")
         .env("LANG", locale)
         .env("XDG_CONFIG_HOME", config_home)
+        // 로그도 임시 폴더에 쓰게 한다 (사용자의 실제 로그를 건드리지 않는다).
+        .env("XDG_STATE_HOME", config_home.join("state"))
         .output()
         .unwrap();
     String::from_utf8(output.stderr).unwrap()

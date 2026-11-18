@@ -8,7 +8,7 @@ use crate::lang::t;
 use crate::lut::Lut;
 use crate::mask::{self, Low, Mask, Segmenter};
 use crate::skin::{self, SkinFinder};
-use crate::{Result, denoise, develop, heif, job, raw};
+use crate::{Result, denoise, develop, heif, job, log, raw};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -340,6 +340,33 @@ pub fn convert(
     }))
 }
 
+/// 내보내기의 결과를 로그에 남긴다: 실패한 사진과 이유, 알릴 일, 요약.
+fn record(outcome: &job::Outcome, warnings: &Warnings, seconds: f32) {
+    for (file, reason) in &outcome.failed {
+        log::error(format!(
+            "{}: {}: {reason}",
+            t("실패", "Failed"),
+            file.display()
+        ));
+    }
+    for (file, warning) in warnings {
+        log::warn(format!("{}: {warning}", file.display()));
+    }
+    if let Some(reason) = &outcome.stopped {
+        log::error(t(
+            format!("끝까지 처리하지 못했습니다: {reason}"),
+            format!("Stopped before finishing: {reason}"),
+        ));
+    }
+    let (done, skipped, failed) = (outcome.done, outcome.skipped, outcome.failed.len());
+    log::info(t(
+        format!("내보내기 끝: 완료 {done}장, 건너뜀 {skipped}장, 실패 {failed}장 ({seconds:.1}초)"),
+        format!(
+            "Export finished: done {done}, skipped {skipped}, failed {failed} ({seconds:.1} s)"
+        ),
+    ));
+}
+
 /// 사진 한 장을 처리하는 데 잡아 둘 메모리(바이트). `size`는 센서의 가로·세로 화소 수.
 /// 프레임을 두르면 그림이 커지는 만큼 더 잡는다. 사진이 가로로 서 있는지 세로로 서 있는지는
 /// 헤더만으로 알 수 없으므로, 둘 중 더 커지는 쪽으로 잡는다.
@@ -582,6 +609,12 @@ pub fn run(
         });
     let (workers, encoder_threads) = plan(cores(), settings.jobs, limit, per_photo, tasks.len());
     let budget = job::Budget::new(limit, workers);
+    let (count, quality) = (tasks.len(), settings.quality);
+    log::info(t(
+        format!("내보내기 시작: {count}장 (동시에 {workers}장, 품질 {quality})"),
+        format!("Export started: {count} photos ({workers} at a time, quality {quality})"),
+    ));
+    let started = Instant::now();
     let warnings = Mutex::new(Vec::new());
     let batch = job::Batch {
         tasks: &tasks,
@@ -637,7 +670,9 @@ pub fn run(
     };
     let mut monitor = Monitor::new(system, limit)?;
     let outcome = job::run_batch(&batch, |status| report(&monitor.sample(status, &budget)));
-    Ok((outcome, warnings.into_inner().unwrap()))
+    let warnings = warnings.into_inner().unwrap();
+    record(&outcome, &warnings, started.elapsed().as_secs_f32());
+    Ok((outcome, warnings))
 }
 
 #[cfg(test)]

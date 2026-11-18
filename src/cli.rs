@@ -233,22 +233,23 @@ fn auto_params(args: &Args, inputs: &[PathBuf]) -> Result<Vec<Params>> {
     let presets = presets();
     let mut classifier = crate::recommend::load_classifier()?;
     // ponytail: 한 장씩 차례로 분류한다 (장당 0.1초쯤). 수천 장이면 여러 스레드로 나눈다.
-    inputs
+    Ok(inputs
         .iter()
         .map(|input| {
-            let guess = match crate::preview::thumbnail(input, 448)? {
-                Some(picture) => Some(classifier.classify(&picture)?),
-                None => None,
-            };
+            // 읽을 수 없는 사진은 분류하지 않고 넘어간다. 변환할 때 그 사진만 이유와 함께 실패로 남는다.
+            let guess = crate::preview::thumbnail(input, 448)
+                .ok()
+                .flatten()
+                .and_then(|picture| classifier.classify(&picture).ok());
             let preset = guess.and_then(|guess| crate::recommend::preset_for(&presets, &guess));
-            Ok(preset::resolve(
+            preset::resolve(
                 &presets,
                 preset.map(|preset| preset.id.as_str()),
                 args.strength,
                 &Params::default(),
-            ))
+            )
         })
-        .collect()
+        .collect())
 }
 
 /// 명령행에서 고른 프리셋과 강도로 보정 값을 정한다.
@@ -382,8 +383,10 @@ pub fn run(args: &Args) -> Result<()> {
             &|_| {},
         )?;
         if let Some(warning) = warning {
+            crate::log::warn(format!("{}: {warning}", args.input.display()));
             eprintln!("{}: {warning}", t("경고", "Warning"));
         }
+        crate::log::info(format!("{}: {}", t("완료", "Done"), args.output.display()));
         eprintln!("{}: {}", t("완료", "Done"), args.output.display());
         return Ok(());
     }
@@ -684,5 +687,23 @@ mod tests {
             assert!(args(&[bad, "in", "out"]).is_err(), "{bad}");
         }
         assert!(usage().contains("--quality"));
+    }
+
+    #[test]
+    fn auto_preset_does_not_stop_the_batch_for_an_unreadable_photo() {
+        // 분류 모델이 있을 때만 돈다.
+        if crate::recommend::load_classifier().is_err() {
+            eprintln!("분류 모델이 없어 건너뜀");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("amsil-auto-broken-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let broken = dir.join("broken.ARW");
+        std::fs::write(&broken, [0x5a; 4096]).unwrap();
+        let args = args(&["--preset=auto", "in", "out"]).unwrap();
+        // 분류하지 못한 사진은 보정 없이 둔다. 변환 단계에서 그 사진만 이유와 함께 실패로 남는다.
+        let chosen = auto_params(&args, std::slice::from_ref(&broken));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(chosen.unwrap()[0].is_neutral());
     }
 }

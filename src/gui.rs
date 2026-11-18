@@ -110,6 +110,25 @@ impl Env for Dialogs {
             .pick_file()
     }
 
+    // ponytail: Linux의 xdg-open으로 연다. Windows를 지원할 때 그쪽 명령을 더한다.
+    fn open_log(&mut self) -> String {
+        let path = crate::log::path();
+        let shown = path.display();
+        match std::process::Command::new("xdg-open").arg(&path).spawn() {
+            Ok(mut viewer) => {
+                // 끝난 프로세스가 남지 않게 기다려 준다.
+                std::thread::spawn(move || viewer.wait());
+                t(format!("로그 파일: {shown}"), format!("Log file: {shown}"))
+            }
+            Err(e) => t(
+                format!(
+                    "로그 파일을 열 프로그램을 찾지 못했습니다 ({e}). 직접 열어 보세요: {shown}"
+                ),
+                format!("No program found to open the log file ({e}). Open it yourself: {shown}"),
+            ),
+        }
+    }
+
     fn screenshot(&mut self, ctx: &egui::Context) {
         let send = self.send.clone();
         ctx.request_screenshot(move |image| {

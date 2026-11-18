@@ -10,6 +10,7 @@ mod gui;
 mod heif;
 mod job;
 mod lang;
+mod log;
 mod lut;
 mod mask;
 mod preset;
@@ -36,12 +37,29 @@ fn main() -> std::process::ExitCode {
     // 화면에서 고른 언어가 있으면 그것을, 없으면 시스템 언어를 쓴다.
     let config = project::Config::load(&project::Config::path());
     lang::set(config.lang.unwrap_or_else(lang::system));
+    log::init();
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    log::info(format!(
+        "{} {} {}: {}",
+        t("암실", "Amsil"),
+        env!("CARGO_PKG_VERSION"),
+        t("시작", "started"),
+        if arguments.is_empty() {
+            t("창", "window").to_owned()
+        } else {
+            arguments.join(" ")
+        }
+    ));
 
     // 인자 없이 실행하면 창을 띄운다.
     if std::env::args_os().len() <= 1 {
         return match gui::run() {
             Ok(()) => std::process::ExitCode::SUCCESS,
             Err(e) => {
+                log::error(t(
+                    format!("창을 열 수 없습니다: {e}"),
+                    format!("Could not open a window: {e}"),
+                ));
                 eprintln!(
                     "{}\n{}",
                     t(
@@ -61,6 +79,7 @@ fn main() -> std::process::ExitCode {
     let args = match cli::parse_args(std::env::args_os().skip(1)) {
         Ok(args) => args,
         Err(message) => {
+            log::error(&message);
             eprintln!("{message}\n{}", cli::usage());
             return std::process::ExitCode::from(2);
         }
@@ -78,6 +97,7 @@ fn main() -> std::process::ExitCode {
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
+            log::error(e.to_string());
             eprintln!("{}: {e}", t("실패", "Failed"));
             std::process::ExitCode::FAILURE
         }

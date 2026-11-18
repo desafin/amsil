@@ -22,6 +22,8 @@ pub trait Env {
     fn pick_lut(&mut self) -> Option<PathBuf>;
     /// 지금 창을 갈무리한다. 결과는 나중에 `Action::SaveScreenshot`으로 도착한다.
     fn screenshot(&mut self, ctx: &egui::Context);
+    /// 로그 파일을 연다. 화면에 알릴 말(파일의 위치, 또는 열지 못한 까닭)을 돌려준다.
+    fn open_log(&mut self) -> String;
 }
 
 /// 화면 쪽에서만 쓰는 상태: GPU에 올린 그림과 창의 열림 여부.
@@ -105,10 +107,26 @@ fn language_buttons(ui: &mut egui::Ui, actions: &mut Vec<Action>) {
     }
 }
 
+/// 문제가 생겼을 때 볼 로그 파일을 여는 단추.
+fn log_button(ui: &mut egui::Ui, env: &mut dyn Env, actions: &mut Vec<Action>) {
+    if ui
+        .button(t("로그 열기", "Open log"))
+        .on_hover_text(t(
+            "오류와 내보내기 기록이 남는 파일을 엽니다",
+            "Opens the file where errors and exports are recorded",
+        ))
+        .clicked()
+    {
+        actions.push(Action::Notify(env.open_log()));
+    }
+}
+
 fn start_screen(ui: &mut egui::Ui, app: &App, env: &mut dyn Env, actions: &mut Vec<Action>) {
     Panel::top("language").show(ui, |ui| {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            language_buttons(ui, actions)
+            language_buttons(ui, actions);
+            ui.separator();
+            log_button(ui, env, actions);
         });
     });
     egui::CentralPanel::default().show(ui, |ui| {
@@ -213,6 +231,8 @@ fn workspace(
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 language_buttons(ui, actions);
+                ui.separator();
+                log_button(ui, env, actions);
                 ui.separator();
                 backend_label(ui, app, view)
             });
@@ -1339,6 +1359,7 @@ mod tests {
     struct Fake {
         path: Option<PathBuf>,
         screenshots: usize,
+        logs_opened: usize,
     }
 
     impl Env for Fake {
@@ -1356,6 +1377,14 @@ mod tests {
         }
         fn screenshot(&mut self, _: &egui::Context) {
             self.screenshots += 1;
+        }
+        fn open_log(&mut self) -> String {
+            self.logs_opened += 1;
+            crate::lang::t(
+                "로그 파일: /tmp/amsil/log.txt",
+                "Log file: /tmp/amsil/log.txt",
+            )
+            .into()
         }
     }
 
@@ -2586,5 +2615,25 @@ mod tests {
                 .quality,
             100
         );
+    }
+
+    #[test]
+    fn the_log_can_be_opened_from_the_start_screen_and_the_workspace() {
+        let screen = Screen::new("open-log");
+        screen.env.borrow_mut().path = Some(screen.dir.join("trip.amsil"));
+        let mut harness = screen.harness();
+        harness.run_steps(3);
+        harness.get_by_label("로그 열기").click();
+        harness.run_steps(3);
+        assert_eq!(screen.env.borrow().logs_opened, 1);
+        // 파일이 어디에 있는지 화면에도 알려 준다.
+        harness.get_by_label("로그 파일: /tmp/amsil/log.txt");
+
+        harness.get_by_label("새 프로젝트").click();
+        harness.run_steps(3);
+        harness.get_by_label("로그 열기").click();
+        harness.run_steps(3);
+        assert_eq!(screen.env.borrow().logs_opened, 2);
+        harness.get_by_label("로그 파일: /tmp/amsil/log.txt");
     }
 }
