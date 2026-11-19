@@ -4,7 +4,7 @@
 //! 디코더가 내는 마스크는 256×256 격자라서, 그림의 윤곽을 따라가며 원래 크기로 키운다.
 
 use crate::edit::Params;
-use crate::lang::t;
+use crate::lang::{Text, text};
 use crate::preview::Pixels;
 use crate::{Image, Result};
 use ort::session::Session;
@@ -160,7 +160,7 @@ impl Segmenter {
         let best = (0..scores.len())
             .max_by(|&a, &b| scores[a].total_cmp(&scores[b]))
             .ok_or_else(|| {
-                t(
+                text!(
                     "마스크 모델이 결과를 내지 않았습니다",
                     "The mask model returned nothing",
                 )
@@ -168,7 +168,7 @@ impl Segmenter {
         let grid = masks
             .get(best * GRID * GRID..(best + 1) * GRID * GRID)
             .ok_or_else(|| {
-                t(
+                text!(
                     "마스크 모델의 출력 크기가 예상과 다릅니다",
                     "Unexpected mask model output size",
                 )
@@ -197,13 +197,13 @@ pub fn load_segmenter() -> Result<Segmenter> {
 }
 
 /// 마스크 모델이 없으면 그 사실과 받는 방법을 알리는 문구. 있으면 None.
-pub fn missing() -> Option<String> {
+pub fn missing() -> Option<Text> {
     let dir = crate::gpu::model_dir().join(MODEL);
     if dir.join("encoder.onnx").exists() && dir.join("decoder.onnx").exists() {
         return None;
     }
     let dir = dir.display();
-    Some(t(
+    Some(text!(
         format!(
             "마스크 모델이 없습니다: {dir}\nfetch-models.sh를 실행해 받으세요 (실행 파일 옆이나 저장소의 scripts 폴더에 있습니다)."
         ),

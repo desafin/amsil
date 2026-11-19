@@ -4,7 +4,7 @@
 //! (`assets/clip/categories.txt`)와 견준다. 가장 가까운 분류가 답이다.
 
 use crate::Result;
-use crate::lang::t;
+use crate::lang::{t, text};
 use crate::preset::Preset;
 use crate::preview::Pixels;
 use ort::session::Session;
@@ -199,7 +199,7 @@ pub fn load_classifier() -> Result<Classifier> {
     let path = crate::gpu::model_dir().join(MODEL);
     if !path.exists() {
         let path = path.display();
-        return Err(t(
+        return Err(text!(
             format!("사진 분류 모델이 없습니다: {path}\nfetch-models.sh를 실행해 받으세요 (실행 파일 옆이나 저장소의 scripts 폴더에 있습니다)."),
             format!("The photo classification model is missing: {path}\nRun fetch-models.sh to download it (next to the program, or in the scripts folder of the repository)."),
         )

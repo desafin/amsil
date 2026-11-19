@@ -4,7 +4,7 @@
 use crate::edit::Params;
 use crate::frame::{Frame, Shot};
 use crate::gpu::{self, Denoiser};
-use crate::lang::t;
+use crate::lang::{Text, t, text};
 use crate::lut::Lut;
 use crate::mask::{self, Low, Mask, Segmenter};
 use crate::skin::{self, SkinFinder};
@@ -76,7 +76,7 @@ impl Default for Settings {
 }
 
 /// 변환은 됐지만 알려야 할 일이 있는 사진과 그 내용.
-pub type Warnings = Vec<(PathBuf, String)>;
+pub type Warnings = Vec<(PathBuf, Text)>;
 
 /// 현상이 끝난 사진: 바로 세운 sRGB 이미지와 출력 파일에 넣을 EXIF.
 pub struct Rendered {
@@ -197,11 +197,10 @@ impl Loaded {
             let Some(segmenter) = look.segmenter else {
                 return Err(mask::missing()
                     .unwrap_or_else(|| {
-                        t(
+                        text!(
                             "마스크 모델이 준비되지 않았습니다",
                             "The mask model is not loaded",
                         )
-                        .into()
                     })
                     .into());
             };
@@ -217,11 +216,10 @@ impl Loaded {
             let Some(finder) = look.skin_finder else {
                 return Err(skin::missing()
                     .unwrap_or_else(|| {
-                        t(
+                        text!(
                             "피부 보정 모델이 준비되지 않았습니다",
                             "The skin model is not loaded",
                         )
-                        .into()
                     })
                     .into());
             };
@@ -319,7 +317,7 @@ pub fn convert(
     denoise: Option<(&Mutex<Denoiser>, f32)>,
     look: Look,
     progress: &dyn Fn(f32),
-) -> Result<Option<String>> {
+) -> Result<Option<Text>> {
     let timing = Timing::start();
     let Rendered { image, exif } = render(input, denoise, look, progress)?;
     let encoded = heif::encode(&image, quality, Some(&exif), encoder_threads)?;
@@ -333,7 +331,7 @@ pub fn convert(
     std::fs::rename(&tmp, output)?;
     Ok((encoded.quality < quality).then(|| {
         let lowered = encoded.quality;
-        t(
+        text!(
             format!("파일이 너무 커져서 품질을 {quality}에서 {lowered}(으)로 낮췄습니다"),
             format!("The file got too large, so quality was lowered from {quality} to {lowered}"),
         )
@@ -343,27 +341,17 @@ pub fn convert(
 /// 내보내기의 결과를 로그에 남긴다: 실패한 사진과 이유, 알릴 일, 요약.
 fn record(outcome: &job::Outcome, warnings: &Warnings, seconds: f32) {
     for (file, reason) in &outcome.failed {
-        log::error(format!(
-            "{}: {}: {reason}",
-            t("실패", "Failed"),
-            file.display()
-        ));
+        log::error(format_args!("Failed: {}: {reason}", file.display()));
     }
     for (file, warning) in warnings {
-        log::warn(format!("{}: {warning}", file.display()));
+        log::warn(format_args!("{}: {warning}", file.display()));
     }
     if let Some(reason) = &outcome.stopped {
-        log::error(t(
-            format!("끝까지 처리하지 못했습니다: {reason}"),
-            format!("Stopped before finishing: {reason}"),
-        ));
+        log::error(format_args!("Stopped before finishing: {reason}"));
     }
     let (done, skipped, failed) = (outcome.done, outcome.skipped, outcome.failed.len());
-    log::info(t(
-        format!("내보내기 끝: 완료 {done}장, 건너뜀 {skipped}장, 실패 {failed}장 ({seconds:.1}초)"),
-        format!(
-            "Export finished: done {done}, skipped {skipped}, failed {failed} ({seconds:.1} s)"
-        ),
+    log::info(format!(
+        "Export finished: done {done}, skipped {skipped}, failed {failed} ({seconds:.1} s)"
     ));
 }
 
@@ -408,7 +396,7 @@ pub fn load_denoiser() -> Result<Denoiser> {
     let path = gpu::model_dir().join(gpu::DENOISE_MODEL);
     if !path.exists() {
         let path = path.display();
-        return Err(t(
+        return Err(text!(
             format!(
                 "노이즈 제거 모델이 없습니다: {path}\nfetch-models.sh를 실행해 받으세요 (실행 파일 옆이나 저장소의 scripts 폴더에 있습니다)."
             ),
@@ -422,13 +410,13 @@ pub fn load_denoiser() -> Result<Denoiser> {
 }
 
 /// GPU를 쓰지 못해 CPU로 돌고 있으면, 느리다는 것과 해결 방법을 알리는 문구.
-pub fn cpu_notice(denoiser: &Denoiser) -> Option<String> {
+pub fn cpu_notice(denoiser: &Denoiser) -> Option<Text> {
     let gpu::Backend::Cpu { reason } = &denoiser.backend else {
         return None;
     };
     // 2,400만 화소 사진 한 장이 48타일이다.
     let seconds = denoiser.tile_seconds * 48.0;
-    Some(t(
+    Some(text!(
         format!(
             "GPU 가속을 쓸 수 없어 CPU로 실행합니다. 노이즈 제거가 느립니다 \
              (2,400만 화소 사진 한 장에 약 {seconds:.0}초).\n\
@@ -564,10 +552,10 @@ pub fn run(
     mut report: impl FnMut(&Report),
 ) -> Result<(job::Outcome, Warnings)> {
     if photos.is_empty() {
-        return Err(t("변환할 사진이 없습니다", "No photos to convert").into());
+        return Err(text!("변환할 사진이 없습니다", "No photos to convert").into());
     }
     if denoiser.is_none() && photos.iter().any(|photo| photo.denoise > 0.0) {
-        return Err(t(
+        return Err(text!(
             "노이즈 제거 모델이 준비되지 않았습니다",
             "The denoise model is not loaded",
         )
@@ -585,10 +573,10 @@ pub fn run(
         .map(|photo| (photo.output.as_path(), photo))
         .collect();
     // LUT 파일은 한 번씩만 읽는다. 읽지 못한 것은 그 LUT을 쓰는 사진만 실패시킨다.
-    let luts: HashMap<&Path, std::result::Result<Lut, String>> = photos
+    let luts: HashMap<&Path, std::result::Result<Lut, Text>> = photos
         .iter()
         .filter_map(|photo| photo.lut.as_ref())
-        .map(|(file, _)| (file.as_path(), Lut::load(file).map_err(|e| e.to_string())))
+        .map(|(file, _)| (file.as_path(), Lut::load(file).map_err(|e| Text::of(&e))))
         .collect();
 
     let mut system = sysinfo::System::new()?;
@@ -610,9 +598,8 @@ pub fn run(
     let (workers, encoder_threads) = plan(cores(), settings.jobs, limit, per_photo, tasks.len());
     let budget = job::Budget::new(limit, workers);
     let (count, quality) = (tasks.len(), settings.quality);
-    log::info(t(
-        format!("내보내기 시작: {count}장 (동시에 {workers}장, 품질 {quality})"),
-        format!("Export started: {count} photos ({workers} at a time, quality {quality})"),
+    log::info(format!(
+        "Export started: {count} photos ({workers} at a time, quality {quality})"
     ));
     let started = Instant::now();
     let warnings = Mutex::new(Vec::new());
@@ -911,7 +898,7 @@ mod tests {
         .unwrap();
         assert_eq!((outcome.done, outcome.failed.len()), (1, 1));
         assert!(
-            outcome.failed[0].1.contains("없는 필름.cube"),
+            outcome.failed[0].1.to_string().contains("없는 필름.cube"),
             "{:?}",
             outcome.failed
         );
@@ -1171,7 +1158,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!((outcome.done, outcome.failed.len()), (1, 1));
         assert!(
-            outcome.failed[0].1.contains("마스크 모델"),
+            outcome.failed[0].1.to_string().contains("마스크 모델"),
             "{:?}",
             outcome.failed
         );

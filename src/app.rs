@@ -8,7 +8,7 @@ use crate::edit::Params;
 use crate::export::{self, Report};
 use crate::frame::Frame;
 use crate::job::Outcome;
-use crate::lang::{self, Lang, t};
+use crate::lang::{self, Lang, Text, t, text};
 use crate::log;
 use crate::mask::{Mask, Point};
 use crate::preset::{self, Preset};
@@ -30,11 +30,11 @@ pub struct App {
     /// 고를 수 있는 프리셋: 기본 프리셋 뒤에 사용자가 만든 것.
     pub presets: Vec<Preset>,
     /// 프리셋 추천(사진 분류)을 쓸 수 없는 이유. 쓸 수 있으면 None.
-    pub recommend_problem: Option<String>,
+    pub recommend_problem: Option<Text>,
     /// 마스크를 쓸 수 없는 이유. 쓸 수 있으면 None.
-    pub mask_problem: Option<String>,
+    pub mask_problem: Option<Text>,
     /// 피부 보정을 쓸 수 없는 이유. 쓸 수 있으면 None.
-    pub skin_problem: Option<String>,
+    pub skin_problem: Option<Text>,
 }
 
 /// AI 모델(노이즈 제거)의 실행 환경.
@@ -44,9 +44,9 @@ pub enum Backend {
     Unknown,
     Gpu,
     /// GPU를 못 써서 CPU로 돈다. 느리다는 안내와 해결 방법.
-    Cpu(String),
+    Cpu(Text),
     /// 모델을 쓸 수 없다 (파일이 없는 경우 등). 이유와 해결 방법.
-    Unavailable(String),
+    Unavailable(Text),
 }
 
 /// 열려 있는 프로젝트의 작업 상태.
@@ -101,7 +101,7 @@ pub struct Original {
     /// 그림이 바뀔 때마다 달라지는 번호. 화면 쪽에서 텍스처를 다시 올릴지 아는 데 쓴다.
     pub serial: u64,
     /// 만들지 못했으면 그 이유.
-    pub pixels: std::result::Result<Pixels, String>,
+    pub pixels: std::result::Result<Pixels, Text>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -239,22 +239,22 @@ pub enum Action {
     PreviewReady {
         generation: u64,
         index: usize,
-        result: std::result::Result<Pixels, String>,
+        result: std::result::Result<Pixels, Text>,
     },
     OriginalReady {
         generation: u64,
         index: usize,
-        result: std::result::Result<Pixels, String>,
+        result: std::result::Result<Pixels, Text>,
     },
     ExportProgress(Report),
-    ExportFinished(std::result::Result<(Outcome, export::Warnings), String>),
+    ExportFinished(std::result::Result<(Outcome, export::Warnings), Text>),
     Backend(Backend),
     /// 프리셋 추천을 쓸 수 있는지. 쓸 수 없으면 그 이유.
-    Recommender(Option<String>),
+    Recommender(Option<Text>),
     /// 마스크를 쓸 수 있는지. 쓸 수 없으면 그 이유.
-    Segmenter(Option<String>),
+    Segmenter(Option<Text>),
     /// 피부 보정을 쓸 수 있는지. 쓸 수 없으면 그 이유.
-    SkinModel(Option<String>),
+    SkinModel(Option<Text>),
 }
 
 /// 화면 밖에서 해야 할 일.
@@ -320,7 +320,7 @@ impl App {
             Ok(effects) => effects,
             Err(error) => {
                 // 화면에 띄운 오류는 로그에도 남긴다 (알림은 다음 알림에 덮여 사라진다).
-                log::error(error.to_string());
+                log::error(&error);
                 self.notice = Some(error.to_string());
                 Vec::new()
             }
@@ -348,7 +348,7 @@ impl App {
             Action::Backend(backend) => {
                 match &backend {
                     Backend::Unknown => {}
-                    Backend::Gpu => log::info(t("AI 실행: GPU", "AI backend: GPU")),
+                    Backend::Gpu => log::info("AI backend: GPU"),
                     Backend::Cpu(notice) | Backend::Unavailable(notice) => log::warn(notice),
                 }
                 self.backend = backend;
@@ -422,7 +422,7 @@ impl App {
             }
             Action::CloseProject => {
                 if matches!(open.export, ExportState::Running { .. }) {
-                    return Err(t(
+                    return Err(text!(
                         "내보내는 중에는 프로젝트를 닫을 수 없습니다. 먼저 취소하세요.",
                         "The project cannot be closed while exporting. Cancel the export first.",
                     )
@@ -438,7 +438,7 @@ impl App {
                     .iter()
                     .any(|folder| folder.path == path)
                 {
-                    return Err(t(
+                    return Err(text!(
                         "이미 가져온 폴더입니다",
                         "This folder has already been imported",
                     )
@@ -447,7 +447,7 @@ impl App {
                 let files = crate::job::scan(&path)?;
                 if files.is_empty() {
                     let path = path.display();
-                    return Err(t(
+                    return Err(text!(
                         format!("이 폴더에는 RAW 파일이 없습니다: {path}"),
                         format!("No RAW files in this folder: {path}"),
                     )
@@ -641,9 +641,11 @@ impl App {
                     return Ok(effects);
                 }
                 let Some(out) = open.project.export.folder.clone() else {
-                    return Err(
-                        t("출력 폴더를 먼저 정하세요", "Choose an output folder first").into(),
-                    );
+                    return Err(text!(
+                        "출력 폴더를 먼저 정하세요",
+                        "Choose an output folder first"
+                    )
+                    .into());
                 };
                 let names = open.project.export_names();
                 let photos: Vec<export::Photo> = (0..open.photos.len())
@@ -666,7 +668,7 @@ impl App {
                     })
                     .collect();
                 if photos.is_empty() {
-                    return Err(t("내보낼 사진이 없습니다", "No photos to export").into());
+                    return Err(text!("내보낼 사진이 없습니다", "No photos to export").into());
                 }
                 let existing = photos.iter().filter(|photo| photo.output.exists()).count();
                 if existing > 0 {
@@ -754,7 +756,7 @@ impl App {
             Action::ExportFinished(result) => {
                 open.export = match result {
                     Ok((outcome, warnings)) => ExportState::Finished { outcome, warnings },
-                    Err(error) => ExportState::Failed(error),
+                    Err(error) => ExportState::Failed(error.to_string()),
                 };
             }
         }
@@ -1393,11 +1395,11 @@ mod tests {
         fx.app.handle(Action::OriginalReady {
             generation: second,
             index: 1,
-            result: Err("broken".into()),
+            result: Err(Text::of("broken")),
         });
         let original = fx.open().original.as_ref().unwrap();
         assert_eq!(original.index, 1);
-        assert_eq!(original.pixels, Err("broken".to_string()));
+        assert_eq!(original.pixels, Err(Text::of("broken")));
         // 만들지 못한 사진은 다시 고르면 다시 요청한다.
         let effects = fx.app.handle(Action::Select {
             index: 1,
@@ -1468,8 +1470,8 @@ mod tests {
         let mut fx = Fixture::new("backend");
         assert_eq!(fx.app.backend, Backend::Unknown);
         fx.app
-            .handle(Action::Backend(Backend::Cpu("느립니다".into())));
-        assert_eq!(fx.app.backend, Backend::Cpu("느립니다".into()));
+            .handle(Action::Backend(Backend::Cpu(Text::of("느립니다"))));
+        assert_eq!(fx.app.backend, Backend::Cpu(Text::of("느립니다")));
     }
 
     #[test]
@@ -1894,7 +1896,7 @@ mod tests {
         let outcome = Outcome {
             done: 2,
             skipped: 0,
-            failed: vec![("c.ARW".into(), "읽을 수 없음".into())],
+            failed: vec![("c.ARW".into(), Text::of("읽을 수 없음"))],
             stopped: None,
         };
         fx.app
@@ -1913,7 +1915,7 @@ mod tests {
             only_selected: false,
         });
         fx.app
-            .handle(Action::ExportFinished(Err("모델이 없습니다".into())));
+            .handle(Action::ExportFinished(Err(Text::of("모델이 없습니다"))));
         assert_eq!(
             fx.open().export,
             ExportState::Failed("모델이 없습니다".into())
@@ -2073,8 +2075,8 @@ mod tests {
         let mut fx = Fixture::new("no-clip");
         assert_eq!(fx.app.recommend_problem, None);
         fx.app
-            .handle(Action::Recommender(Some("모델이 없습니다".into())));
-        assert_eq!(fx.app.recommend_problem.as_deref(), Some("모델이 없습니다"));
+            .handle(Action::Recommender(Some(Text::of("모델이 없습니다"))));
+        assert_eq!(fx.app.recommend_problem, Some(Text::of("모델이 없습니다")));
         fx.app.handle(Action::Recommender(None));
         assert_eq!(fx.app.recommend_problem, None);
     }
@@ -2244,8 +2246,8 @@ mod tests {
     fn a_missing_mask_model_is_remembered_with_its_reason() {
         let mut fx = Fixture::new("no-sam");
         fx.app
-            .handle(Action::Segmenter(Some("모델이 없습니다".into())));
-        assert_eq!(fx.app.mask_problem.as_deref(), Some("모델이 없습니다"));
+            .handle(Action::Segmenter(Some(Text::of("모델이 없습니다"))));
+        assert_eq!(fx.app.mask_problem, Some(Text::of("모델이 없습니다")));
         fx.app.handle(Action::Segmenter(None));
         assert_eq!(fx.app.mask_problem, None);
     }
@@ -2298,8 +2300,8 @@ mod tests {
     fn a_missing_skin_model_is_remembered_with_its_reason() {
         let mut fx = Fixture::new("no-skin");
         fx.app
-            .handle(Action::SkinModel(Some("모델이 없습니다".into())));
-        assert_eq!(fx.app.skin_problem.as_deref(), Some("모델이 없습니다"));
+            .handle(Action::SkinModel(Some(Text::of("모델이 없습니다"))));
+        assert_eq!(fx.app.skin_problem, Some(Text::of("모델이 없습니다")));
         fx.app.handle(Action::SkinModel(None));
         assert_eq!(fx.app.skin_problem, None);
     }

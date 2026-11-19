@@ -2,6 +2,7 @@
 
 use crate::app::{Action, Backend, Effect};
 use crate::gpu::Denoiser;
+use crate::lang::Text;
 use crate::lut::Lut;
 use crate::mask::{self, Low, Mask, Point, Segmenter};
 use crate::recommend::{self, Classifier};
@@ -127,49 +128,49 @@ impl Workers {
         });
     }
 
-    fn denoiser(&self) -> std::result::Result<SharedDenoiser, String> {
+    fn denoiser(&self) -> std::result::Result<SharedDenoiser, Text> {
         let mut slot = self.denoiser.lock().unwrap();
         if let Some(denoiser) = slot.as_ref() {
             return Ok(denoiser.clone());
         }
         // 실패는 기억해 두지 않는다. 모델 파일을 받아 놓으면 다음에는 읽힌다.
         let denoiser = Arc::new(Mutex::new(
-            export::load_denoiser().map_err(|e| e.to_string())?,
+            export::load_denoiser().map_err(|e| Text::of(&e))?,
         ));
         *slot = Some(denoiser.clone());
         Ok(denoiser)
     }
 
-    fn classifier(&self) -> std::result::Result<Arc<Mutex<Classifier>>, String> {
+    fn classifier(&self) -> std::result::Result<Arc<Mutex<Classifier>>, Text> {
         let mut slot = self.classifier.lock().unwrap();
         if let Some(classifier) = slot.as_ref() {
             return Ok(classifier.clone());
         }
         let classifier = Arc::new(Mutex::new(
-            recommend::load_classifier().map_err(|e| e.to_string())?,
+            recommend::load_classifier().map_err(|e| Text::of(&e))?,
         ));
         *slot = Some(classifier.clone());
         Ok(classifier)
     }
 
-    fn segmenter(&self) -> std::result::Result<Arc<Mutex<Segmenter>>, String> {
+    fn segmenter(&self) -> std::result::Result<Arc<Mutex<Segmenter>>, Text> {
         let mut slot = self.segmenter.lock().unwrap();
         if let Some(segmenter) = slot.as_ref() {
             return Ok(segmenter.clone());
         }
         let segmenter = Arc::new(Mutex::new(
-            mask::load_segmenter().map_err(|e| e.to_string())?,
+            mask::load_segmenter().map_err(|e| Text::of(&e))?,
         ));
         *slot = Some(segmenter.clone());
         Ok(segmenter)
     }
 
-    fn skin_finder(&self) -> std::result::Result<Arc<Mutex<SkinFinder>>, String> {
+    fn skin_finder(&self) -> std::result::Result<Arc<Mutex<SkinFinder>>, Text> {
         let mut slot = self.skin_finder.lock().unwrap();
         if let Some(finder) = slot.as_ref() {
             return Ok(finder.clone());
         }
-        let finder = Arc::new(Mutex::new(skin::load_finder().map_err(|e| e.to_string())?));
+        let finder = Arc::new(Mutex::new(skin::load_finder().map_err(|e| Text::of(&e))?));
         *slot = Some(finder.clone());
         Ok(finder)
     }
@@ -180,7 +181,7 @@ impl Workers {
         base: &Base,
         masks: &[Mask],
         skin: f32,
-    ) -> std::result::Result<export::Areas, String> {
+    ) -> std::result::Result<export::Areas, Text> {
         /// 사진 한 장에 기억해 두는 마스크 영역의 수.
         const REMEMBERED: usize = 16;
         let mut areas = export::Areas::default();
@@ -195,7 +196,7 @@ impl Workers {
                         let embedding = Arc::new(
                             segmenter
                                 .embed(&base.loaded.model_picture())
-                                .map_err(|e| e.to_string())?,
+                                .map_err(|e| Text::of(&e))?,
                         );
                         *slot = Some(embedding.clone());
                         embedding
@@ -210,7 +211,7 @@ impl Workers {
                 }
                 let area = segmenter
                     .select(&embedding, &mask.points)
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| Text::of(&e))?;
                 if known.len() >= REMEMBERED {
                     known.remove(0);
                 }
@@ -226,7 +227,7 @@ impl Workers {
                     .lock()
                     .unwrap()
                     .find(&base.loaded.model_picture())
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| Text::of(&e))?;
                 *slot = Some(found);
             }
             areas.skin = slot.clone();
@@ -236,7 +237,7 @@ impl Workers {
 
     /// 사진을 읽는다. 방금 읽은 사진(같은 노이즈 제거 레벨)이면 다시 읽지 않는다.
     /// 여러 요청이 동시에 와도 한 번만 읽도록, 읽는 동안 잠금을 쥐고 있는다.
-    fn base(&self, path: &Path, denoise: f32) -> std::result::Result<Arc<Base>, String> {
+    fn base(&self, path: &Path, denoise: f32) -> std::result::Result<Arc<Base>, Text> {
         let mut slot = self.base.lock().unwrap();
         if let Some(base) = slot
             .as_ref()
@@ -250,7 +251,7 @@ impl Workers {
             None
         };
         let model = denoiser.as_deref().map(|model| (model, denoise));
-        let loaded = export::load(path, model, &|_| {}).map_err(|e| e.to_string())?;
+        let loaded = export::load(path, model, &|_| {}).map_err(|e| Text::of(&e))?;
         let small = preview::downscale(&loaded.cam, QUICK_SIDE);
         let base = Arc::new(Base {
             path: path.to_owned(),
@@ -266,12 +267,12 @@ impl Workers {
     }
 
     // ponytail: 경로만 보고 재사용한다. 프로그램을 켜 둔 채 LUT 파일을 고치면 사진을 다시 골라도 옛 내용이 보인다.
-    fn lut(&self, path: &Path) -> std::result::Result<Arc<Lut>, String> {
+    fn lut(&self, path: &Path) -> std::result::Result<Arc<Lut>, Text> {
         let mut slot = self.lut.lock().unwrap();
         if let Some((_, lut)) = slot.as_ref().filter(|(cached, _)| cached == path) {
             return Ok(lut.clone());
         }
-        let lut = Arc::new(Lut::load(path).map_err(|e| e.to_string())?);
+        let lut = Arc::new(Lut::load(path).map_err(|e| Text::of(&e))?);
         *slot = Some((path.to_owned(), lut.clone()));
         Ok(lut)
     }
@@ -327,7 +328,7 @@ impl Workers {
                             result: Ok(pixels),
                         });
                     };
-                    let result = (|| -> std::result::Result<(), String> {
+                    let result = (|| -> std::result::Result<(), Text> {
                         let lut = match &lut {
                             Some((file, strength)) => Some((workers.lut(file)?, *strength)),
                             None => None,
@@ -403,7 +404,7 @@ impl Workers {
                             );
                             preview::shrink(&full, workers.preview_side.load(SeqCst) as usize)
                         })
-                        .map_err(|e| e.to_string());
+                        .map_err(|e| Text::of(&e));
                     if !stale() {
                         workers.send(Action::OriginalReady {
                             generation,
@@ -445,7 +446,7 @@ impl Workers {
                                 workers.send(Action::ExportProgress(*report));
                             },
                         )
-                        .map_err(|e| e.to_string())
+                        .map_err(|e| Text::of(&e))
                     })();
                     workers.send(Action::ExportFinished(result));
                 });

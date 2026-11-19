@@ -2,7 +2,7 @@
 
 use crate::Result;
 use crate::denoise::TILE;
-use crate::lang::t;
+use crate::lang::text;
 use ort::environment::Environment;
 use ort::ep;
 use ort::session::Session;
@@ -81,7 +81,7 @@ impl Denoiser {
         // 첫 실행은 준비 작업이 섞여 느리다. 동작 확인에 쓰고, 두 번째 실행으로 시간을 잰다.
         let probe = vec![0.1; 4 * TILE * TILE];
         if denoiser.infer(&probe)?.iter().any(|v| !v.is_finite()) {
-            return Err(t(
+            return Err(text!(
                 "모델이 올바른 값을 내지 못했습니다",
                 "The model produced invalid values",
             )

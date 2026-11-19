@@ -3,7 +3,7 @@
 use crate::edit::Params;
 use crate::export::{self, Look, Photo, Report, Settings};
 use crate::frame::{Frame, Layout};
-use crate::lang::t;
+use crate::lang::{Text, t, text};
 use crate::{Result, job, preset};
 use std::ffi::OsString;
 use std::io::IsTerminal;
@@ -79,7 +79,7 @@ Options:
     )
 }
 
-pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> std::result::Result<Args, String> {
+pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> std::result::Result<Args, Text> {
     let (mut denoise, mut overwrite, mut jobs, mut memory_gb) = (0.0, false, None, None);
     let (mut preset, mut strength) = (None, 1.0);
     let (mut lut, mut lut_strength) = (None, 1.0);
@@ -103,20 +103,20 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> std::result::Resu
                     .parse()
                     .ok()
                     .filter(|strength| (0.0..=1.0).contains(strength))
-                    .ok_or(t(
+                    .ok_or(text!(
                         "노이즈 제거 강도는 0에서 1 사이의 숫자여야 합니다",
                         "The denoise level must be a number from 0 to 1",
                     ))?;
             }
             ("--overwrite", None) => overwrite = true,
             ("--jobs", Some(value)) => {
-                jobs = Some(value.parse().ok().filter(|&n| n >= 1).ok_or(t(
+                jobs = Some(value.parse().ok().filter(|&n| n >= 1).ok_or(text!(
                     "--jobs에는 1 이상의 정수를 줘야 합니다",
                     "--jobs needs a whole number, 1 or more",
                 ))?);
             }
             ("--memory", Some(value)) => {
-                memory_gb = Some(value.parse().ok().filter(|&gb| gb > 0.0).ok_or(t(
+                memory_gb = Some(value.parse().ok().filter(|&gb| gb > 0.0).ok_or(text!(
                     "--memory에는 0보다 큰 숫자(GB)를 줘야 합니다",
                     "--memory needs a number above 0 (in GB)",
                 ))?);
@@ -127,7 +127,7 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> std::result::Resu
                     .parse()
                     .ok()
                     .filter(|strength| (0.0..=1.5).contains(strength))
-                    .ok_or(t(
+                    .ok_or(text!(
                         "프리셋 강도는 0에서 1.5 사이의 숫자여야 합니다",
                         "The preset strength must be a number from 0 to 1.5",
                     ))?;
@@ -138,7 +138,7 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> std::result::Resu
                     .parse()
                     .ok()
                     .filter(|strength| (0.0..=1.0).contains(strength))
-                    .ok_or(t(
+                    .ok_or(text!(
                         "LUT 강도는 0에서 1 사이의 숫자여야 합니다",
                         "The LUT strength must be a number from 0 to 1",
                     ))?;
@@ -150,7 +150,7 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> std::result::Resu
                     .parse()
                     .ok()
                     .filter(|quality| export::QUALITY_RANGE.contains(quality))
-                    .ok_or(t(
+                    .ok_or(text!(
                         "품질은 40에서 100 사이의 정수여야 합니다",
                         "The quality must be a whole number from 40 to 100",
                     ))?;
@@ -161,13 +161,13 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> std::result::Resu
                     .parse()
                     .ok()
                     .filter(|amount| (0.0..=1.0).contains(amount))
-                    .ok_or(t(
+                    .ok_or(text!(
                         "피부 보정의 세기는 0에서 1 사이의 숫자여야 합니다",
                         "The skin amount must be a number from 0 to 1",
                     ))?;
             }
             _ => {
-                return Err(t(
+                return Err(text!(
                     format!("모르는 옵션: {option}"),
                     format!("Unknown option: {option}"),
                 ));
@@ -175,11 +175,10 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> std::result::Resu
         }
     }
     if frame_black && layout.is_none() {
-        return Err(t(
+        return Err(text!(
             "--frame-black은 --frame과 함께 써야 합니다",
             "--frame-black needs --frame",
-        )
-        .into());
+        ));
     }
     let frame = layout.map(|layout| Frame {
         layout,
@@ -201,11 +200,10 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> std::result::Resu
             skin,
             quality,
         }),
-        Err(_) => Err(t(
+        Err(_) => Err(text!(
             "입력과 출력을 하나씩 지정해야 합니다",
             "Give exactly one input and one output",
-        )
-        .into()),
+        )),
     }
 }
 
@@ -260,7 +258,7 @@ fn params(args: &Args) -> Result<Params> {
     {
         let known: Vec<&str> = presets.iter().map(|p| p.id.as_str()).collect();
         let known = known.join(", ");
-        return Err(t(
+        return Err(text!(
             format!("모르는 프리셋: {id}\n쓸 수 있는 프리셋: {known}"),
             format!("Unknown preset: {id}\nAvailable presets: {known}"),
         )
@@ -301,7 +299,7 @@ fn run_folder(
 ) -> Result<(job::Outcome, export::Warnings)> {
     let files = job::scan(&args.input)?;
     if files.is_empty() {
-        return Err(t("RAW 파일을 찾지 못했습니다", "No RAW files found").into());
+        return Err(text!("RAW 파일을 찾지 못했습니다", "No RAW files found").into());
     }
     let inputs: Vec<PathBuf> = files.iter().map(|file| args.input.join(file)).collect();
     let params = params_for(args, &inputs)?;
@@ -383,10 +381,10 @@ pub fn run(args: &Args) -> Result<()> {
             &|_| {},
         )?;
         if let Some(warning) = warning {
-            crate::log::warn(format!("{}: {warning}", args.input.display()));
+            crate::log::warn(format_args!("{}: {warning}", args.input.display()));
             eprintln!("{}: {warning}", t("경고", "Warning"));
         }
-        crate::log::info(format!("{}: {}", t("완료", "Done"), args.output.display()));
+        crate::log::info(format!("Done: {}", args.output.display()));
         eprintln!("{}: {}", t("완료", "Done"), args.output.display());
         return Ok(());
     }
@@ -423,12 +421,12 @@ pub fn run(args: &Args) -> Result<()> {
         eprintln!("  {}: {}: {reason}", t("실패", "Failed"), file.display());
     }
     match outcome.stopped {
-        Some(reason) => Err(t(
+        Some(reason) => Err(text!(
             format!("끝까지 처리하지 못했습니다: {reason}"),
             format!("Stopped before finishing: {reason}"),
         )
         .into()),
-        None if !outcome.failed.is_empty() => Err(t(
+        None if !outcome.failed.is_empty() => Err(text!(
             "일부 사진을 변환하지 못했습니다",
             "Some photos could not be converted",
         )
@@ -442,7 +440,7 @@ mod tests {
     use super::*;
     use crate::sample_arw;
 
-    fn args(list: &[&str]) -> std::result::Result<Args, String> {
+    fn args(list: &[&str]) -> std::result::Result<Args, Text> {
         parse_args(list.iter().map(OsString::from))
     }
 
@@ -599,18 +597,18 @@ mod tests {
     fn usage_and_errors_follow_the_language() {
         assert!(usage().starts_with("사용법"));
         assert_eq!(
-            args(&["--nope", "in", "out"]).unwrap_err(),
+            args(&["--nope", "in", "out"]).unwrap_err().to_string(),
             "모르는 옵션: --nope"
         );
         crate::lang::set(crate::lang::Lang::En);
         assert!(usage().starts_with("Usage"));
         assert!(usage().contains("--lut-strength"));
         assert_eq!(
-            args(&["--nope", "in", "out"]).unwrap_err(),
+            args(&["--nope", "in", "out"]).unwrap_err().to_string(),
             "Unknown option: --nope"
         );
         assert_eq!(
-            args(&["in"]).unwrap_err(),
+            args(&["in"]).unwrap_err().to_string(),
             "Give exactly one input and one output"
         );
     }
@@ -638,6 +636,7 @@ mod tests {
         assert!(
             args(&["--frame=round", "in", "out"])
                 .unwrap_err()
+                .to_string()
                 .contains("round")
         );
         assert!(

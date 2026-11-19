@@ -1,7 +1,7 @@
 //! 프레임: 사진 둘레에 여백을 두르고 촬영 정보를 적는다.
 
 use crate::Image;
-use crate::lang::t;
+use crate::lang::{Text, text};
 use ab_glyph::{Font, FontRef, ScaleFont};
 use serde::{Deserialize, Serialize};
 
@@ -39,9 +39,9 @@ pub enum Layout {
 const MAX_RATIO: u32 = 3;
 
 impl std::str::FromStr for Layout {
-    type Err = String;
+    type Err = Text;
 
-    fn from_str(text: &str) -> Result<Self, String> {
+    fn from_str(text: &str) -> Result<Self, Text> {
         let ratio = || {
             let (w, h) = text.split_once(':')?;
             let (w, h): (u32, u32) = (w.parse().ok()?, h.parse().ok()?);
@@ -51,7 +51,7 @@ impl std::str::FromStr for Layout {
             "band" => Ok(Layout::Band),
             "border" => Ok(Layout::Border),
             _ => ratio().ok_or_else(|| {
-                t(
+                text!(
                     format!(
                         "모르는 프레임 모양: {text} (band, border 또는 4:5 같은 비율. 비율은 3:1보다 길쭉할 수 없습니다)"
                     ),
@@ -75,8 +75,8 @@ impl std::fmt::Display for Layout {
 }
 
 impl TryFrom<String> for Layout {
-    type Error = String;
-    fn try_from(text: String) -> Result<Self, String> {
+    type Error = Text;
+    fn try_from(text: String) -> Result<Self, Text> {
         text.parse()
     }
 }

@@ -5,7 +5,7 @@
 use crate::Result;
 use crate::edit::Params;
 use crate::frame::Frame;
-use crate::lang::t;
+use crate::lang::{t, text};
 use crate::mask::Mask;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -133,14 +133,14 @@ impl Project {
             version: u32,
         }
         let header: Header = toml::from_str(&text).map_err(|e| {
-            t(
+            text!(
                 format!("프로젝트 파일이 아닙니다 ({e})"),
                 format!("Not a project file ({e})"),
             )
         })?;
         if header.version != VERSION {
             let found = header.version;
-            return Err(t(
+            return Err(text!(
                 format!(
                     "이 프로젝트 파일은 버전 {found}이고, 이 프로그램은 버전 {VERSION}만 읽을 수 있습니다"
                 ),
@@ -151,7 +151,7 @@ impl Project {
             .into());
         }
         Ok(toml::from_str(&text).map_err(|e| {
-            t(
+            text!(
                 format!("프로젝트 파일을 읽을 수 없습니다 ({e})"),
                 format!("Cannot read the project file ({e})"),
             )

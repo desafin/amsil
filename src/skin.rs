@@ -5,7 +5,7 @@
 //! 얼룩만 줄인다. 눈·입술 같은 뚜렷한 윤곽은 차이가 커서 건드리지 않는다.
 
 use crate::develop::box_blur;
-use crate::lang::t;
+use crate::lang::{Text, text};
 use crate::mask::Low;
 use crate::preview::Pixels;
 use crate::{Image, Result};
@@ -74,7 +74,7 @@ impl SkinFinder {
         let outputs = self.session.run(ort::inputs![input])?;
         let (_, scores) = outputs[0].try_extract_tensor::<f32>()?;
         if scores.len() != SIDE * SIDE * CLASSES {
-            return Err(t(
+            return Err(text!(
                 "피부를 찾는 모델의 출력 크기가 예상과 다릅니다",
                 "Unexpected output size from the skin model",
             )
@@ -97,13 +97,13 @@ pub fn load_finder() -> Result<SkinFinder> {
 }
 
 /// 피부를 찾는 모델이 없으면 그 사실과 받는 방법을 알리는 문구. 있으면 None.
-pub fn missing() -> Option<String> {
+pub fn missing() -> Option<Text> {
     let path = crate::gpu::model_dir().join(MODEL);
     if path.exists() {
         return None;
     }
     let path = path.display();
-    Some(t(
+    Some(text!(
         format!(
             "피부 보정 모델이 없습니다: {path}\nfetch-models.sh를 실행해 받으세요 (실행 파일 옆이나 저장소의 scripts 폴더에 있습니다)."
         ),

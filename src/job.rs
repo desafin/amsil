@@ -1,7 +1,7 @@
 //! 일괄 처리: 폴더 탐색, 메모리 예산 안에서의 동시 실행, 진행률과 남은 시간.
 
 use crate::Result;
-use crate::lang::t;
+use crate::lang::{Text, t, text};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::SeqCst;
@@ -237,9 +237,9 @@ pub struct Outcome {
     pub done: usize,
     pub skipped: usize,
     /// 실패한 입력 파일과 이유.
-    pub failed: Vec<(PathBuf, String)>,
+    pub failed: Vec<(PathBuf, Text)>,
     /// 배치가 끝까지 가지 못했으면 그 이유.
-    pub stopped: Option<String>,
+    pub stopped: Option<Text>,
 }
 
 /// 배치를 실행한다. 한 장이 실패해도 나머지는 계속한다. `tick`은 0.2초마다, 그리고 끝날 때 한 번 불린다.
@@ -285,11 +285,10 @@ pub fn run_batch(batch: &Batch, mut tick: impl FnMut(&Status)) -> Outcome {
                             Err(error) => {
                                 if is_disk_full(error.as_ref()) {
                                     stop.store(true, SeqCst);
-                                    outcome.stopped = Some(
-                                        t("디스크가 가득 찼습니다", "The disk is full").into(),
-                                    );
+                                    outcome.stopped =
+                                        Some(text!("디스크가 가득 찼습니다", "The disk is full"));
                                 }
-                                outcome.failed.push((task.input.clone(), error.to_string()));
+                                outcome.failed.push((task.input.clone(), Text::of(&error)));
                             }
                         }
                         finished.fetch_add(1, SeqCst);
@@ -309,7 +308,7 @@ pub fn run_batch(batch: &Batch, mut tick: impl FnMut(&Status)) -> Outcome {
         && batch.cancel.load(SeqCst)
         && outcome.done + outcome.skipped + outcome.failed.len() < total
     {
-        outcome.stopped = Some(t("취소했습니다", "Cancelled").into());
+        outcome.stopped = Some(text!("취소했습니다", "Cancelled"));
     }
     tick(&Status {
         total,
@@ -344,7 +343,7 @@ fn run_one(batch: &Batch, task: &Task, stop: &AtomicBool, partial: &AtomicU32) -
     if cost > batch.budget.limit && cost > available {
         const GB: f64 = (1u64 << 30) as f64;
         let (needed, free) = (cost as f64 / GB, available as f64 / GB);
-        return Err(t(
+        return Err(text!(
             format!("메모리 부족 (필요 {needed:.1}GB, 사용 가능 {free:.1}GB)"),
             format!("Not enough memory (needs {needed:.1} GB, {free:.1} GB available)"),
         )
@@ -689,7 +688,11 @@ mod tests {
             (outcome.done, outcome.skipped, outcome.stopped),
             (3, 0, None)
         );
-        let mut failed = outcome.failed;
+        let mut failed: Vec<(PathBuf, String)> = outcome
+            .failed
+            .into_iter()
+            .map(|(file, reason)| (file, reason.to_string()))
+            .collect();
         failed.sort();
         assert_eq!(
             failed,
@@ -751,7 +754,7 @@ mod tests {
         );
         assert_eq!(calls.load(SeqCst), 1);
         assert_eq!(outcome.failed.len(), 1);
-        assert!(outcome.stopped.unwrap().contains("디스크"));
+        assert!(outcome.stopped.unwrap().to_string().contains("디스크"));
     }
 
     #[test]
@@ -809,6 +812,7 @@ mod tests {
         assert_eq!(outcome.done, 1);
         assert_eq!(outcome.failed.len(), 1);
         let (file, reason) = &outcome.failed[0];
+        let reason = reason.to_string();
         assert_eq!(file, Path::new("huge.ARW"));
         assert!(
             reason.contains("메모리") && reason.contains("40.0") && reason.contains("16.0"),

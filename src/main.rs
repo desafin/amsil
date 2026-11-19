@@ -41,12 +41,10 @@ fn main() -> std::process::ExitCode {
     log::init();
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     log::info(format!(
-        "{} {} {}: {}",
-        t("암실", "Amsil"),
+        "Amsil {} started: {}",
         env!("CARGO_PKG_VERSION"),
-        t("시작", "started"),
         if arguments.is_empty() {
-            t("창", "window").to_owned()
+            "window".to_owned()
         } else {
             arguments.join(" ")
         }
@@ -57,10 +55,7 @@ fn main() -> std::process::ExitCode {
         return match gui::run() {
             Ok(()) => std::process::ExitCode::SUCCESS,
             Err(e) => {
-                log::error(t(
-                    format!("창을 열 수 없습니다: {e}"),
-                    format!("Could not open a window: {e}"),
-                ));
+                log::error(format!("Could not open a window: {e}"));
                 eprintln!(
                     "{}\n{}",
                     t(
@@ -98,7 +93,7 @@ fn main() -> std::process::ExitCode {
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
-            log::error(e.to_string());
+            log::error(&e);
             eprintln!("{}: {e}", t("실패", "Failed"));
             std::process::ExitCode::FAILURE
         }

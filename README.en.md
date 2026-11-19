@@ -294,10 +294,10 @@ The full list of what ships in the release archive is in [THIRD-PARTY.md](THIRD-
 | AI models | `~/.local/share/amsil/models/` (change it with `AMSIL_MODELS`) |
 | Log | `~/.local/state/amsil/log.txt` |
 
-**Log.** So that you can find out what went wrong when something does, Amsil records what happens in one file. Click **[Open log]** in the window to open it. The command line writes to the same file.
+**Log.** So that you can find out what went wrong when something does, Amsil records what happens in one file. Click **[Open log]** in the window to open it. The command line writes to the same file. The log is always in English, whatever language the interface is in, so it is easy to share and to search for an error message.
 
 ```
-2026-11-18 15:19:49 [info] Amsil 0.1.0 started: photos out
+2026-11-18 15:19:49 [info] Amsil 0.2.0 started: photos out
 2026-11-18 15:19:50 [info] Export started: 3 photos (3 at a time, quality 55)
 2026-11-18 15:19:52 [error] Failed: photos/broken.ARW: Unsupported or damaged RAW file (…)
 2026-11-18 15:19:58 [info] Export finished: done 2, skipped 0, failed 1 (8.1 s)

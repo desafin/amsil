@@ -2,9 +2,13 @@
 //!
 //! 프로그램 전체가 파일 하나(`~/.local/state/amsil/log.txt`)에 쓴다. `init`을 부르기 전에는
 //! 아무것도 쓰지 않으므로, 테스트가 사용자의 로그 파일을 건드리지 않는다.
+//!
+//! 로그는 화면의 언어와 상관없이 영어로 쓴다. 누구에게 보여 주거나 검색하기 쉽게.
+//! 화면에도 나오는 글(오류 등)은 [`Text`](crate::lang::Text)로 넘기면 그 영어 쪽이 남는다.
 
-use crate::lang::t;
+use crate::lang::{self, Lang, t};
 use std::ffi::OsString;
+use std::fmt::Display;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -24,9 +28,9 @@ pub enum Level {
 impl Level {
     fn label(self) -> &'static str {
         match self {
-            Level::Info => t("정보", "info"),
-            Level::Warn => t("경고", "warn"),
-            Level::Error => t("오류", "error"),
+            Level::Info => "info",
+            Level::Warn => "warn",
+            Level::Error => "error",
         }
     }
 }
@@ -117,34 +121,36 @@ pub fn init() {
         {
             logger.write(
                 Level::Error,
-                &t(
-                    format!("프로그램이 예기치 않게 멈췄습니다: {info}"),
-                    format!("The program stopped unexpectedly: {info}"),
-                ),
+                &format!("The program stopped unexpectedly: {info}"),
             );
         }
         default(info);
     }));
 }
 
-fn write(level: Level, text: &str) {
+/// 영어로 그려서 쓴다. `Text`나 그것을 담은 오류는 영어 쪽이 나온다.
+fn write(level: Level, text: &dyn Display) {
     if let Ok(mut logger) = LOGGER.lock()
         && let Some(logger) = logger.as_mut()
     {
-        logger.write(level, text);
+        logger.write(level, &english(text));
     }
 }
 
-pub fn info(text: impl AsRef<str>) {
-    write(Level::Info, text.as_ref());
+fn english(text: &dyn Display) -> String {
+    lang::with(Lang::En, || text.to_string())
 }
 
-pub fn warn(text: impl AsRef<str>) {
-    write(Level::Warn, text.as_ref());
+pub fn info(text: impl Display) {
+    write(Level::Info, &text);
 }
 
-pub fn error(text: impl AsRef<str>) {
-    write(Level::Error, text.as_ref());
+pub fn warn(text: impl Display) {
+    write(Level::Warn, &text);
+}
+
+pub fn error(text: impl Display) {
+    write(Level::Error, &text);
 }
 
 #[cfg(test)]
@@ -189,9 +195,9 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 3, "{text}");
         assert!(lines.iter().all(|line| starts_with_time(line)), "{text}");
-        assert!(lines[0].ends_with(" [정보] 시작"), "{}", lines[0]);
-        assert!(lines[1].ends_with(" [오류] a.ARW: 읽을 수 없습니다"));
-        assert!(lines[2].ends_with(" [경고] 품질을 낮췄습니다"));
+        assert!(lines[0].ends_with(" [info] 시작"), "{}", lines[0]);
+        assert!(lines[1].ends_with(" [error] a.ARW: 읽을 수 없습니다"));
+        assert!(lines[2].ends_with(" [warn] 품질을 낮췄습니다"));
     }
 
     #[test]
@@ -257,6 +263,20 @@ mod tests {
             ])),
             PathBuf::from("/data/state/amsil/log.txt")
         );
+    }
+
+    #[test]
+    fn what_the_screen_shows_in_korean_is_logged_in_english() {
+        lang::set(Lang::Ko);
+        let reason = lang::text!("손상된 파일입니다", "The file is damaged");
+        let error: Box<dyn std::error::Error + Send + Sync> =
+            lang::text!(format!("a.ARW: {reason}"), format!("a.ARW: {reason}")).into();
+        assert_eq!(
+            error.to_string(),
+            "a.ARW: 손상된 파일입니다",
+            "화면에는 한국어"
+        );
+        assert_eq!(english(&error), "a.ARW: The file is damaged");
     }
 
     #[test]

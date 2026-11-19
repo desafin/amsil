@@ -2,7 +2,7 @@
 
 use crate::Result;
 use crate::edit::Params;
-use crate::lang::t;
+use crate::lang::{t, text};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -73,7 +73,7 @@ pub fn load_dir(dir: &Path) -> (Vec<Preset>, Vec<String>) {
 /// TOML 글에서 프리셋 하나를 읽는다.
 pub fn parse(id: &str, text: &str) -> Result<Preset> {
     let mut preset: Preset = toml::from_str(text).map_err(|e| {
-        t(
+        text!(
             format!("프리셋 {id}을(를) 읽을 수 없습니다: {e}"),
             format!("Cannot read preset {id}: {e}"),
         )

@@ -2,7 +2,7 @@
 
 use crate::denoise::{Packed, pack_rggb};
 use crate::frame::Shot;
-use crate::lang::t;
+use crate::lang::text;
 use crate::{Image, Result};
 use rawler::RawImage;
 use rawler::cfa::{CFA, CFAColor};
@@ -45,7 +45,7 @@ impl Raw {
         let Intermediate::ThreeColor(rgb) =
             RawDevelop::new_with(&steps).develop_intermediate(&self.image)?
         else {
-            return Err(t(
+            return Err(text!(
                 "RGB 컬러 센서만 지원합니다",
                 "Only RGB colour sensors are supported",
             )
@@ -86,7 +86,7 @@ impl Raw {
         // 모델 출력의 (0, 0)은 센서의 첫 R 화소 자리다.
         let (ox, oy) = self.rggb_offset;
         if x < ox || y < oy || x - ox + w > full.width || y - oy + h > full.height {
-            return Err(t(
+            return Err(text!(
                 "모델 출력이 출력 영역을 다 덮지 못합니다",
                 "The model output does not cover the whole picture",
             )
@@ -158,7 +158,7 @@ pub fn sensor_size(path: &Path) -> Result<(usize, usize)> {
 /// 파일 형식에 맞는 디코더를 찾는다.
 fn decoder(source: &RawSource) -> Result<Box<dyn rawler::decoders::Decoder>> {
     rawler::get_decoder(source).map_err(|e| {
-        t(
+        text!(
             format!("지원하지 않거나 손상된 RAW 파일입니다 ({e})"),
             format!("Unsupported or damaged RAW file ({e})"),
         )
@@ -212,7 +212,7 @@ pub fn decode(path: &Path) -> Result<Raw> {
         RawPhotometricInterpretation::Cfa(config) => rggb_offset(&config.cfa),
         _ => None,
     }
-    .ok_or(t(
+    .ok_or(text!(
         "RGB Bayer 센서만 지원합니다",
         "Only RGB Bayer sensors are supported",
     ))?;
@@ -230,7 +230,7 @@ pub fn decode(path: &Path) -> Result<Raw> {
         .color_matrix
         .get(&Illuminant::D65)
         .filter(|m| m.len() >= 9)
-        .ok_or(t(
+        .ok_or(text!(
             "이 카메라의 D65 색행렬이 없습니다",
             "No D65 colour matrix for this camera",
         ))?;

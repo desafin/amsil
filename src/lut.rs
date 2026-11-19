@@ -1,6 +1,6 @@
 //! 3D LUT (`.cube` 파일): 색을 다른 색으로 바꾸는 표. 필름 느낌 같은 "룩"을 입히는 데 쓴다.
 
-use crate::lang::t;
+use crate::lang::text;
 use crate::{Image, Result};
 use rayon::prelude::*;
 use std::path::Path;
@@ -27,7 +27,7 @@ impl Lut {
                 continue;
             }
             let unreadable = || {
-                t(
+                text!(
                     format!("{}번째 줄을 읽을 수 없습니다: {line}", index + 1),
                     format!("Line {} cannot be read: {line}", index + 1),
                 )
@@ -44,7 +44,7 @@ impl Lut {
             };
             match first {
                 "LUT_1D_SIZE" => {
-                    return Err(t(
+                    return Err(text!(
                         "1D LUT는 지원하지 않습니다. 3D LUT(.cube)만 쓸 수 있습니다",
                         "1D LUTs are not supported. Only 3D LUTs (.cube) work",
                     )
@@ -53,7 +53,7 @@ impl Lut {
                 "LUT_3D_SIZE" => {
                     let n = numbers(1)?[0] as usize;
                     if !(2..=256).contains(&n) {
-                        return Err(t(
+                        return Err(text!(
                             format!("LUT 크기가 올바르지 않습니다: {n}"),
                             format!("Invalid LUT size: {n}"),
                         )
@@ -75,13 +75,13 @@ impl Lut {
                 _ => {}
             }
         }
-        let size = size.ok_or(t(
+        let size = size.ok_or(text!(
             "LUT_3D_SIZE가 없습니다. 3D LUT(.cube) 파일이 아닙니다",
             "LUT_3D_SIZE is missing. This is not a 3D LUT (.cube) file",
         ))?;
         if table.len() != size * size * size {
             let (wanted, found) = (size * size * size, table.len());
-            return Err(t(
+            return Err(text!(
                 format!("색 값이 {wanted}줄 있어야 하는데 {found}줄 있습니다"),
                 format!("Expected {wanted} rows of colour values but found {found}"),
             )
@@ -99,7 +99,7 @@ impl Lut {
             .map_err(Into::into)
             .and_then(|text| Self::parse(&text))
             .map_err(|e| {
-                t(
+                text!(
                     format!("LUT 파일을 읽을 수 없습니다 ({}): {e}", path.display()),
                     format!("Cannot read the LUT file ({}): {e}", path.display()),
                 )

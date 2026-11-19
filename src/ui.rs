@@ -4,7 +4,7 @@ use crate::app::{Action, App, Backend, ExportState, Open, ReportView};
 use crate::credits::{self, Credit, Feature};
 use crate::frame::{Frame, Layout as Shape};
 use crate::job::{describe_remaining, describe_resources};
-use crate::lang::{self, Lang, t};
+use crate::lang::{self, Lang, Text, t};
 use crate::preview::Pixels;
 use crate::project::{Split, Theme};
 use crate::recommend;
@@ -194,7 +194,7 @@ fn credit_line(ui: &mut egui::Ui, prefix: &str, credit: &Credit) {
 fn model_status(app: &App, feature: Feature) -> &'static str {
     let ready = t("준비됨", "Ready");
     let missing = t("모델 없음", "No model");
-    let problem = |problem: &Option<String>| if problem.is_some() { missing } else { ready };
+    let problem = |problem: &Option<Text>| if problem.is_some() { missing } else { ready };
     match feature {
         Feature::Denoise => match &app.backend {
             Backend::Unknown => t("확인 중", "Checking"),
@@ -468,11 +468,12 @@ fn backend_label(ui: &mut egui::Ui, app: &App, view: &mut View) {
 
 fn backend_help(ctx: &egui::Context, app: &App, view: &mut View) {
     let text = match &app.backend {
-        Backend::Cpu(notice) | Backend::Unavailable(notice) => notice.as_str(),
+        Backend::Cpu(notice) | Backend::Unavailable(notice) => notice.to_string(),
         _ => t(
             "AI 노이즈 제거를 GPU로 실행합니다.",
             "AI noise reduction runs on the GPU.",
-        ),
+        )
+        .to_owned(),
     };
     let mut open = true;
     egui::Window::new(t("AI 실행 환경", "AI backend"))
@@ -737,7 +738,7 @@ fn look_panel(
         }
     } else if let Some(problem) = &app.recommend_problem {
         ui.weak(t("프리셋 추천: 모델 없음", "Preset suggestions: no model"))
-            .on_hover_text(problem);
+            .on_hover_text(problem.to_string());
     }
     credit_line(ui, t("추천", "Suggestions"), &credits::RECOMMEND);
     ui.add_enabled_ui(edit.preset.is_some(), |ui| {
@@ -883,7 +884,7 @@ fn skin_panel(ui: &mut egui::Ui, app: &App, open: &Open, actions: &mut Vec<Actio
     };
     if let Some(problem) = &app.skin_problem {
         ui.weak(t("피부 보정: 모델 없음", "Skin retouch: no model"))
-            .on_hover_text(problem);
+            .on_hover_text(problem.to_string());
         return;
     }
     let mut amount = open.edit(current).skin;
@@ -917,7 +918,7 @@ fn mask_panel(ui: &mut egui::Ui, app: &App, open: &Open, actions: &mut Vec<Actio
     };
     if let Some(problem) = &app.mask_problem {
         ui.weak(t("마스크: 모델 없음", "Masks: no model"))
-            .on_hover_text(problem);
+            .on_hover_text(problem.to_string());
         return;
     }
     let masks = open.edit(current).masks;
@@ -2298,9 +2299,12 @@ mod tests {
     #[test]
     fn cpu_backend_is_shown_with_a_way_to_read_the_advice() {
         let screen = Screen::with_photos("cpu");
-        screen.app.borrow_mut().handle(Action::Backend(Backend::Cpu(
-            "Vulkan 드라이버를 설치하세요".into(),
-        )));
+        screen
+            .app
+            .borrow_mut()
+            .handle(Action::Backend(Backend::Cpu(Text::of(
+                "Vulkan 드라이버를 설치하세요",
+            ))));
         let mut harness = screen.harness();
         harness.run();
         harness.get_by_label("CPU (느림)").click();
@@ -2595,7 +2599,7 @@ mod tests {
             skipped: 0,
             failed: vec![(
                 "DSC04560.ARW".into(),
-                "지원하지 않거나 손상된 RAW 파일입니다".into(),
+                Text::of("지원하지 않거나 손상된 RAW 파일입니다"),
             )],
             stopped: None,
         };
@@ -2712,7 +2716,7 @@ mod tests {
         handle(Action::OpenProject(screen.dir.join("trip.amsil")));
         check(&mut harness, "빈 작업 화면");
         handle(Action::ImportFolder(screen.dir.join("사진")));
-        handle(Action::Backend(Backend::Cpu("no Vulkan".into())));
+        handle(Action::Backend(Backend::Cpu(Text::of("no Vulkan"))));
         check(&mut harness, "사진을 고르기 전");
 
         handle(Action::Select {
@@ -2766,7 +2770,7 @@ mod tests {
         handle(Action::OriginalReady {
             generation: original,
             index: 0,
-            result: Err("broken".into()),
+            result: Err(Text::of("broken")),
         });
         check(&mut harness, "보정 전 그림을 만들지 못했을 때");
         handle(Action::OriginalReady {
@@ -2788,20 +2792,20 @@ mod tests {
         });
         check(&mut harness, "마스크를 고치는 중");
         handle(Action::SelectMask(None));
-        handle(Action::Segmenter(Some("no model".into())));
-        handle(Action::SkinModel(Some("no model".into())));
+        handle(Action::Segmenter(Some(Text::of("no model"))));
+        handle(Action::SkinModel(Some(Text::of("no model"))));
         check(&mut harness, "마스크와 피부 모델이 없을 때");
         handle(Action::Segmenter(None));
         handle(Action::SkinModel(None));
         harness.get_by_label("CPU (slow)").click();
         check(&mut harness, "CPU 안내");
-        handle(Action::Backend(Backend::Unavailable("no model".into())));
+        handle(Action::Backend(Backend::Unavailable(Text::of("no model"))));
         check(&mut harness, "모델이 없을 때");
         handle(Action::Backend(Backend::Unknown));
         check(&mut harness, "AI 준비 중");
         harness.get_by_label("AI info").click();
         check(&mut harness, "AI 정보 창");
-        handle(Action::Recommender(Some("no model".into())));
+        handle(Action::Recommender(Some(Text::of("no model"))));
         check(&mut harness, "분류 모델이 없을 때");
 
         // 내보내기: 확인 창, 진행 중, 결과, 실패
@@ -2837,13 +2841,13 @@ mod tests {
         let outcome = Outcome {
             done: 1,
             skipped: 0,
-            failed: vec![("b.ARW".into(), "broken".into())],
-            stopped: Some("disk full".into()),
+            failed: vec![("b.ARW".into(), Text::of("broken"))],
+            stopped: Some(Text::of("disk full")),
         };
-        let warnings = vec![("a.ARW".into(), "quality lowered".into())];
+        let warnings = vec![("a.ARW".into(), Text::of("quality lowered"))];
         handle(Action::ExportFinished(Ok((outcome, warnings))));
         check(&mut harness, "내보내기 결과");
-        handle(Action::ExportFinished(Err("boom".into())));
+        handle(Action::ExportFinished(Err(Text::of("boom"))));
         check(&mut harness, "내보내기 실패");
     }
 
@@ -2930,9 +2934,9 @@ mod tests {
             index: 0,
             extend: false,
         });
-        handle(Action::Recommender(Some(
-            "사진 분류 모델이 없습니다".into(),
-        )));
+        handle(Action::Recommender(Some(Text::of(
+            "사진 분류 모델이 없습니다",
+        ))));
         let mut harness = screen.harness();
         harness.run_steps(3);
         harness.get_by_label("프리셋 추천: 모델 없음");
@@ -3073,7 +3077,7 @@ mod tests {
             index: 0,
             extend: false,
         });
-        handle(Action::Segmenter(Some("마스크 모델이 없습니다".into())));
+        handle(Action::Segmenter(Some(Text::of("마스크 모델이 없습니다"))));
         let mut harness = screen.harness();
         harness.run_steps(3);
         harness.get_by_label("마스크: 모델 없음");
@@ -3094,7 +3098,9 @@ mod tests {
         harness.run_steps(3);
         // 슬라이더는 이름표와 조절 막대 두 군데에 같은 이름이 붙는다.
         assert!(harness.query_all_by_label("피부 보정 세기").count() > 0);
-        handle(Action::SkinModel(Some("피부 보정 모델이 없습니다".into())));
+        handle(Action::SkinModel(Some(Text::of(
+            "피부 보정 모델이 없습니다",
+        ))));
         harness.run_steps(3);
         harness.get_by_label("피부 보정: 모델 없음");
         assert_eq!(harness.query_all_by_label("피부 보정 세기").count(), 0);
@@ -3264,7 +3270,7 @@ mod tests {
         };
         // 마스크 모델만 없는 상태
         handle(Action::Backend(Backend::Gpu));
-        handle(Action::Segmenter(Some("마스크 모델이 없습니다".into())));
+        handle(Action::Segmenter(Some(Text::of("마스크 모델이 없습니다"))));
         let mut harness = screen.harness();
         harness.run_steps(3);
         // 시작 화면에서도 볼 수 있다.
