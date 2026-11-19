@@ -28,4 +28,4 @@ LGPL 라이브러리(libheif, rawler)를 고친 것으로 바꿔 쓰려면 저�
 
 ## 묶음에 들어 있지 않고 따로 받는 것
 
-AI 모델은 `fetch-models.sh`가 받는다. 출처와 라이선스는 README의 "AI 모델과 출처"에 있다.
+AI 모델은 `fetch-models.sh`가 받는다. 출처와 라이선스는 README의 "AI 기능과 출처"에 있다.

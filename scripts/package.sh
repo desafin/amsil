@@ -38,7 +38,7 @@ for lib in libwebgpu_dawn libx265 libde265 libnuma; do
 done
 
 cp "$root/scripts/fetch-models.sh" "$stage/fetch-models.sh"
-cp "$root/README.md" "$root/LICENSE" "$root/THIRD-PARTY.md" "$stage/"
+cp "$root/README.md" "$root/README.en.md" "$root/LICENSE" "$root/THIRD-PARTY.md" "$stage/"
 chmod +x "$stage/amsil" "$stage/fetch-models.sh"
 
 tar -C "$out" -czf "$out/$name.tar.gz" "$name"

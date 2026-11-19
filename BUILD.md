@@ -34,7 +34,7 @@ cargo test --locked
 - 실제 RAW 파일이 필요한 테스트는 `DCIM/` 아래의 샘플 사진이 있을 때만, 모델이 필요한 테스트는 모델을 받아 두었을 때만 실행된다. 없으면 건너뛴다. 샘플 사진은 개인 사진이라 저장소에 없다.
 - 화면 테스트는 창을 띄우지 않고 돈다 (`egui_kittest`).
 - 눈으로 확인할 화면 그림은 `cargo test -- --ignored render`로 `target/ui/`에 만든다 (샘플 사진 필요).
-- README의 화면 그림(`assets/screenshots/workspace.jpg`)은 `cargo test -- --ignored render_readme_screenshot`으로 다시 만든다. 공개 저장소에 올라가는 그림이라, 쓸 사진(사람이 나오지 않는 것)의 목록이 그 테스트 안에 적혀 있다.
+- README의 화면 그림(한국어 `assets/screenshots/workspace.jpg`, 영어 `workspace.en.jpg`)은 `cargo test -- --ignored render_readme_screenshot`으로 다시 만든다. 공개 저장소에 올라가는 그림이라, 쓸 사진(사람이 나오지 않는 것)의 목록이 그 테스트 안에 적혀 있다.
 
 커밋을 올리면 GitHub Actions가 깨끗한 Ubuntu 24.04에서 같은 절차로 빌드하고 테스트한다 ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
 
@@ -90,5 +90,6 @@ git push origin v0.1.0
 ## 고칠 때 지킬 것
 
 - **문구는 두 언어로.** 화면이나 메시지에 나오는 글은 쓰는 자리에 `t("한국어", "English")`로 나란히 적는다. 영어 화면에 한글이 남아 있으면 실패하는 테스트가 있다.
-- **모델은 고정해서.** 새 모델을 더할 때는 출처(릴리스 태그나 커밋)와 SHA-256을 `scripts/fetch-models.sh`에 고정하고, README의 "AI 모델과 출처"에 적는다.
+- **README는 두 언어로.** `README.md`(한국어)를 고치면 `README.en.md`(영어)도 같이 고친다. AI 모델의 출처는 테스트가 두 파일 모두에서 확인한다.
+- **모델은 고정해서.** 새 모델을 더할 때는 출처(릴리스 태그나 커밋)와 SHA-256을 `scripts/fetch-models.sh`에 고정하고, README 두 개(`README.md`, `README.en.md`)의 "AI 기능과 출처"에 적는다.
 - **개인 사진은 올리지 않는다.** `DCIM/`은 깃이 무시한다.

@@ -1,5 +1,7 @@
 # 암실 (amsil)
 
+**한국어** | [English](README.en.md)
+
 카메라 RAW 사진을 한꺼번에 보정해서, 용량이 작은 HEIF로 내보내는 프로그램.
 
 *Amsil ("darkroom" in Korean) batch-develops camera RAW photos and exports them as compact 10-bit HEIF. The interface is available in Korean and English.*

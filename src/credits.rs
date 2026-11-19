@@ -1,5 +1,5 @@
 //! AI 기능이 쓰는 모델의 출처. 화면의 "AI 정보" 창과 각 패널의 한 줄 표시가 이것을 쓴다.
-//! README의 "AI 기능과 출처"와 같은 내용이어야 한다 (테스트가 확인한다).
+//! README(한국어, 영어)의 "AI 기능과 출처"와 같은 내용이어야 한다 (테스트가 확인한다).
 
 /// 모델을 쓰는 기능.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,12 +133,18 @@ mod tests {
     #[test]
     fn the_readme_gives_the_same_sources_as_the_program() {
         // 화면과 문서가 서로 다른 말을 하지 않도록, 화면에 나오는 출처가 README에도 그대로 있어야 한다.
-        let readme = include_str!("../README.md");
-        for credit in ALL {
-            let mut wanted = vec![credit.model, credit.by, credit.license, credit.source];
-            wanted.extend(credit.paper);
-            for text in wanted {
-                assert!(readme.contains(text), "README에 없다: {text}");
+        // 한국어와 영어 README 둘 다.
+        let readmes = [
+            ("README.md", include_str!("../README.md")),
+            ("README.en.md", include_str!("../README.en.md")),
+        ];
+        for (file, readme) in readmes {
+            for credit in ALL {
+                let mut wanted = vec![credit.model, credit.by, credit.license, credit.source];
+                wanted.extend(credit.paper);
+                for text in wanted {
+                    assert!(readme.contains(text), "{file}에 없다: {text}");
+                }
             }
         }
     }

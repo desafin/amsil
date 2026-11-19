@@ -3310,7 +3310,8 @@ mod tests {
         }
     }
 
-    /// README에 넣는 화면 그림(`assets/screenshots/workspace.jpg`)을 만든다.
+    /// README에 넣는 화면 그림을 만든다: 한국어 README의 `assets/screenshots/workspace.jpg`,
+    /// 영어 README의 `workspace.en.jpg`.
     /// `cargo test -- --ignored render_readme_screenshot`
     ///
     /// 그림은 공개 저장소에 올라간다. 그래서 사람이 나오지 않는 풍경·건축·음식 사진만 골라 쓰고,
@@ -3318,6 +3319,11 @@ mod tests {
     #[test]
     #[ignore = "샘플 사진이 필요하고, 저장소에 든 그림 파일을 고쳐 쓴다"]
     fn render_readme_screenshot() {
+        render_readme_screenshot_in(Lang::Ko, "가을 여행", "workspace.jpg");
+        render_readme_screenshot_in(Lang::En, "Autumn trip", "workspace.en.jpg");
+    }
+
+    fn render_readme_screenshot_in(lang: Lang, album: &str, file_name: &str) {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let source = root.join("DCIM/10361110");
         let chosen = [
@@ -3331,17 +3337,20 @@ mod tests {
             "DSC04559.ARW", // 햄버거
             "DSC04560.ARW", // 감자튀김
         ];
-        let screen = Screen::new("readme");
+        let screen = Screen::new(&format!("readme-{file_name}"));
         let handle = |action| {
             screen.app.borrow_mut().handle(action);
         };
+        handle(Action::SetLanguage(lang));
         // 고른 사진만 든 폴더를 만들어 가져온다.
-        let folder = screen.dir.join("가을 여행");
+        let folder = screen.dir.join(album);
         std::fs::create_dir_all(&folder).unwrap();
         for name in chosen {
             std::os::unix::fs::symlink(source.join(name), folder.join(name)).unwrap();
         }
-        handle(Action::NewProject(screen.dir.join("가을 여행.amsil")));
+        handle(Action::NewProject(
+            screen.dir.join(format!("{album}.amsil")),
+        ));
         handle(Action::ImportFolder(folder));
         handle(Action::Backend(Backend::Gpu));
         handle(Action::SetTheme(Theme::Dark));
@@ -3386,7 +3395,7 @@ mod tests {
             result: Ok(crate::preview::shrink(&rendered.image, 8192)),
         });
         handle(Action::SetExportFolder(
-            "/home/user/Pictures/가을 여행".into(),
+            format!("/home/user/Pictures/{album}").into(),
         ));
 
         let out = root.join("assets/screenshots");
@@ -3405,7 +3414,7 @@ mod tests {
         let cropped =
             image::imageops::crop_imm(&rendered, margin, margin, width, height).to_image();
         let rgb = image::DynamicImage::ImageRgba8(cropped).into_rgb8();
-        let file = std::fs::File::create(out.join("workspace.jpg")).unwrap();
+        let file = std::fs::File::create(out.join(file_name)).unwrap();
         image::codecs::jpeg::JpegEncoder::new_with_quality(file, 90)
             .encode_image(&rgb)
             .unwrap();
