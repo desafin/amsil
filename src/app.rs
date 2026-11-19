@@ -13,7 +13,7 @@ use crate::log;
 use crate::mask::{Mask, Point};
 use crate::preset::{self, Preset};
 use crate::preview::Pixels;
-use crate::project::{Config, Edit, Folder, LutRef, Project, Theme};
+use crate::project::{Config, Edit, Folder, LutRef, Project, Split, Theme};
 use crate::recommend::{self, Guess};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -66,10 +66,16 @@ pub struct Open {
     pub mask: Option<usize>,
     /// 고쳐 쓰는 마스크가 고른 영역을 미리보기에 붉게 표시할지.
     pub show_mask: bool,
+    /// 전후 비교를 켰는가. 켜면 미리보기를 보정 전과 보정 후 두 칸으로 나눈다.
+    pub compare: bool,
+    /// 비교할 때 보여 줄 보정 전 그림 (한 장만 둔다).
+    pub original: Option<Original>,
     pub export: ExportState,
     /// 미리보기 요청 번호. 늦게 도착한 옛 결과를 버리는 데 쓴다.
     generation: u64,
     preview_serial: u64,
+    /// 보정 전 그림의 요청 번호. 늦게 도착한 옛 결과를 버리는 데 쓴다.
+    original_generation: u64,
 }
 
 pub struct Photo {
@@ -87,6 +93,15 @@ pub struct Preview {
     /// 그림이 바뀔 때마다 달라지는 번호. 화면 쪽에서 텍스처를 다시 올릴지 아는 데 쓴다.
     pub serial: u64,
     pub pixels: Pixels,
+}
+
+/// 아무 보정도 하지 않은 사진 (전후 비교의 보정 전 칸).
+pub struct Original {
+    pub index: usize,
+    /// 그림이 바뀔 때마다 달라지는 번호. 화면 쪽에서 텍스처를 다시 올릴지 아는 데 쓴다.
+    pub serial: u64,
+    /// 만들지 못했으면 그 이유.
+    pub pixels: std::result::Result<Pixels, String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -183,6 +198,8 @@ pub enum Action {
     },
     /// 고른 영역을 미리보기에 표시할지.
     ShowMask(bool),
+    /// 전후 비교를 켜거나 끈다.
+    SetCompare(bool),
     /// 선택한 사진들의 피부 보정 세기 (0~1).
     SetSkin {
         value: f32,
@@ -210,6 +227,8 @@ pub enum Action {
     Notify(String),
     /// 화면을 밝게 또는 어둡게.
     SetTheme(Theme),
+    /// 전후 비교에서 미리보기를 나누는 방향을 정한다 (설정에 저장한다).
+    SetCompareSplit(Split),
 
     Thumbnail {
         index: usize,
@@ -218,6 +237,11 @@ pub enum Action {
         guess: Option<Guess>,
     },
     PreviewReady {
+        generation: u64,
+        index: usize,
+        result: std::result::Result<Pixels, String>,
+    },
+    OriginalReady {
         generation: u64,
         index: usize,
         result: std::result::Result<Pixels, String>,
@@ -255,6 +279,12 @@ pub enum Effect {
         overlay: Option<usize>,
         /// 피부 보정의 세기.
         skin: f32,
+    },
+    /// 아무 보정도 하지 않은 사진을 만든다 (전후 비교의 보정 전 칸). 결과는 `Action::OriginalReady`로 온다.
+    Original {
+        generation: u64,
+        index: usize,
+        path: PathBuf,
     },
     Export {
         photos: Vec<export::Photo>,
@@ -357,6 +387,11 @@ impl App {
                 self.config.save(&self.config_path)?;
                 return Ok(Vec::new());
             }
+            Action::SetCompareSplit(split) => {
+                self.config.compare_split = split;
+                self.config.save(&self.config_path)?;
+                return Ok(Vec::new());
+            }
             Action::SetLanguage(chosen) => {
                 lang::set(chosen);
                 self.config.lang = Some(chosen);
@@ -378,6 +413,7 @@ impl App {
             | Action::SetLanguage(_)
             | Action::Notify(_)
             | Action::SetTheme(_)
+            | Action::SetCompareSplit(_)
             | Action::Recommender(_)
             | Action::Segmenter(_)
             | Action::SkinModel(_)
@@ -438,6 +474,7 @@ impl App {
                 open.mask = None;
                 open.denoise_level = open.edit(index).denoise;
                 effects.push(open.request_preview(index, &self.presets));
+                effects.extend(open.request_original());
             }
             Action::SelectAll => open.selected = (0..open.photos.len()).collect(),
             Action::SetDenoiseLevel(level) => open.denoise_level = level.clamp(0.0, 1.0),
@@ -564,6 +601,14 @@ impl App {
                     effects.push(open.request_preview(current, &self.presets));
                 }
             }
+            Action::SetCompare(on) => {
+                open.compare = on;
+                // 비교하는 동안에는 프레임을 빼므로 보정 후 그림을 다시 받는다.
+                if let Some(current) = open.current {
+                    effects.push(open.request_preview(current, &self.presets));
+                }
+                effects.extend(open.request_original());
+            }
             Action::SetSkin { value, commit } => {
                 open.change_look(commit, &self.presets, &mut effects, |edit| {
                     edit.skin = value.clamp(0.0, 1.0)
@@ -672,6 +717,24 @@ impl App {
                     });
                 }
             }
+            Action::OriginalReady {
+                generation,
+                index,
+                result,
+            } => {
+                // 그 사이에 다른 사진을 골랐다면 버린다.
+                if generation == open.original_generation {
+                    if let Err(error) = &result {
+                        log::error(error);
+                    }
+                    open.preview_serial += 1;
+                    open.original = Some(Original {
+                        index,
+                        serial: open.preview_serial,
+                        pixels: result,
+                    });
+                }
+            }
             Action::ExportProgress(report) => {
                 if let ExportState::Running { report: slot, .. } = &mut open.export {
                     *slot = Some(ReportView {
@@ -710,9 +773,12 @@ impl App {
             preview: None,
             mask: None,
             show_mask: true,
+            compare: false,
+            original: None,
             export: ExportState::Idle,
             generation: 0,
             preview_serial: 0,
+            original_generation: 0,
         };
         let mut wanted = Vec::new();
         let mut missing = Vec::new();
@@ -787,6 +853,30 @@ impl Open {
         self.generation
     }
 
+    /// 가장 최근에 요청한 보정 전 그림의 번호.
+    #[cfg(test)]
+    pub fn original_generation(&self) -> u64 {
+        self.original_generation
+    }
+
+    /// 비교 중이면 지금 사진의 보정 전 그림을 요청한다. 이미 들고 있으면 (만들지 못한 경우는 빼고) 하지 않는다.
+    fn request_original(&mut self) -> Option<Effect> {
+        let current = self.current.filter(|_| self.compare)?;
+        if self
+            .original
+            .as_ref()
+            .is_some_and(|original| original.index == current && original.pixels.is_ok())
+        {
+            return None;
+        }
+        self.original_generation += 1;
+        Some(Effect::Original {
+            generation: self.original_generation,
+            index: current,
+            path: self.photo_path(current),
+        })
+    }
+
     /// 사진에 저장된 편집 내용.
     pub fn edit(&self, index: usize) -> Edit {
         let photo = &self.photos[index];
@@ -827,7 +917,8 @@ impl Open {
     fn request_preview(&mut self, index: usize, presets: &[Preset]) -> Effect {
         self.generation += 1;
         let edit = self.edit(index);
-        // 마스크를 고쳐 쓰는 동안에는 누른 자리가 어긋나지 않도록 프레임 없이 보여 준다.
+        // 마스크를 고쳐 쓰는 동안과 전후를 비교하는 동안에는 프레임 없이 보여 준다
+        // (누른 자리가 어긋나지 않게, 두 칸의 크기가 같게).
         let editing = self.mask.filter(|_| self.current == Some(index));
         Effect::Preview {
             generation: self.generation,
@@ -836,7 +927,7 @@ impl Open {
             denoise: edit.denoise,
             params: self.params(index, presets),
             lut: self.lut(index),
-            frame: edit.frame.filter(|_| editing.is_none()),
+            frame: edit.frame.filter(|_| editing.is_none() && !self.compare),
             masks: edit.masks,
             overlay: editing.filter(|_| self.show_mask),
             skin: edit.skin,
@@ -1098,6 +1189,19 @@ mod tests {
     }
 
     #[test]
+    fn the_compare_split_is_remembered_in_the_config() {
+        let mut fx = Fixture::new("split");
+        let effects = fx.app.handle(Action::SetCompareSplit(Split::Side));
+        assert!(effects.is_empty());
+        assert_eq!(fx.app.config.compare_split, Split::Side);
+        assert_eq!(
+            Config::load(&fx.dir.join("config/config.toml")).compare_split,
+            Split::Side,
+            "프로젝트를 열지 않아도 저장된다"
+        );
+    }
+
+    #[test]
     fn selecting_a_photo_shows_it_and_asks_for_a_preview_with_its_denoise_level() {
         let mut fx = Fixture::with_photos("select");
         let effects = fx.app.handle(Action::Select {
@@ -1169,6 +1273,137 @@ mod tests {
             result: Ok(pixels()),
         });
         assert_eq!(fx.open().preview.as_ref().unwrap().index, 1);
+    }
+
+    /// 효과 가운데 보정 전 그림 요청의 (요청 번호, 사진 번호).
+    fn original_requests(effects: &[Effect]) -> Vec<(u64, usize)> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Original {
+                    generation, index, ..
+                } => Some((*generation, *index)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn comparing_asks_for_the_unedited_photo_once_per_photo() {
+        let mut fx = Fixture::with_photos("compare");
+        let effects = fx.app.handle(Action::Select {
+            index: 0,
+            extend: false,
+        });
+        assert!(
+            original_requests(&effects).is_empty(),
+            "비교를 켜기 전에는 요청하지 않는다"
+        );
+
+        let effects = fx.app.handle(Action::SetCompare(true));
+        assert!(fx.open().compare);
+        let requests = original_requests(&effects);
+        let [(generation, 0)] = requests[..] else {
+            panic!("{effects:?}")
+        };
+        let path = fx.open().photo_path(0);
+        assert!(effects.contains(&Effect::Original {
+            generation,
+            index: 0,
+            path
+        }));
+        fx.app.handle(Action::OriginalReady {
+            generation,
+            index: 0,
+            result: Ok(pixels()),
+        });
+        assert_eq!(fx.open().original.as_ref().unwrap().index, 0);
+
+        // 보정을 바꾸거나 비교를 껐다 켜도 다시 만들지 않는다.
+        let effects = fx.app.handle(Action::SetStrength {
+            value: 0.5,
+            commit: true,
+        });
+        assert!(original_requests(&effects).is_empty());
+        fx.app.handle(Action::SetCompare(false));
+        let effects = fx.app.handle(Action::SetCompare(true));
+        assert!(original_requests(&effects).is_empty());
+
+        // 다른 사진으로 가면 그 사진의 것을 요청한다.
+        let effects = fx.app.handle(Action::Select {
+            index: 2,
+            extend: false,
+        });
+        assert!(matches!(original_requests(&effects)[..], [(_, 2)]));
+    }
+
+    #[test]
+    fn comparing_shows_the_edited_photo_without_its_frame() {
+        let mut fx = Fixture::with_photos("compare-frame");
+        fx.app.handle(Action::Select {
+            index: 0,
+            extend: false,
+        });
+        let frame = Frame {
+            layout: crate::frame::Layout::Band,
+            dark: false,
+        };
+        fx.app.handle(Action::SetFrame(Some(frame)));
+        let shown_frame = |effects: &[Effect]| {
+            effects.iter().find_map(|effect| match effect {
+                Effect::Preview { frame, .. } => Some(*frame),
+                _ => None,
+            })
+        };
+        let effects = fx.app.handle(Action::SetCompare(true));
+        assert_eq!(
+            shown_frame(&effects),
+            Some(None),
+            "비교하는 동안에는 두 칸의 크기가 같도록 프레임을 뺀다"
+        );
+        let effects = fx.app.handle(Action::SetCompare(false));
+        assert_eq!(shown_frame(&effects), Some(Some(frame)));
+        assert_eq!(
+            fx.open().edit(0).frame,
+            Some(frame),
+            "저장된 프레임은 그대로"
+        );
+    }
+
+    #[test]
+    fn comparing_handles_a_late_or_failed_unedited_photo() {
+        let mut fx = Fixture::with_photos("compare-late");
+        fx.app.handle(Action::Select {
+            index: 0,
+            extend: false,
+        });
+        let first = original_requests(&fx.app.handle(Action::SetCompare(true)))[0].0;
+        let second = original_requests(&fx.app.handle(Action::Select {
+            index: 1,
+            extend: false,
+        }))[0]
+            .0;
+        fx.app.handle(Action::OriginalReady {
+            generation: first,
+            index: 0,
+            result: Ok(pixels()),
+        });
+        assert!(fx.open().original.is_none(), "옛 사진의 결과는 버린다");
+
+        fx.app.handle(Action::OriginalReady {
+            generation: second,
+            index: 1,
+            result: Err("broken".into()),
+        });
+        let original = fx.open().original.as_ref().unwrap();
+        assert_eq!(original.index, 1);
+        assert_eq!(original.pixels, Err("broken".to_string()));
+        // 만들지 못한 사진은 다시 고르면 다시 요청한다.
+        let effects = fx.app.handle(Action::Select {
+            index: 1,
+            extend: false,
+        });
+        assert!(matches!(original_requests(&effects)[..], [(_, 1)]));
     }
 
     #[test]

@@ -54,6 +54,10 @@ pub struct Workers {
     latest_preview: Arc<AtomicU64>,
     /// 미리보기의 긴 변 한도.
     preview_side: Arc<AtomicU64>,
+    /// 가장 최근의 보정 전 그림 요청 번호.
+    latest_original: Arc<AtomicU64>,
+    /// 보정 전 그림은 한 번에 한 장만 읽는다 (사진을 빠르게 넘길 때 무거운 읽기가 쌓이지 않게).
+    original_lock: Arc<Mutex<()>>,
     /// 미리보기 중인 사진 한 장.
     base: Arc<Mutex<Option<Arc<Base>>>>,
     /// 마지막으로 읽은 LUT. 강도 슬라이더를 끄는 동안 파일을 다시 읽지 않게 한다.
@@ -76,6 +80,8 @@ impl Workers {
             cancel: Arc::default(),
             latest_preview: Arc::default(),
             preview_side: Arc::new(AtomicU64::new(PREVIEW_SIDE as u64)),
+            latest_original: Arc::default(),
+            original_lock: Arc::default(),
             base: Arc::default(),
             lut: Arc::default(),
             classifier: Arc::default(),
@@ -368,6 +374,41 @@ impl Workers {
                             generation,
                             index,
                             result: Err(error),
+                        });
+                    }
+                });
+            }
+            Effect::Original {
+                generation,
+                index,
+                path,
+            } => {
+                self.latest_original.store(generation, SeqCst);
+                std::thread::spawn(move || {
+                    let stale = || workers.latest_original.load(SeqCst) != generation;
+                    let _one_at_a_time = workers.original_lock.lock().unwrap();
+                    // 기다리는 사이에 더 새로운 요청이 왔으면 읽지 않는다.
+                    if stale() {
+                        return;
+                    }
+                    // 읽어 둔 사진(`base`)은 보정 후 미리보기의 것이라 건드리지 않는다.
+                    // 여기서 바꾸면 보정 후 쪽이 노이즈 제거를 다시 하게 된다.
+                    let result = export::load(&path, None, &|_| {})
+                        .map(|loaded| {
+                            let params = crate::edit::Params::default();
+                            let full = loaded.develop(
+                                &loaded.cam,
+                                export::Look::new(&params),
+                                &export::Areas::default(),
+                            );
+                            preview::shrink(&full, workers.preview_side.load(SeqCst) as usize)
+                        })
+                        .map_err(|e| e.to_string());
+                    if !stale() {
+                        workers.send(Action::OriginalReady {
+                            generation,
+                            index,
+                            result,
                         });
                     }
                 });
@@ -672,5 +713,60 @@ mod tests {
             "고른 건물은 붉게 표시된다: {tower_plain:?} → {tower_shown:?}"
         );
         assert_eq!(sky_shown, sky_plain, "하늘은 그대로");
+    }
+
+    #[test]
+    fn the_unedited_photo_is_the_preview_of_a_photo_without_edits() {
+        let Some(sample) = crate::sample_arw() else {
+            return;
+        };
+        let (workers, rx) = Workers::new(|| {});
+        workers.run(Effect::Original {
+            generation: 3,
+            index: 5,
+            path: sample.clone(),
+        });
+        let seen = wait_for(&rx, |action| matches!(action, Action::OriginalReady { .. }));
+        let Some(Action::OriginalReady {
+            generation: 3,
+            index: 5,
+            result: Ok(original),
+        }) = seen.last()
+        else {
+            panic!("보정 전 그림이 오지 않았다");
+        };
+        assert_eq!(
+            (original.width, original.height),
+            (1365, 2048),
+            "보정 후 미리보기와 같은 크기 (긴 변 2048)"
+        );
+
+        workers.run(Effect::Preview {
+            generation: 1,
+            index: 5,
+            path: sample,
+            denoise: 0.0,
+            params: Default::default(),
+            lut: None,
+            frame: None,
+            masks: Vec::new(),
+            overlay: None,
+            skin: 0.0,
+        });
+        let seen_preview = wait_for(
+            &rx,
+            |action| matches!(action, Action::PreviewReady { result: Ok(preview), .. } if preview.height == 2048),
+        );
+        let Some(Action::PreviewReady {
+            result: Ok(preview),
+            ..
+        }) = seen_preview.last()
+        else {
+            unreachable!()
+        };
+        assert!(
+            original.rgba == preview.rgba,
+            "아무 보정도 하지 않은 사진의 미리보기와 화소까지 같아야 한다"
+        );
     }
 }

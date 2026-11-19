@@ -228,6 +228,9 @@ pub struct Config {
     /// 화면에서 고른 밝기 모드. 고른 적이 없으면 시스템의 설정을 따른다.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<Theme>,
+    /// 전후 비교에서 미리보기를 나누는 방향.
+    #[serde(default)]
+    pub compare_split: Split,
     /// 최근에 연 프로젝트. 최신이 맨 앞.
     #[serde(default)]
     pub recent: Vec<PathBuf>,
@@ -239,6 +242,19 @@ pub struct Config {
 pub enum Theme {
     Light,
     Dark,
+}
+
+/// 전후 비교에서 미리보기를 나누는 방향.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Split {
+    /// 사진이 더 크게 들어가는 쪽으로.
+    #[default]
+    Auto,
+    /// 좌우로 (보정 전이 왼쪽).
+    Side,
+    /// 위아래로 (보정 전이 위).
+    Stacked,
 }
 
 /// 최근 프로젝트 목록의 최대 길이.
@@ -641,5 +657,24 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(text.contains("theme = \"light\""), "{text}");
         assert_eq!(loaded.theme, Some(Theme::Light));
+    }
+
+    #[test]
+    fn the_compare_split_is_saved_and_automatic_until_chosen() {
+        let dir = std::env::temp_dir().join(format!("amsil-config-split-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        let mut config = Config::load(&path);
+        assert_eq!(config.compare_split, Split::Auto, "고르기 전에는 자동");
+        config.compare_split = Split::Stacked;
+        config.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let loaded = Config::load(&path);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(text.contains("compare_split = \"stacked\""), "{text}");
+        assert_eq!(loaded.compare_split, Split::Stacked);
+        // 이 항목이 없던 예전 설정 파일도 그대로 읽힌다 (못 읽으면 최근 프로젝트 목록이 사라진다).
+        let old: Config = toml::from_str("recent = [\"/a.amsil\"]\n").unwrap();
+        assert_eq!(old.compare_split, Split::Auto);
+        assert_eq!(old.recent.len(), 1);
     }
 }

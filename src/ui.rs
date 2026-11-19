@@ -6,7 +6,7 @@ use crate::frame::{Frame, Layout as Shape};
 use crate::job::{describe_remaining, describe_resources};
 use crate::lang::{self, Lang, t};
 use crate::preview::Pixels;
-use crate::project::Theme;
+use crate::project::{Split, Theme};
 use crate::recommend;
 use eframe::egui::{self, Align, Key, Layout, Panel, RichText, TextureHandle, TextureOptions};
 use std::collections::HashMap;
@@ -36,6 +36,8 @@ pub struct View {
     thumbnails: HashMap<usize, TextureHandle>,
     /// (요청 번호, 텍스처)
     preview: Option<(u64, TextureHandle)>,
+    /// 전후 비교의 보정 전 그림. (번호, 텍스처)
+    original: Option<(u64, TextureHandle)>,
     show_backend_help: bool,
     /// "AI 기능과 출처" 창이 열려 있는가.
     show_ai_info: bool,
@@ -48,6 +50,8 @@ pub struct View {
     zoomed_photo: Option<usize>,
 }
 
+/// 전후 비교에서 두 칸 사이의 틈 (화면 단위).
+const PANE_GAP: f32 = 4.0;
 /// 원본 화소 하나를 화면 몇 점까지 키울 수 있는지 (4 = 400%).
 const MAX_ZOOM: f32 = 4.0;
 /// 휠 한 칸에 얼마나 확대할지 정하는 값.
@@ -422,7 +426,7 @@ fn workspace(
         .show(ui, |ui| {
             photo_list(ui, open, view, actions);
         });
-    egui::CentralPanel::default().show(ui, |ui| preview(ui, open, view, actions));
+    egui::CentralPanel::default().show(ui, |ui| preview(ui, app, open, view, actions));
 
     export_windows(ui.ctx(), open, actions);
     if view.show_backend_help {
@@ -1218,13 +1222,83 @@ impl Zoom {
     }
 }
 
-fn preview(ui: &mut egui::Ui, open: &Open, view: &mut View, actions: &mut Vec<Action>) {
+/// 미리보기 위의 전후 비교 단추. 비교를 켜면 나누는 방향도 고를 수 있다.
+fn compare_bar(ui: &mut egui::Ui, app: &App, open: &Open, actions: &mut Vec<Action>) {
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .selectable_label(open.compare, t("비교", "Compare"))
+            .on_hover_text(t(
+                "보정 전과 보정 후를 나란히 본다. 한쪽을 확대하거나 옮기면 다른 쪽도 같이 움직인다.",
+                "Show the photo before and after editing side by side. Zooming or moving one side moves both.",
+            ))
+            .clicked()
+        {
+            actions.push(Action::SetCompare(!open.compare));
+        }
+        if open.compare {
+            ui.separator();
+            let choices = [
+                (Split::Auto, t("자동", "Auto")),
+                (Split::Side, t("좌우", "Side by side")),
+                (Split::Stacked, t("위아래", "Top and bottom")),
+            ];
+            for (choice, name) in choices {
+                let chosen = app.config.compare_split == choice;
+                if ui.selectable_label(chosen, name).clicked() && !chosen {
+                    actions.push(Action::SetCompareSplit(choice));
+                }
+            }
+        }
+    });
+}
+
+/// 미리보기 그림을 GPU에 올린다.
+fn upload(ctx: &egui::Context, name: &str, pixels: &Pixels) -> TextureHandle {
+    // 줄여서 볼 때는 부드럽게(밉맵), 100%를 넘겨 볼 때는 화소가 그대로 보이게 한다.
+    let options = TextureOptions {
+        magnification: egui::TextureFilter::Nearest,
+        minification: egui::TextureFilter::Linear,
+        mipmap_mode: Some(egui::TextureFilter::Linear),
+        ..TextureOptions::LINEAR
+    };
+    // GPU가 받을 수 있는 크기를 넘으면 줄여서 올린다 (넘는 텍스처를 올리면 프로그램이 멈춘다).
+    let limit = ctx.input(|input| input.max_texture_side);
+    let image = match pixels.fit_within(limit) {
+        Some(smaller) => color_image(&smaller),
+        None => color_image(pixels),
+    };
+    ctx.load_texture(name, image, options)
+}
+
+/// 전후 비교를 위해 `area`를 같은 크기의 두 칸(보정 전, 보정 후)으로 나눈다. `image`는 사진의 크기.
+/// 자동이면 좌우와 위아래 가운데 사진이 더 크게 들어가는 쪽을 고른다. 같으면 좌우.
+fn compare_panes(split: Split, image: egui::Vec2, area: egui::Rect) -> [egui::Rect; 2] {
+    let width = ((area.width() - PANE_GAP) / 2.0).max(0.0);
+    let side = [
+        egui::Rect::from_min_size(area.min, egui::vec2(width, area.height())),
+        egui::Rect::from_min_max(egui::pos2(area.max.x - width, area.min.y), area.max),
+    ];
+    let height = ((area.height() - PANE_GAP) / 2.0).max(0.0);
+    let stacked = [
+        egui::Rect::from_min_size(area.min, egui::vec2(area.width(), height)),
+        egui::Rect::from_min_max(egui::pos2(area.min.x, area.max.y - height), area.max),
+    ];
+    let side_by_side = match split {
+        Split::Side => true,
+        Split::Stacked => false,
+        Split::Auto => fit(image, side[0].size()).x >= fit(image, stacked[0].size()).x,
+    };
+    if side_by_side { side } else { stacked }
+}
+
+fn preview(ui: &mut egui::Ui, app: &App, open: &Open, view: &mut View, actions: &mut Vec<Action>) {
     let Some(current) = open.current else {
         ui.centered_and_justified(|ui| {
             ui.weak(t("왼쪽에서 사진을 고르세요", "Pick a photo on the left"))
         });
         return;
     };
+    compare_bar(ui, app, open, actions);
     let shown = open
         .preview
         .as_ref()
@@ -1233,105 +1307,176 @@ fn preview(ui: &mut egui::Ui, open: &Open, view: &mut View, actions: &mut Vec<Ac
         && view
             .preview
             .as_ref()
-            .is_none_or(|(generation, _)| *generation != preview.serial)
+            .is_none_or(|(serial, _)| *serial != preview.serial)
     {
-        // 줄여서 볼 때는 부드럽게(밉맵), 100%를 넘겨 볼 때는 화소가 그대로 보이게 한다.
-        let options = TextureOptions {
-            magnification: egui::TextureFilter::Nearest,
-            minification: egui::TextureFilter::Linear,
-            mipmap_mode: Some(egui::TextureFilter::Linear),
-            ..TextureOptions::LINEAR
-        };
-        // GPU가 받을 수 있는 크기를 넘으면 줄여서 올린다 (넘는 텍스처를 올리면 프로그램이 멈춘다).
-        let limit = ui.ctx().input(|input| input.max_texture_side);
-        let image = match preview.pixels.fit_within(limit) {
-            Some(smaller) => color_image(&smaller),
-            None => color_image(&preview.pixels),
-        };
-        let texture = ui.ctx().load_texture("preview", image, options);
-        view.preview = Some((preview.serial, texture));
+        view.preview = Some((preview.serial, upload(ui.ctx(), "preview", &preview.pixels)));
     }
-    match (shown, &view.preview) {
-        (Some(_), Some((_, texture))) => {
-            // 다른 사진으로 넘어가면 창에 맞춘 상태로 돌아간다. 같은 사진을 다시 그린 경우(노이즈 제거 적용 등)에는
-            // 보던 자리를 유지한다.
-            if view.zoomed_photo != Some(current) {
-                view.zoomed_photo = Some(current);
+    // 보정 전 그림은 비교 중이고 지금 사진의 것일 때만 쓴다. 비교를 끄면 텍스처도 내려놓는다.
+    let original = open
+        .original
+        .as_ref()
+        .filter(|original| open.compare && original.index == current);
+    if !open.compare {
+        view.original = None;
+    }
+    if let Some(original) = original
+        && let Ok(pixels) = &original.pixels
+        && view
+            .original
+            .as_ref()
+            .is_none_or(|(serial, _)| *serial != original.serial)
+    {
+        view.original = Some((original.serial, upload(ui.ctx(), "original", pixels)));
+    }
+    let (Some(_), Some((_, texture))) = (shown, &view.preview) else {
+        ui.centered_and_justified(|ui| ui.spinner());
+        return;
+    };
+    // 다른 사진으로 넘어가면 창에 맞춘 상태로 돌아간다. 같은 사진을 다시 그린 경우(노이즈 제거 적용 등)에는
+    // 보던 자리를 유지한다.
+    if view.zoomed_photo != Some(current) {
+        view.zoomed_photo = Some(current);
+        view.zoom = Zoom::default();
+    }
+    let area = ui.available_rect_before_wrap();
+    let image = texture.size_vec2();
+    // 비교할 때는 보정 전, 보정 후 두 칸. 마지막 칸이 보정 후다.
+    let panes = if open.compare {
+        compare_panes(app.config.compare_split, image, area).to_vec()
+    } else {
+        vec![area]
+    };
+    // 칸들은 크기가 같아서 확대 상태 하나를 같이 쓴다. 어느 칸에서 확대하거나 끌어도 모든 칸이 같이 움직인다.
+    let pane_size = panes[0].size();
+    let fit_size = fit(image, pane_size);
+    // 창에 맞춘 크기를 1로 볼 때 원본 크기(100%)에 해당하는 배율
+    let actual = image.x / fit_size.x;
+    let max = (MAX_ZOOM * actual).max(1.0);
+    let responses: Vec<egui::Response> = panes
+        .iter()
+        .map(|pane| ui.allocate_rect(*pane, egui::Sense::click_and_drag()))
+        .collect();
+    for (pane, response) in panes.iter().zip(&responses) {
+        let pointer = response.hover_pos().map(|pos| pos - pane.center());
+        if let Some(pointer) = pointer {
+            let (wheel, pinch) =
+                ui.input(|input| (input.smooth_scroll_delta.y, input.zoom_delta()));
+            let factor = (wheel * WHEEL_ZOOM).exp() * pinch;
+            if factor != 1.0 {
+                view.zoom.zoom_at(factor, pointer, max);
+            }
+        }
+        if response.dragged() {
+            view.zoom.offset += response.drag_delta();
+        }
+        // 마스크를 고쳐 쓰는 동안에는 누르는 것이 자리를 찍는 일이라, 두 번 눌러 확대하는 것은 쉰다.
+        if response.double_clicked() && open.mask.is_none() {
+            // 창에 맞춤 ↔ 100%
+            if view.zoom.scale == 1.0 {
+                view.zoom.zoom_at(actual, pointer.unwrap_or_default(), max);
+            } else {
                 view.zoom = Zoom::default();
             }
-            let area = ui.available_rect_before_wrap();
-            let response = ui.allocate_rect(area, egui::Sense::click_and_drag());
-            let image = texture.size_vec2();
-            let fit_size = fit(image, area.size());
-            // 창에 맞춘 크기를 1로 볼 때 원본 크기(100%)에 해당하는 배율
-            let actual = image.x / fit_size.x;
-            let max = (MAX_ZOOM * actual).max(1.0);
-            let pointer = response.hover_pos().map(|pos| pos - area.center());
-            if let Some(pointer) = pointer {
-                let (wheel, pinch) =
-                    ui.input(|input| (input.smooth_scroll_delta.y, input.zoom_delta()));
-                let factor = (wheel * WHEEL_ZOOM).exp() * pinch;
-                if factor != 1.0 {
-                    view.zoom.zoom_at(factor, pointer, max);
-                }
-            }
-            if response.dragged() {
-                view.zoom.offset += response.drag_delta();
-            }
-            // 마스크를 고쳐 쓰는 동안에는 누르는 것이 자리를 찍는 일이라, 두 번 눌러 확대하는 것은 쉰다.
-            if response.double_clicked() && open.mask.is_none() {
-                // 창에 맞춤 ↔ 100%
-                if view.zoom.scale == 1.0 {
-                    view.zoom.zoom_at(actual, pointer.unwrap_or_default(), max);
-                } else {
-                    view.zoom = Zoom::default();
-                }
-            }
-            view.zoom.clamp(fit_size, area.size());
-            let rect = egui::Rect::from_center_size(
-                area.center() + view.zoom.offset,
-                fit_size * view.zoom.scale,
-            );
-            let mut canvas = ui.new_child(egui::UiBuilder::new().max_rect(area));
-            canvas.set_clip_rect(area);
+        }
+    }
+    view.zoom.clamp(fit_size, pane_size);
+    let last = panes.len() - 1;
+    for (number, (pane, response)) in panes.iter().zip(&responses).enumerate() {
+        let after = number == last;
+        let rect = egui::Rect::from_center_size(
+            pane.center() + view.zoom.offset,
+            fit_size * view.zoom.scale,
+        );
+        let mut canvas = ui.new_child(egui::UiBuilder::new().max_rect(*pane));
+        canvas.set_clip_rect(*pane);
+        if after {
             egui::Image::new(texture).paint_at(&canvas, rect);
-            if let Some(active) = open.mask {
-                // 사진을 누른 자리가 마스크에 더해진다. 오른쪽 단추로 누르면 빼는 자리다.
-                let presses = [
-                    (response.clicked(), true),
-                    (response.secondary_clicked(), false),
-                ];
-                for (pressed, include) in presses {
-                    if pressed
-                        && let Some((x, y)) = response
-                            .interact_pointer_pos()
-                            .and_then(|pos| photo_point(rect, pos))
-                    {
-                        actions.push(Action::AddMaskPoint { x, y, include });
-                    }
+        } else {
+            match (original.map(|original| &original.pixels), &view.original) {
+                (Some(Ok(_)), Some((_, before))) => {
+                    // 보정 후 그림이 잠깐 프레임을 두른 것이거나 작은 사본이어도 일그러지지 않게, 비율을 지켜 같은 자리에 넣는다.
+                    let size = before.size_vec2();
+                    let scale = (rect.width() / size.x).min(rect.height() / size.y);
+                    egui::Image::new(before).paint_at(
+                        &canvas,
+                        egui::Rect::from_center_size(rect.center(), size * scale),
+                    );
                 }
-                // 지금까지 누른 자리를 사진 위에 점으로 보여 준다 (고르는 자리는 초록, 빼는 자리는 빨강).
-                if let Some(mask) = open.edit(current).masks.get(active) {
-                    for point in &mask.points {
-                        let colour = if point.include {
-                            egui::Color32::from_rgb(60, 220, 90)
-                        } else {
-                            egui::Color32::from_rgb(235, 70, 60)
-                        };
-                        canvas.painter().circle(
-                            rect.min + egui::vec2(point.x, point.y) * rect.size(),
-                            5.0,
-                            colour,
-                            egui::Stroke::new(1.5, egui::Color32::WHITE),
-                        );
-                    }
+                (Some(Err(error)), _) => {
+                    canvas.put(
+                        pane.shrink(16.0),
+                        egui::Label::new(
+                            RichText::new(t(
+                                format!("보정 전 그림을 만들지 못했습니다: {error}"),
+                                format!("Could not make the unedited photo: {error}"),
+                            ))
+                            .weak(),
+                        )
+                        .wrap(),
+                    );
+                }
+                _ => {
+                    canvas.put(
+                        egui::Rect::from_center_size(pane.center(), egui::Vec2::splat(24.0)),
+                        egui::Spinner::new(),
+                    );
                 }
             }
+        }
+        if let Some(active) = open.mask {
+            // 사진을 누른 자리가 마스크에 더해진다. 오른쪽 단추로 누르면 빼는 자리다. 어느 칸을 눌러도 같은 자리다.
+            let presses = [
+                (response.clicked(), true),
+                (response.secondary_clicked(), false),
+            ];
+            for (pressed, include) in presses {
+                if pressed
+                    && let Some((x, y)) = response
+                        .interact_pointer_pos()
+                        .and_then(|pos| photo_point(rect, pos))
+                {
+                    actions.push(Action::AddMaskPoint { x, y, include });
+                }
+            }
+            // 지금까지 누른 자리를 사진 위에 점으로 보여 준다 (고르는 자리는 초록, 빼는 자리는 빨강).
+            if let Some(mask) = open.edit(current).masks.get(active) {
+                for point in &mask.points {
+                    let colour = if point.include {
+                        egui::Color32::from_rgb(60, 220, 90)
+                    } else {
+                        egui::Color32::from_rgb(235, 70, 60)
+                    };
+                    canvas.painter().circle(
+                        rect.min + egui::vec2(point.x, point.y) * rect.size(),
+                        5.0,
+                        colour,
+                        egui::Stroke::new(1.5, egui::Color32::WHITE),
+                    );
+                }
+            }
+        }
+        if open.compare {
+            let name = if after {
+                t("보정 후", "After")
+            } else {
+                t("보정 전", "Before")
+            };
+            canvas.put(
+                egui::Rect::from_min_size(pane.min + egui::vec2(6.0, 4.0), egui::vec2(110.0, 20.0)),
+                egui::Label::new(
+                    RichText::new(name)
+                        .strong()
+                        .background_color(canvas.visuals().extreme_bg_color),
+                )
+                .selectable(false),
+            );
+        }
+        if after {
             // 지금 배율 (원본 화소 대비)
             let percent = view.zoom.scale / actual * 100.0;
             let corner = egui::Rect::from_min_max(
-                area.right_bottom() - egui::vec2(90.0, 24.0),
-                area.right_bottom(),
+                pane.right_bottom() - egui::vec2(90.0, 24.0),
+                pane.right_bottom(),
             );
             // 사용법은 배율 표시에 마우스를 올렸을 때만 보여 준다. 사진 위에 계속 뜨면 거슬린다.
             canvas
@@ -1350,9 +1495,6 @@ fn preview(ui: &mut egui::Ui, open: &Open, view: &mut View, actions: &mut Vec<Ac
                     "휠: 확대/축소 · 끌기: 이동 · 두 번 누르기: 맞춤/100%",
                     "Wheel: zoom · Drag: move · Double-click: fit/100%",
                 ));
-        }
-        _ => {
-            ui.centered_and_justified(|ui| ui.spinner());
         }
     }
 }
@@ -1527,6 +1669,36 @@ mod tests {
         };
         zoom.clamp(vec2(200.0, 300.0), vec2(400.0, 300.0));
         assert_eq!(zoom.offset, vec2(0.0, 75.0));
+    }
+
+    #[test]
+    fn compare_splits_the_area_so_the_photo_is_shown_largest() {
+        let area = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), vec2(1000.0, 700.0));
+        let landscape = vec2(6000.0, 4000.0);
+        let portrait = vec2(4000.0, 6000.0);
+        let [before, after] = compare_panes(Split::Auto, landscape, area);
+        assert_eq!(before.width(), 1000.0, "가로 사진은 위아래로: {before:?}");
+        assert!(before.max.y < after.min.y, "보정 전이 위");
+        let [before, after] = compare_panes(Split::Auto, portrait, area);
+        assert_eq!(before.height(), 700.0, "세로 사진은 좌우로: {before:?}");
+        assert!(before.max.x < after.min.x, "보정 전이 왼쪽");
+
+        // 고른 방향은 사진과 상관없이 따른다.
+        let [before, after] = compare_panes(Split::Side, landscape, area);
+        assert!(before.max.x < after.min.x);
+        let [before, after] = compare_panes(Split::Stacked, portrait, area);
+        assert!(before.max.y < after.min.y);
+
+        // 두 칸은 크기가 같고, 영역 안에 있고, 겹치지 않는다.
+        for split in [Split::Side, Split::Stacked] {
+            let [before, after] = compare_panes(split, landscape, area);
+            assert_eq!(before.size(), after.size());
+            assert!(area.contains_rect(before) && area.contains_rect(after));
+            assert!(!before.intersects(after));
+        }
+        // 작은 사진은 어느 쪽으로 나눠도 원래 크기로 들어가니 좌우.
+        let [before, after] = compare_panes(Split::Auto, vec2(300.0, 200.0), area);
+        assert!(before.max.x < after.min.x);
     }
 
     /// 대화 상자 대신 정해 둔 경로를 돌려주는 가짜 환경.
@@ -1829,6 +2001,80 @@ mod tests {
         let mut harness = screen.harness();
         harness.run();
         harness.get_by_label_contains("배율 ");
+    }
+
+    #[test]
+    fn compare_shows_before_and_after_and_zooms_them_together() {
+        let screen = Screen::with_photos("compare");
+        let handle = |action| {
+            screen.app.borrow_mut().handle(action);
+        };
+        let photo = || Pixels {
+            width: 2000,
+            height: 1000,
+            rgba: vec![128; 2000 * 1000 * 4],
+        };
+        handle(Action::Select {
+            index: 0,
+            extend: false,
+        });
+        let generation = screen
+            .app
+            .borrow()
+            .open
+            .as_ref()
+            .unwrap()
+            .preview_generation();
+        handle(Action::PreviewReady {
+            generation,
+            index: 0,
+            result: Ok(photo()),
+        });
+        let mut harness = screen.harness();
+        harness.run();
+        assert_eq!(shown(&harness, "보정 전"), 0, "비교를 켜기 전에는 한 칸");
+
+        harness.get_by_label("비교").click();
+        // 보정 전 그림을 기다리는 동안에는 회전 표시가 돌아서 화면이 멈추지 않는다.
+        harness.run_steps(3);
+        assert!(screen.app.borrow().open.as_ref().unwrap().compare);
+        let (generation, original) = {
+            let app = screen.app.borrow();
+            let open = app.open.as_ref().unwrap();
+            (open.preview_generation(), open.original_generation())
+        };
+        handle(Action::PreviewReady {
+            generation,
+            index: 0,
+            result: Ok(photo()),
+        });
+        handle(Action::OriginalReady {
+            generation: original,
+            index: 0,
+            result: Ok(photo()),
+        });
+        harness.run();
+        harness.get_by_label("보정 후");
+        let fit = shown_zoom(&harness);
+
+        // 보정 전 칸에서 휠을 올리면, 보정 후 칸에 표시된 배율도 같이 오른다.
+        let before = harness.get_by_label("보정 전").rect();
+        harness.hover_at(before.right_bottom() + vec2(60.0, 60.0));
+        harness.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: vec2(0.0, 120.0),
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run();
+        let zoomed = shown_zoom(&harness);
+        assert!(zoomed > fit * 1.2, "{fit}% → {zoomed}%");
+
+        // 방향 단추는 설정에 저장된다.
+        harness.get_by_label("좌우").click();
+        harness.run();
+        assert_eq!(screen.app.borrow().config.compare_split, Split::Side);
     }
 
     #[test]
@@ -2198,6 +2444,39 @@ mod tests {
             result: Ok(crate::preview::shrink(&looked.image, 8192)),
         });
         shot(&mut harness, "2c-preset.png");
+        // 전후 비교: 보정 전(보정 없음)과 보정 후(풍경 120%)
+        handle(Action::SetCompare(true));
+        let (generation, original) = {
+            let app = screen.app.borrow();
+            let open = app.open.as_ref().unwrap();
+            (open.preview_generation(), open.original_generation())
+        };
+        handle(Action::PreviewReady {
+            generation,
+            index: 7,
+            result: Ok(crate::preview::shrink(&looked.image, 8192)),
+        });
+        handle(Action::OriginalReady {
+            generation: original,
+            index: 7,
+            result: Ok(crate::preview::shrink(&rendered.image, 8192)),
+        });
+        shot(&mut harness, "2d-compare.png");
+        let before = harness.get_by_label("보정 전").rect();
+        harness.hover_at(before.right_bottom() + vec2(80.0, 80.0));
+        for _ in 0..6 {
+            harness.event(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: vec2(0.0, 120.0),
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Wheel,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.run_steps(2);
+        }
+        shot(&mut harness, "2e-compare-zoomed.png");
+        harness.remove_cursor();
+        handle(Action::SetCompare(false));
         handle(Action::ResetLook);
 
         // LUT을 입힌 모습 (따뜻하고 채도가 낮은 시험용 LUT, 강도 80%)
@@ -2475,6 +2754,32 @@ mod tests {
         harness.run_steps(3);
         harness.get_by_label("By colour").click();
         check(&mut harness, "편집 패널을 다 펼친 모습");
+        handle(Action::SetCompare(true));
+        check(&mut harness, "비교를 켜고 보정 전 그림을 기다리는 중");
+        let original = screen
+            .app
+            .borrow()
+            .open
+            .as_ref()
+            .unwrap()
+            .original_generation();
+        handle(Action::OriginalReady {
+            generation: original,
+            index: 0,
+            result: Err("broken".into()),
+        });
+        check(&mut harness, "보정 전 그림을 만들지 못했을 때");
+        handle(Action::OriginalReady {
+            generation: original,
+            index: 0,
+            result: Ok(Pixels {
+                width: 4,
+                height: 4,
+                rgba: vec![128; 64],
+            }),
+        });
+        check(&mut harness, "전후 비교");
+        handle(Action::SetCompare(false));
         handle(Action::AddMask);
         handle(Action::AddMaskPoint {
             x: 0.5,
