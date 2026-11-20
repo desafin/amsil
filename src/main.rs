@@ -18,6 +18,7 @@ mod preset;
 mod preview;
 mod project;
 mod raw;
+mod rcd;
 mod recommend;
 mod skin;
 mod ui;

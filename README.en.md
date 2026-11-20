@@ -275,6 +275,7 @@ Masks can only be made in the window.
 | Job | Name | Licence |
 |---|---|---|
 | Reading RAW, EXIF | [rawler](https://github.com/dnglab/dnglab) | LGPL-2.1 |
+| RAW colour reconstruction (ported algorithm) | [RCD](https://github.com/LuisSR/RCD-Demosaicing) (Luis Sanz Rodríguez) | GPL-3.0 |
 | Writing HEIF | [libheif](https://github.com/strukturag/libheif) | LGPL-3.0 |
 | HEVC encoder | [x265](https://www.x265.org) | GPL-2.0 or later |
 | HEVC decoder | [libde265](https://github.com/strukturag/libde265) | LGPL-3.0 |

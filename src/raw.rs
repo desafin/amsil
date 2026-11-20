@@ -8,11 +8,11 @@ use rawler::RawImage;
 use rawler::cfa::{CFA, CFAColor};
 use rawler::decoders::{Orientation, RawDecodeParams};
 use rawler::formats::tiff::TiffWriter;
-use rawler::imgop::develop::{Intermediate, ProcessingStep, RawDevelop};
 use rawler::imgop::xyz::Illuminant;
 use rawler::rawimage::RawPhotometricInterpretation;
 use rawler::rawsource::RawSource;
 use rawler::tags::TiffCommonTag;
+use std::borrow::Cow;
 use std::io::Cursor;
 use std::path::Path;
 
@@ -33,9 +33,69 @@ pub struct Raw {
     pub shot: Shot,
 }
 
+/// 센서 전체의 CFA와 그 배치. 캡처 샤픈이 하이라이트 보호와 반경을 구하는 데 쓴다.
+pub struct Sensor<'a> {
+    /// 블랙·화이트 보정이 끝난 0..1 값 (화이트밸런스 전). 센서 전체, 줄 우선.
+    pub cfa: Cow<'a, [f32]>,
+    pub width: usize,
+    pub height: usize,
+    /// 첫 R 화소의 위치 (x, y).
+    pub red: (usize, usize),
+    /// 출력 영역: (x, y, 가로, 세로). `Raw::demosaic`의 결과가 센서의 이 영역이다.
+    pub crop: (usize, usize, usize, usize),
+}
+
 impl Raw {
-    /// 일반 디모자익(PPG)을 거친 카메라 RGB. 선형 값이고 센서 포화가 1.0이며 출력 영역으로 잘려 있다.
+    /// RCD 디모자익을 거친 카메라 RGB. 선형 값이고 센서 포화가 1.0이며 출력 영역으로 잘려 있다.
+    /// RCD는 화이트밸런스를 맞춘 값을 전제로 하므로, 카메라 화이트밸런스를 곱해 [0, 1]로 자른 뒤
+    /// 복원하고 다시 나눈다. 그래서 포화한 화소는 카메라 화이트밸런스 기준으로 잘린다
+    /// (현상 단계도 화이트밸런스를 곱한 뒤 1.0에서 자른다).
     pub fn demosaic(&self) -> Result<Image> {
+        let sensor = self.sensor();
+        let (w, h) = (sensor.width, sensor.height);
+        let colour = |x: usize, y: usize| crate::rcd::colour_at(x, y, sensor.red);
+        let balanced: Vec<f32> = sensor
+            .cfa
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (v * self.wb[colour(i % w, i / w)]).clamp(0.0, 1.0))
+            .collect();
+        let mut full = crate::rcd::demosaic(&balanced, w, h, sensor.red);
+        for (plane, wb) in full.planes.iter_mut().zip(self.wb) {
+            plane.iter_mut().for_each(|v| *v /= wb);
+        }
+        let image = self.crop(&full, (0, 0))?;
+        debug_assert_eq!((image.width, image.height), (sensor.crop.2, sensor.crop.3));
+        Ok(image)
+    }
+
+    /// 센서 전체의 CFA와 배치, 출력 영역.
+    pub fn sensor(&self) -> Sensor<'_> {
+        let (x, y, w, h) = self.crop_area();
+        Sensor {
+            cfa: match self.image.data.as_f32() {
+                Cow::Borrowed(data) => Cow::Borrowed(data.as_slice()),
+                Cow::Owned(data) => Cow::Owned(data),
+            },
+            width: self.image.width,
+            height: self.image.height,
+            red: self.rggb_offset,
+            crop: (x, y, w, h),
+        }
+    }
+
+    /// 출력 영역 (x, y, 가로, 세로), 센서 좌표.
+    fn crop_area(&self) -> (usize, usize, usize, usize) {
+        match self.image.crop_area.or(self.image.active_area) {
+            Some(area) => (area.p.x, area.p.y, area.d.w, area.d.h),
+            None => (0, 0, self.image.width, self.image.height),
+        }
+    }
+
+    /// 비교용: rawler의 PPG 디모자익 (예전에 쓰던 것).
+    #[cfg(test)]
+    pub fn demosaic_ppg_for_tests(&self) -> Result<Image> {
+        use rawler::imgop::develop::{Intermediate, ProcessingStep, RawDevelop};
         // 화이트밸런스와 색행렬은 develop 단계에서 직접 적용하므로 여기서는 디모자익과 크롭까지만 한다.
         let steps = [
             ProcessingStep::Demosaic,
@@ -78,13 +138,14 @@ impl Raw {
     }
 
     /// `packed_bayer`로 만든 모델 출력(센서 전체 크기)을 `demosaic`과 같은 영역으로 자른다.
+    /// 모델 출력의 (0, 0)은 센서의 첫 R 화소 자리다.
     pub fn crop_model_output(&self, full: &Image) -> Result<Image> {
-        let (x, y, w, h) = match self.image.crop_area.or(self.image.active_area) {
-            Some(area) => (area.p.x, area.p.y, area.d.w, area.d.h),
-            None => (0, 0, self.image.width, self.image.height),
-        };
-        // 모델 출력의 (0, 0)은 센서의 첫 R 화소 자리다.
-        let (ox, oy) = self.rggb_offset;
+        self.crop(full, self.rggb_offset)
+    }
+
+    /// 센서의 `origin` 자리에서 시작하는 그림 `full`을 출력 영역으로 자른다.
+    fn crop(&self, full: &Image, (ox, oy): (usize, usize)) -> Result<Image> {
+        let (x, y, w, h) = self.crop_area();
         if x < ox || y < oy || x - ox + w > full.width || y - oy + h > full.height {
             return Err(text!(
                 "모델 출력이 출력 영역을 다 덮지 못합니다",
@@ -359,6 +420,77 @@ mod tests {
                 "({x}, {y})"
             );
             assert!(cropped.planes[0][i] > 0.0);
+        }
+    }
+
+    #[test]
+    fn rcd_covers_the_same_area_as_rawler_ppg_and_is_not_shifted() {
+        let Some(path) = crate::sample_arw() else {
+            return;
+        };
+        let raw = decode(&path).unwrap();
+        let ours = raw.demosaic().unwrap();
+        let ppg = raw.demosaic_ppg_for_tests().unwrap();
+        assert_eq!((ours.width, ours.height), (ppg.width, ppg.height));
+        // 초록 평면의 상관이 제자리에서 가장 높아야 한다 (한 화소라도 밀리면 낮아진다).
+        let corr = |dx: isize, dy: isize| {
+            let (w, h) = (ours.width as isize, ours.height as isize);
+            let (mut sab, mut saa, mut sbb) = (0f64, 0f64, 0f64);
+            for y in (100..h - 100).step_by(7) {
+                for x in (100..w - 100).step_by(7) {
+                    let a = ours.planes[1][(y * w + x) as usize] as f64;
+                    let b = ppg.planes[1][((y + dy) * w + x + dx) as usize] as f64;
+                    sab += a * b;
+                    saa += a * a;
+                    sbb += b * b;
+                }
+            }
+            sab / (saa * sbb).sqrt()
+        };
+        let here = corr(0, 0);
+        for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+            assert!(here > corr(dx, dy), "({dx}, {dy}): {here} {}", corr(dx, dy));
+        }
+        // 색은 PPG와 거의 같다 (평균 절대 차이).
+        for c in 0..3 {
+            let diff = ours.planes[c]
+                .iter()
+                .zip(&ppg.planes[c])
+                .map(|(a, b)| (a - b).abs() as f64)
+                .sum::<f64>()
+                / ours.planes[c].len() as f64;
+            assert!(diff < 0.005, "{c}: {diff}");
+        }
+    }
+
+    #[test]
+    fn the_sensor_view_matches_the_crop_of_the_demosaiced_photo() {
+        let Some(path) = crate::sample_arw() else {
+            return;
+        };
+        let raw = decode(&path).unwrap();
+        let sensor = raw.sensor();
+        let photo = raw.demosaic().unwrap();
+        assert_eq!((sensor.crop.2, sensor.crop.3), (photo.width, photo.height));
+        assert_eq!((sensor.width, sensor.height), (6080, 4048));
+        assert_eq!(sensor.cfa.len(), sensor.width * sensor.height);
+        assert_eq!(sensor.red, raw.rggb_offset);
+        // 잘린 그림의 (0, 0)은 센서의 crop 자리다: 그 화소의 제 색 값이 센서 값과 같다.
+        let (cx, cy) = (sensor.crop.0, sensor.crop.1);
+        let colour = |x: usize, y: usize| match ((x + sensor.red.0) % 2, (y + sensor.red.1) % 2) {
+            (0, 0) => 0,
+            (1, 1) => 2,
+            _ => 1,
+        };
+        for (x, y) in [(0, 0), (31, 17), (3000, 2000)] {
+            let (sx, sy) = (cx + x, cy + y);
+            let c = colour(sx, sy);
+            let sensor_value = sensor.cfa[sy * sensor.width + sx].clamp(0.0, 1.0 / raw.wb[c]);
+            let photo_value = photo.planes[c][y * photo.width + x];
+            assert!(
+                (photo_value - sensor_value).abs() < 1e-6,
+                "({x}, {y}): {photo_value} {sensor_value}"
+            );
         }
     }
 

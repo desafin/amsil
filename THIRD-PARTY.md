@@ -24,6 +24,14 @@ Ubuntu 24.04의 패키지에서 가져온 것이다. 정확한 버전은 묶음 
 | 나눔고딕 (글꼴) | SIL Open Font License 1.1 | <https://hangeul.naver.com/font> |
 | 그 밖의 Rust 크레이트 | 대부분 MIT 또는 Apache-2.0 | 목록과 버전은 저장소의 `Cargo.lock` |
 
+## 옮겨 온 알고리즘
+
+다른 프로젝트의 코드를 Rust로 옮겨 실행 파일 안에 넣은 것이다. 옮긴 파일의 머리에 원 저작자와 판을 적어 두었다.
+
+| 이름 | 쓰는 곳 | 원 저작자 | 라이선스 | 소스 |
+|---|---|---|---|---|
+| RCD (Ratio Corrected Demosaicing) | RAW의 색 복원 (`src/rcd.rs`) | Luis Sanz Rodríguez | GPL-3.0 | <https://github.com/LuisSR/RCD-Demosaicing> |
+
 LGPL 라이브러리(libheif, rawler)를 고친 것으로 바꿔 쓰려면 저장소의 소스에서 다시 빌드하면 된다 (`BUILD.md`).
 
 ## 묶음에 들어 있지 않고 따로 받는 것
