@@ -1,7 +1,7 @@
 //! 변환의 실제 작업: 사진 한 장의 처리 과정과, 여러 장을 자원 한도 안에서 동시에 돌리는 일.
 //! 명령행과 GUI가 함께 쓴다.
 
-use crate::capture::{self, Capture};
+use crate::capture::{self, Capture, CaptureView};
 use crate::edit::Params;
 use crate::frame::{Frame, Shot};
 use crate::gpu::{self, Denoiser};
@@ -108,6 +108,8 @@ pub struct Look<'a> {
     pub skin_finder: Option<&'a Mutex<SkinFinder>>,
     /// RAW를 읽을 때 할 캡처 샤픈 (`render`가 쓴다).
     pub capture: Capture,
+    /// 캡처 샤픈이 걸리는 곳을 보여 줄지 (미리보기에서).
+    pub capture_view: Option<CaptureView>,
 }
 
 impl<'a> Look<'a> {
@@ -123,6 +125,7 @@ impl<'a> Look<'a> {
             skin: 0.0,
             skin_finder: None,
             capture: Capture::off(),
+            capture_view: None,
         }
     }
 }
@@ -188,10 +191,40 @@ impl Loaded {
             let alpha = mask::upscale(area, &image, false);
             skin::smooth(&mut image, &alpha, look.skin);
         }
+        if let Some(view) = look.capture_view
+            && let Some(area) = self.capture_area(cam)
+        {
+            match view {
+                CaptureView::Overlay => mask::tint(&mut image, &area),
+                CaptureView::Map => image.planes = [area.clone(), area.clone(), area],
+            }
+        }
         match look.frame {
             Some(frame) => crate::frame::apply(&image, frame, &self.shot),
             None => image,
         }
+    }
+
+    /// 캡처 샤픈을 섞은 마스크를 `cam`(원본이나 그것을 줄인 것)의 크기로 맞추고 바로 세운 것.
+    /// 마스크가 없으면(`load`로 읽었으면) None.
+    fn capture_area(&self, cam: &crate::Image) -> Option<Vec<f32>> {
+        if self.capture_mask.is_empty() {
+            return None;
+        }
+        let (w, h) = (self.cam.width, self.cam.height);
+        let plane = if (cam.width, cam.height) == (w, h) {
+            self.capture_mask.clone()
+        } else {
+            resize_plane(&self.capture_mask, w, h, cam.width, cam.height)
+        };
+        let (transpose, flip_h, flip_v) = self.flips;
+        let image = crate::Image {
+            width: cam.width,
+            height: cam.height,
+            planes: [plane, Vec::new(), Vec::new()],
+        };
+        let [plane, _, _] = develop::orient(image, transpose, flip_h, flip_v).planes;
+        Some(plane)
     }
 
     /// 마스크가 고른 곳과 피부를 모델로 구한다. 마스크도 피부 보정도 없으면 모델이 필요 없다.
@@ -248,6 +281,29 @@ impl Loaded {
         );
         crate::preview::shrink(&image, mask::INPUT)
     }
+}
+
+/// 평면 하나를 다른 크기로 바꾼다 (줄일 때는 덮는 화소들의 평균, 키울 때는 가장 가까운 화소).
+fn resize_plane(src: &[f32], w: usize, h: usize, out_w: usize, out_h: usize) -> Vec<f32> {
+    let mut out = vec![0f32; out_w * out_h];
+    for oy in 0..out_h {
+        let (y0, y1) = (
+            oy * h / out_h,
+            ((oy + 1) * h / out_h).max(oy * h / out_h + 1).min(h),
+        );
+        for ox in 0..out_w {
+            let (x0, x1) = (
+                ox * w / out_w,
+                ((ox + 1) * w / out_w).max(ox * w / out_w + 1).min(w),
+            );
+            let mut sum = 0f32;
+            for y in y0..y1 {
+                sum += src[y * w + x0..y * w + x1].iter().sum::<f32>();
+            }
+            out[oy * out_w + ox] = sum / ((y1 - y0) * (x1 - x0)) as f32;
+        }
+    }
+    out
 }
 
 /// RAW를 읽어 디모자익(또는 노이즈 제거)까지 한 것과 캡처 샤픈의 재료. 캡처 샤픈 값을 바꿀 때
@@ -761,6 +817,50 @@ mod tests {
         let n = tiles.len();
         let mean = |part: &[(f64, f64)]| part.iter().map(|t| t.1).sum::<f64>() / part.len() as f64;
         (mean(&tiles[n - n * 15 / 100..]), mean(&tiles[..n / 4]))
+    }
+
+    #[test]
+    fn the_sharpened_area_is_shown_in_red_or_as_a_map() {
+        let Some(path) = sample_arw() else { return };
+        let loaded = read(&path, None, &|_| {})
+            .unwrap()
+            .sharpened(&Capture::default());
+        let params = Params::default();
+        let develop = |view| {
+            let look = Look {
+                capture_view: view,
+                ..Look::new(&params)
+            };
+            loaded.develop(&loaded.cam, look, &Areas::default())
+        };
+        let (plain, red, map) = (
+            develop(None),
+            develop(Some(CaptureView::Overlay)),
+            develop(Some(CaptureView::Map)),
+        );
+        assert_eq!((map.width, map.height), (plain.width, plain.height));
+        // 흑백 지도는 회색이다.
+        let brightest = (0..map.planes[0].len())
+            .max_by(|&a, &b| map.planes[0][a].total_cmp(&map.planes[0][b]))
+            .unwrap();
+        assert!(map.planes[0][brightest] > 0.5);
+        assert_eq!(map.planes[0][brightest], map.planes[2][brightest]);
+        // 흰 곳은 빨간 표시에서 붉어지고, 검은 곳은 그대로다.
+        let redness = |image: &crate::Image, i: usize| image.planes[0][i] - image.planes[2][i];
+        assert!(redness(&red, brightest) > redness(&plain, brightest) + 0.05);
+        let darkest = (0..map.planes[0].len())
+            .min_by(|&a, &b| map.planes[0][a].total_cmp(&map.planes[0][b]))
+            .unwrap();
+        assert!(map.planes[0][darkest] < 0.01);
+        assert!((red.planes[0][darkest] - plain.planes[0][darkest]).abs() < 0.01);
+        // 작은 그림으로 현상해도 같은 모양으로 맞춰진다.
+        let small = crate::preview::downscale(&loaded.cam, 1200).unwrap();
+        let look = Look {
+            capture_view: Some(CaptureView::Map),
+            ..Look::new(&params)
+        };
+        let small_map = loaded.develop(&small, look, &Areas::default());
+        assert_eq!(small_map.width.max(small_map.height), 1200);
     }
 
     #[test]

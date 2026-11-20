@@ -63,6 +63,15 @@ impl Capture {
     }
 }
 
+/// 샤픈 영역 보기: 캡처 샤픈이 걸리는 곳을 미리보기에 보여 주는 방식.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureView {
+    /// 사진 위에 빨갛게 ([마스크] 패널과 같은 색).
+    Overlay,
+    /// 흑백 지도: 흰색은 샤픈하는 곳, 검정은 그대로 두는 곳.
+    Map,
+}
+
 /// 고를 수 있는 반복 횟수.
 pub const ITERATIONS: RangeInclusive<u32> = 1..=100;
 /// 고를 수 있는 반경.

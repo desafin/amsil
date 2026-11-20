@@ -236,6 +236,9 @@ pub struct Config {
     /// 전후 비교에서 미리보기를 나누는 방향.
     #[serde(default)]
     pub compare_split: Split,
+    /// 전후 비교의 보정 전 칸에 무엇을 보여 줄지.
+    #[serde(default)]
+    pub compare_before: Before,
     /// 최근에 연 프로젝트. 최신이 맨 앞.
     #[serde(default)]
     pub recent: Vec<PathBuf>,
@@ -260,6 +263,17 @@ pub enum Split {
     Side,
     /// 위아래로 (보정 전이 위).
     Stacked,
+}
+
+/// 전후 비교의 보정 전 칸에 보여 줄 것.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Before {
+    /// 아무 보정도 하지 않은 RAW.
+    #[default]
+    Raw,
+    /// 같은 폴더에 같은 이름으로 있는 카메라 JPEG (없으면 RAW).
+    Jpeg,
 }
 
 /// 최근 프로젝트 목록의 최대 길이.
@@ -688,6 +702,27 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(text.contains("theme = \"light\""), "{text}");
         assert_eq!(loaded.theme, Some(Theme::Light));
+    }
+
+    #[test]
+    fn the_compare_source_is_saved_and_raw_until_chosen() {
+        let dir = std::env::temp_dir().join(format!("amsil-config-before-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        let mut config = Config::load(&path);
+        assert_eq!(
+            config.compare_before,
+            Before::Raw,
+            "고르기 전에는 보정 전 RAW"
+        );
+        config.compare_before = Before::Jpeg;
+        config.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let loaded = Config::load(&path);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(text.contains("compare_before = \"jpeg\""), "{text}");
+        assert_eq!(loaded.compare_before, Before::Jpeg);
+        let old: Config = toml::from_str("recent = [\"/a.amsil\"]\n").unwrap();
+        assert_eq!(old.compare_before, Before::Raw);
     }
 
     #[test]

@@ -343,6 +343,7 @@ impl Workers {
                 overlay,
                 skin,
                 capture,
+                capture_view,
             } => {
                 self.latest_preview.store(generation, SeqCst);
                 std::thread::spawn(move || {
@@ -366,6 +367,7 @@ impl Workers {
                             masks: &masks,
                             overlay,
                             skin,
+                            capture_view,
                             ..export::Look::new(&params)
                         };
                         let (base, new) = workers.base(&path, denoise)?;
@@ -422,6 +424,7 @@ impl Workers {
                 generation,
                 index,
                 path,
+                jpeg,
             } => {
                 self.latest_original.store(generation, SeqCst);
                 std::thread::spawn(move || {
@@ -433,6 +436,18 @@ impl Workers {
                     }
                     // 읽어 둔 사진(`base`)은 보정 후 미리보기의 것이라 건드리지 않는다.
                     // 여기서 바꾸면 보정 후 쪽이 노이즈 제거를 다시 하게 된다.
+                    let side = workers.preview_side.load(SeqCst) as usize;
+                    if let Some(jpeg) = jpeg {
+                        let result = camera_jpeg(&jpeg, side);
+                        if !stale() {
+                            workers.send(Action::OriginalReady {
+                                generation,
+                                index,
+                                result,
+                            });
+                        }
+                        return;
+                    }
                     // 보정 전 그림에는 캡처 샤픈도 걸지 않는다 (비교하면 효과가 보이게).
                     let result =
                         export::load(&path, None, &crate::capture::Capture::off(), &|_| {})
@@ -498,6 +513,45 @@ impl Workers {
     }
 }
 
+/// 카메라 JPEG를 EXIF 방향대로 세워 긴 변이 `side` 안에 들어오게 줄인다 (전후 비교의 보정 전 칸).
+pub(crate) fn camera_jpeg(path: &Path, side: usize) -> std::result::Result<preview::Pixels, Text> {
+    use image::ImageDecoder;
+    let read = || -> crate::Result<image::RgbaImage> {
+        let mut decoder = image::ImageReader::open(path)?
+            .with_guessed_format()?
+            .into_decoder()?;
+        let orientation = decoder.orientation()?;
+        let mut image = image::DynamicImage::from_decoder(decoder)?;
+        image.apply_orientation(orientation);
+        Ok(image.to_rgba8())
+    };
+    let rgba = read().map_err(|e| {
+        let shown = path.display();
+        crate::lang::text!(
+            format!("카메라 JPEG를 읽을 수 없습니다 ({shown}): {e}"),
+            format!("Cannot read the camera JPEG ({shown}): {e}"),
+        )
+    })?;
+    let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+    let long = w.max(h);
+    let rgba = if long > side {
+        let (out_w, out_h) = ((w * side / long).max(1), (h * side / long).max(1));
+        image::imageops::resize(
+            &rgba,
+            out_w as u32,
+            out_h as u32,
+            image::imageops::FilterType::Triangle,
+        )
+    } else {
+        rgba
+    };
+    Ok(preview::Pixels {
+        width: rgba.width() as usize,
+        height: rgba.height() as usize,
+        rgba: rgba.into_raw(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -516,6 +570,21 @@ mod tests {
                 return seen;
             }
         }
+    }
+
+    #[test]
+    fn the_camera_jpeg_is_turned_upright_and_fitted_to_the_preview() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("DCIM/10361110/DSC04545.JPG");
+        if !path.exists() {
+            return;
+        }
+        let pixels = camera_jpeg(&path, 2048).unwrap();
+        // 6048×4032로 저장된 세로 사진이 EXIF 방향대로 선다.
+        assert_eq!((pixels.width, pixels.height), (1365, 2048));
+        assert_eq!(pixels.rgba.len(), 1365 * 2048 * 4);
+        let error = camera_jpeg(&path.with_extension("없음"), 2048).unwrap_err();
+        assert!(error.to_string().contains("카메라 JPEG"), "{error}");
     }
 
     #[test]
@@ -565,6 +634,7 @@ mod tests {
             overlay: None,
             skin: 0.0,
             capture: Capture::off(),
+            capture_view: None,
         });
         // 빠른 작은 미리보기가 먼저 오고, 원본 크기에 가까운 것이 뒤따른다.
         let mut seen = wait_for(&rx, |action| {
@@ -618,6 +688,7 @@ mod tests {
             overlay: None,
             skin: 0.0,
             capture: Capture::off(),
+            capture_view: None,
         });
         let seen = wait_for(&rx, |action| {
             matches!(action, Action::PreviewReady { generation: 8, .. })
@@ -658,6 +729,7 @@ mod tests {
             overlay: None,
             skin: 0.0,
             capture: Capture::default(),
+            capture_view: None,
         });
         let seen = wait_for(
             &rx,
@@ -727,6 +799,7 @@ mod tests {
             overlay: None,
             skin: 0.0,
             capture: Capture::off(),
+            capture_view: None,
         });
         workers.run(Effect::Preview {
             generation: 2,
@@ -740,6 +813,7 @@ mod tests {
             overlay: None,
             skin: 0.0,
             capture: Capture::off(),
+            capture_view: None,
         });
         let seen = wait_for(&rx, |action| {
             matches!(action, Action::PreviewReady { generation: 2, .. })
@@ -784,6 +858,7 @@ mod tests {
                 overlay,
                 skin: 0.0,
                 capture: Capture::off(),
+                capture_view: None,
             });
             let seen = wait_for(
                 &rx,
@@ -822,6 +897,7 @@ mod tests {
             generation: 3,
             index: 5,
             path: sample.clone(),
+            jpeg: None,
         });
         let seen = wait_for(&rx, |action| matches!(action, Action::OriginalReady { .. }));
         let Some(Action::OriginalReady {
@@ -850,6 +926,7 @@ mod tests {
             overlay: None,
             skin: 0.0,
             capture: Capture::off(),
+            capture_view: None,
         });
         let seen_preview = wait_for(
             &rx,

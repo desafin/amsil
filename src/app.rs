@@ -4,7 +4,7 @@
 //! 화면 밖에서 해야 할 일(썸네일 만들기, 내보내기 등)을 `Effect`로 돌려준다. 화면 코드는 상태를 읽어
 //! 그리기만 한다.
 
-use crate::capture::{self, Capture};
+use crate::capture::{self, Capture, CaptureView};
 use crate::edit::Params;
 use crate::export::{self, Report};
 use crate::frame::Frame;
@@ -14,7 +14,7 @@ use crate::log;
 use crate::mask::{Mask, Point};
 use crate::preset::{self, Preset};
 use crate::preview::Pixels;
-use crate::project::{Config, Edit, Folder, LutRef, Project, Split, Theme};
+use crate::project::{Before, Config, Edit, Folder, LutRef, Project, Split, Theme};
 use crate::recommend::{self, Guess};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -71,8 +71,14 @@ pub struct Open {
     pub compare: bool,
     /// 비교할 때 보여 줄 보정 전 그림 (한 장만 둔다).
     pub original: Option<Original>,
+    /// 마지막으로 요청한 보정 전 그림이 카메라 JPEG인가.
+    original_jpeg: bool,
+    /// (사진 번호, 그 사진의 카메라 JPEG). 보정 전 그림을 요청할 때 지금 사진에 대해 찾아 둔다.
+    pub sidecar: Option<(usize, Option<PathBuf>)>,
     /// 사진에서 구한 캡처 샤픈의 (사진 번호, 반경, 대비 문턱). 가장 최근에 읽은 사진의 것만 둔다.
     pub capture_auto: Option<(usize, f32, f32)>,
+    /// 샤픈 영역 보기 (저장하지 않는다).
+    pub capture_view: Option<CaptureView>,
     pub export: ExportState,
     /// 미리보기 요청 번호. 늦게 도착한 옛 결과를 버리는 데 쓴다.
     generation: u64,
@@ -98,9 +104,29 @@ pub struct Preview {
     pub pixels: Pixels,
 }
 
-/// 아무 보정도 하지 않은 사진 (전후 비교의 보정 전 칸).
+/// 같은 폴더에 같은 이름으로 있는 카메라 JPEG (`.jpg`, `.jpeg`, 대소문자 무관). 없으면 None.
+pub fn sidecar_jpeg(raw: &Path) -> Option<PathBuf> {
+    let (dir, stem) = (raw.parent()?, raw.file_stem()?);
+    let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.file_stem() == Some(stem)
+                && path.extension().is_some_and(|ext| {
+                    let ext = ext.to_string_lossy().to_lowercase();
+                    ext == "jpg" || ext == "jpeg"
+                })
+        })
+        .collect();
+    found.sort();
+    found.into_iter().next()
+}
+
+/// 아무 보정도 하지 않은 사진 (전후 비교의 보정 전 칸). 카메라 JPEG일 수도 있다.
 pub struct Original {
     pub index: usize,
+    /// 카메라 JPEG를 읽은 것인가.
+    pub jpeg: bool,
     /// 그림이 바뀔 때마다 달라지는 번호. 화면 쪽에서 텍스처를 다시 올릴지 아는 데 쓴다.
     pub serial: u64,
     /// 만들지 못했으면 그 이유.
@@ -213,6 +239,10 @@ pub enum Action {
         value: Capture,
         commit: bool,
     },
+    /// 샤픈 영역 보기를 바꾼다 (None이면 끈다).
+    SetCaptureView(Option<CaptureView>),
+    /// 전후 비교의 보정 전 칸에 보여 줄 것 (설정 파일에 저장한다).
+    SetCompareBefore(Before),
     /// 워커가 사진을 읽으며 구한 캡처 샤픈의 반경과 대비 문턱 (값을 정하지 않았을 때 쓰는 것).
     CaptureAuto {
         index: usize,
@@ -297,12 +327,16 @@ pub enum Effect {
         skin: f32,
         /// 캡처 샤픈 (RAW 단계).
         capture: Capture,
+        /// 캡처 샤픈이 걸리는 곳을 보여 줄지.
+        capture_view: Option<CaptureView>,
     },
-    /// 아무 보정도 하지 않은 사진을 만든다 (전후 비교의 보정 전 칸). 결과는 `Action::OriginalReady`로 온다.
+    /// 아무 보정도 하지 않은 사진을 만든다 (전후 비교의 보정 전 칸). `jpeg`가 있으면 그 카메라 JPEG를 읽는다.
+    /// 결과는 `Action::OriginalReady`로 온다.
     Original {
         generation: u64,
         index: usize,
         path: PathBuf,
+        jpeg: Option<PathBuf>,
     },
     Export {
         photos: Vec<export::Photo>,
@@ -492,7 +526,7 @@ impl App {
                 open.mask = None;
                 open.denoise_level = open.edit(index).denoise;
                 effects.push(open.request_preview(index, &self.presets));
-                effects.extend(open.request_original());
+                effects.extend(open.request_original(self.config.compare_before));
             }
             Action::SelectAll => open.selected = (0..open.photos.len()).collect(),
             Action::SetDenoiseLevel(level) => open.denoise_level = level.clamp(0.0, 1.0),
@@ -625,7 +659,7 @@ impl App {
                 if let Some(current) = open.current {
                     effects.push(open.request_preview(current, &self.presets));
                 }
-                effects.extend(open.request_original());
+                effects.extend(open.request_original(self.config.compare_before));
             }
             Action::SetSkin { value, commit } => {
                 open.change_look(commit, &self.presets, &mut effects, |edit| {
@@ -648,9 +682,23 @@ impl App {
                         .clamp(*capture::CORNER.start(), *capture::CORNER.end()),
                     ..value
                 };
+                if !value.enabled {
+                    open.capture_view = None;
+                }
                 open.change_look(commit, &self.presets, &mut effects, |edit| {
                     edit.capture = value
                 })?;
+            }
+            Action::SetCompareBefore(before) => {
+                self.config.compare_before = before;
+                self.config.save(&self.config_path)?;
+                effects.extend(open.request_original(before));
+            }
+            Action::SetCaptureView(view) => {
+                open.capture_view = view;
+                if let Some(current) = open.current {
+                    effects.push(open.request_preview(current, &self.presets));
+                }
             }
             Action::CaptureAuto {
                 index,
@@ -777,6 +825,7 @@ impl App {
                     open.preview_serial += 1;
                     open.original = Some(Original {
                         index,
+                        jpeg: open.original_jpeg,
                         serial: open.preview_serial,
                         pixels: result,
                     });
@@ -822,7 +871,10 @@ impl App {
             show_mask: true,
             compare: false,
             original: None,
+            original_jpeg: false,
+            sidecar: None,
             capture_auto: None,
+            capture_view: None,
             export: ExportState::Idle,
             generation: 0,
             preview_serial: 0,
@@ -908,20 +960,27 @@ impl Open {
     }
 
     /// 비교 중이면 지금 사진의 보정 전 그림을 요청한다. 이미 들고 있으면 (만들지 못한 경우는 빼고) 하지 않는다.
-    fn request_original(&mut self) -> Option<Effect> {
+    /// `before`가 카메라 JPEG인데 그 사진의 JPEG가 없으면 보정 전 RAW를 요청한다.
+    fn request_original(&mut self, before: Before) -> Option<Effect> {
         let current = self.current.filter(|_| self.compare)?;
-        if self
-            .original
-            .as_ref()
-            .is_some_and(|original| original.index == current && original.pixels.is_ok())
-        {
+        // 사진 폴더에 파일이 나중에 생길 수도 있으니 요청할 때마다 다시 찾는다 (폴더를 한 번 훑는다).
+        self.sidecar = Some((current, sidecar_jpeg(&self.photo_path(current))));
+        let jpeg = match before {
+            Before::Jpeg => self.sidecar.as_ref().and_then(|(_, jpeg)| jpeg.clone()),
+            Before::Raw => None,
+        };
+        if self.original.as_ref().is_some_and(|original| {
+            original.index == current && original.jpeg == jpeg.is_some() && original.pixels.is_ok()
+        }) {
             return None;
         }
         self.original_generation += 1;
+        self.original_jpeg = jpeg.is_some();
         Some(Effect::Original {
             generation: self.original_generation,
             index: current,
             path: self.photo_path(current),
+            jpeg,
         })
     }
 
@@ -975,11 +1034,15 @@ impl Open {
             denoise: edit.denoise,
             params: self.params(index, presets),
             lut: self.lut(index),
-            frame: edit.frame.filter(|_| editing.is_none() && !self.compare),
+            // 영역(마스크, 샤픈)을 보는 동안에는 프레임을 뺀다 (표시가 사진과 어긋나지 않게).
+            frame: edit
+                .frame
+                .filter(|_| editing.is_none() && !self.compare && self.capture_view.is_none()),
             masks: edit.masks,
             overlay: editing.filter(|_| self.show_mask),
             skin: edit.skin,
             capture: edit.capture,
+            capture_view: self.capture_view.filter(|_| edit.capture.enabled),
         }
     }
 
@@ -1338,6 +1401,88 @@ mod tests {
     }
 
     #[test]
+    fn the_camera_jpeg_is_found_whatever_the_case_of_its_extension() {
+        let dir = std::env::temp_dir().join(format!("amsil-sidecar-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in [
+            "a.ARW", "a.jpg", "b.ARW", "b.JPEG", "c.ARW", "d.arw", "d.JPG",
+        ] {
+            std::fs::write(dir.join(name), b"").unwrap();
+        }
+        let found = [
+            sidecar_jpeg(&dir.join("a.ARW")),
+            sidecar_jpeg(&dir.join("b.ARW")),
+            sidecar_jpeg(&dir.join("c.ARW")),
+            sidecar_jpeg(&dir.join("d.arw")),
+        ];
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            found,
+            [
+                Some(dir.join("a.jpg")),
+                Some(dir.join("b.JPEG")),
+                None,
+                Some(dir.join("d.JPG"))
+            ]
+        );
+    }
+
+    #[test]
+    fn the_before_pane_shows_the_camera_jpeg_when_chosen_and_present() {
+        let mut fx = Fixture::with_photos("compare-jpeg");
+        fx.app.handle(Action::Select {
+            index: 0,
+            extend: false,
+        });
+        fx.app.handle(Action::SetCompare(true));
+        // 사진 a 옆에 카메라 JPEG를 둔다. b에는 없다.
+        let a = fx.open().photo_path(0);
+        let jpeg = a.with_extension("JPG");
+        std::fs::write(&jpeg, b"").unwrap();
+        let effects = fx.app.handle(Action::SetCompareBefore(Before::Jpeg));
+        assert_eq!(fx.app.config.compare_before, Before::Jpeg);
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Original { index: 0, jpeg: Some(path), .. } if *path == jpeg)),
+            "{effects:?}"
+        );
+        // JPEG가 없는 사진은 보정 전 RAW를 보여 준다.
+        let effects = fx.app.handle(Action::Select {
+            index: 1,
+            extend: false,
+        });
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::Original {
+                    index: 1,
+                    jpeg: None,
+                    ..
+                }
+            )),
+            "{effects:?}"
+        );
+        // 고른 것을 되돌리면 a의 보정 전도 RAW로 다시 요청한다.
+        fx.app.handle(Action::Select {
+            index: 0,
+            extend: false,
+        });
+        let effects = fx.app.handle(Action::SetCompareBefore(Before::Raw));
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::Original {
+                    index: 0,
+                    jpeg: None,
+                    ..
+                }
+            )),
+            "{effects:?}"
+        );
+    }
+
+    #[test]
     fn comparing_asks_for_the_unedited_photo_once_per_photo() {
         let mut fx = Fixture::with_photos("compare");
         let effects = fx.app.handle(Action::Select {
@@ -1359,7 +1504,8 @@ mod tests {
         assert!(effects.contains(&Effect::Original {
             generation,
             index: 0,
-            path
+            path,
+            jpeg: None,
         }));
         fx.app.handle(Action::OriginalReady {
             generation,
@@ -1698,6 +1844,45 @@ mod tests {
             threshold: 0.12,
         });
         assert_eq!(fx.open().capture_auto, Some((0, 0.68, 0.12)));
+    }
+
+    #[test]
+    fn viewing_the_sharpened_area_leaves_the_frame_out() {
+        let mut fx = Fixture::with_photos("capture-view");
+        fx.app.handle(Action::Select {
+            index: 0,
+            extend: false,
+        });
+        fx.app.handle(Action::SetFrame(Some(Frame {
+            layout: crate::frame::Layout::Band,
+            dark: false,
+        })));
+        let effects = fx
+            .app
+            .handle(Action::SetCaptureView(Some(CaptureView::Overlay)));
+        assert!(
+            matches!(
+                &effects[..],
+                [Effect::Preview {
+                    frame: None,
+                    capture_view: Some(CaptureView::Overlay),
+                    ..
+                }]
+            ),
+            "{effects:?}"
+        );
+        let effects = fx.app.handle(Action::SetCaptureView(None));
+        assert!(
+            matches!(
+                &effects[..],
+                [Effect::Preview {
+                    frame: Some(_),
+                    capture_view: None,
+                    ..
+                }]
+            ),
+            "{effects:?}"
+        );
     }
 
     #[test]

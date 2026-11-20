@@ -1,12 +1,13 @@
 //! 화면 그리기. 상태(`App`)를 읽어 그리고, 사용자가 한 일을 `Action`으로 돌려준다. 로직은 여기에 두지 않는다.
 
 use crate::app::{Action, App, Backend, ExportState, Open, ReportView};
+use crate::capture::CaptureView;
 use crate::credits::{self, Credit, Feature};
 use crate::frame::{Frame, Layout as Shape};
 use crate::job::{describe_remaining, describe_resources};
 use crate::lang::{self, Lang, Text, t};
 use crate::preview::Pixels;
-use crate::project::{Split, Theme};
+use crate::project::{Before, Split, Theme};
 use crate::recommend;
 use eframe::egui::{self, Align, Key, Layout, Panel, RichText, TextureHandle, TextureOptions};
 use std::collections::HashMap;
@@ -803,6 +804,26 @@ fn capture_panel(ui: &mut egui::Ui, open: &Open, actions: &mut Vec<Action>) {
             ));
         });
     });
+    ui.add_enabled_ui(capture.enabled, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(t("샤픈 영역 보기", "Show sharpened area"));
+            for (view, label) in [
+                (None, t("안 보기", "Hide")),
+                (Some(CaptureView::Overlay), t("빨간 표시", "Red overlay")),
+                (
+                    Some(CaptureView::Map),
+                    t("흑백 지도", "Black-and-white map"),
+                ),
+            ] {
+                if ui
+                    .selectable_label(open.capture_view == view, label)
+                    .clicked()
+                {
+                    actions.push(Action::SetCaptureView(view));
+                }
+            }
+        });
+    });
     ui.weak(t(
         "선예도는 100%로 확대해서 보세요",
         "Judge sharpness at 100% zoom",
@@ -1383,6 +1404,36 @@ fn compare_bar(ui: &mut egui::Ui, app: &App, open: &Open, actions: &mut Vec<Acti
                     actions.push(Action::SetCompareSplit(choice));
                 }
             }
+            ui.separator();
+            // 보정 전 칸에 보여 줄 것. 지금 사진에 같은 이름의 JPEG가 없으면 고를 수 없다.
+            let has_jpeg = open
+                .sidecar
+                .as_ref()
+                .is_some_and(|(index, jpeg)| Some(*index) == open.current && jpeg.is_some());
+            let raw = app.config.compare_before == Before::Raw;
+            if ui
+                .selectable_label(raw, t("보정 전 RAW", "Unedited RAW"))
+                .clicked()
+                && !raw
+            {
+                actions.push(Action::SetCompareBefore(Before::Raw));
+            }
+            let response = ui
+                .add_enabled(
+                    has_jpeg,
+                    egui::Button::selectable(!raw, t("카메라 JPEG", "Camera JPEG")),
+                )
+                .on_hover_text(t(
+                    "카메라가 함께 저장한 JPEG와 견준다",
+                    "Compare with the JPEG the camera saved alongside",
+                ))
+                .on_disabled_hover_text(t(
+                    "같은 폴더에 같은 이름의 JPEG가 없습니다",
+                    "There is no JPEG with the same name in the folder",
+                ));
+            if response.clicked() && raw {
+                actions.push(Action::SetCompareBefore(Before::Jpeg));
+            }
         }
     });
 }
@@ -1591,8 +1642,11 @@ fn preview(ui: &mut egui::Ui, app: &App, open: &Open, view: &mut View, actions: 
             }
         }
         if open.compare {
+            let jpeg = original.is_some_and(|original| original.jpeg);
             let name = if after {
                 t("보정 후", "After")
+            } else if jpeg {
+                t("카메라 JPEG", "Camera JPEG")
             } else {
                 t("보정 전", "Before")
             };
@@ -2508,6 +2562,7 @@ mod tests {
                 skin: 0.0,
                 skin_finder: None,
                 capture: crate::capture::Capture::off(),
+                capture_view: None,
             },
             &|_| {},
         )
@@ -2568,6 +2623,7 @@ mod tests {
                 skin: 0.0,
                 skin_finder: None,
                 capture: crate::capture::Capture::off(),
+                capture_view: None,
             },
             &|_| {},
         )
@@ -2655,6 +2711,7 @@ mod tests {
                 skin: 0.0,
                 skin_finder: None,
                 capture: crate::capture::Capture::off(),
+                capture_view: None,
             },
             &|_| {},
         )
@@ -3295,6 +3352,43 @@ mod tests {
     }
 
     #[test]
+    fn the_sharpened_area_can_be_shown_and_is_greyed_out_when_capture_is_off() {
+        use egui_kittest::kittest::NodeT;
+        let screen = Screen::with_photos("capture-view-ui");
+        screen.app.borrow_mut().handle(Action::Select {
+            index: 0,
+            extend: false,
+        });
+        let mut harness = screen.harness_sized(egui::vec2(1100.0, 1000.0));
+        harness.run_steps(3);
+        harness.get_by_label("빨간 표시").click();
+        harness.run_steps(3);
+        assert_eq!(
+            screen.app.borrow().open.as_ref().unwrap().capture_view,
+            Some(CaptureView::Overlay)
+        );
+        harness.get_by_label("흑백 지도").click();
+        harness.run_steps(3);
+        assert_eq!(
+            screen.app.borrow().open.as_ref().unwrap().capture_view,
+            Some(CaptureView::Map)
+        );
+        // 캡처 샤픈을 끄면 영역 보기도 꺼지고 단추는 흐려진다.
+        harness.get_by_label("캡처 샤픈 켜기").click();
+        harness.run_steps(3);
+        assert_eq!(
+            screen.app.borrow().open.as_ref().unwrap().capture_view,
+            None
+        );
+        assert!(
+            harness
+                .get_by_label("빨간 표시")
+                .accesskit_node()
+                .is_disabled()
+        );
+    }
+
+    #[test]
     fn the_skin_panel_offers_an_amount_or_explains_the_missing_model() {
         let screen = Screen::with_photos("skin");
         let handle = |action| {
@@ -3523,6 +3617,68 @@ mod tests {
             "MediaPipe selfie multiclass 256×256 · Google",
         ] {
             assert_eq!(shown(&harness, text), 1, "{text}");
+        }
+    }
+
+    /// 선예도 기능(샤픈 영역 보기 두 가지, 카메라 JPEG 비교)을 실제 사진으로 그려 `target/ui/`에 둔다.
+    /// `cargo test -- --ignored render_capture_views`
+    #[test]
+    #[ignore = "샘플 사진이 필요하다"]
+    fn render_capture_views() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source = root.join("DCIM/10361110/DSC04551.ARW");
+        let out = root.join("target/ui");
+        std::fs::create_dir_all(&out).unwrap();
+        let read = crate::export::read(&source, None, &|_| {}).unwrap();
+        let loaded = read.sharpened(&crate::capture::Capture::default());
+        let params = crate::edit::Params::default();
+        for (name, view) in [
+            ("capture-overlay", Some(CaptureView::Overlay)),
+            ("capture-map", Some(CaptureView::Map)),
+            ("capture-jpeg", None),
+        ] {
+            let screen = Screen::new(name);
+            let handle = |action| {
+                screen.app.borrow_mut().handle(action);
+            };
+            let folder = screen.dir.join("건물");
+            std::fs::create_dir_all(&folder).unwrap();
+            for file in ["DSC04551.ARW", "DSC04551.JPG"] {
+                std::os::unix::fs::symlink(source.with_file_name(file), folder.join(file)).unwrap();
+            }
+            handle(Action::NewProject(screen.dir.join("건물.amsil")));
+            handle(Action::ImportFolder(folder.clone()));
+            handle(Action::Select {
+                index: 0,
+                extend: false,
+            });
+            if view.is_some() {
+                handle(Action::SetCaptureView(view));
+            } else {
+                handle(Action::SetCompare(true));
+                handle(Action::SetCompareBefore(crate::project::Before::Jpeg));
+                let generation = screen.app.borrow().open.as_ref().unwrap().original_generation();
+                handle(Action::OriginalReady {
+                    generation,
+                    index: 0,
+                    result: Ok(crate::worker::camera_jpeg(&folder.join("DSC04551.JPG"), 4096).unwrap()),
+                });
+            }
+            let look = crate::export::Look {
+                capture_view: view,
+                ..crate::export::Look::new(&params)
+            };
+            let image = loaded.develop(&loaded.cam, look, &crate::export::Areas::default());
+            let generation = screen.app.borrow().open.as_ref().unwrap().preview_generation();
+            handle(Action::PreviewReady {
+                generation,
+                index: 0,
+                result: Ok(crate::preview::shrink(&image, 4096)),
+            });
+            let mut harness = screen.harness_sized(egui::vec2(1400.0, 1000.0));
+            harness.run_steps(6);
+            let rendered = harness.render().unwrap();
+            rendered.save(out.join(format!("{name}.png"))).unwrap();
         }
     }
 
