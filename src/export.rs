@@ -1,6 +1,7 @@
 //! 변환의 실제 작업: 사진 한 장의 처리 과정과, 여러 장을 자원 한도 안에서 동시에 돌리는 일.
 //! 명령행과 GUI가 함께 쓴다.
 
+use crate::capture::{self, Capture};
 use crate::edit::Params;
 use crate::frame::{Frame, Shot};
 use crate::gpu::{self, Denoiser};
@@ -43,6 +44,8 @@ pub struct Photo {
     pub masks: Vec<Mask>,
     /// 피부 보정의 세기 (0~1). 0이면 끈다.
     pub skin: f32,
+    /// 캡처 샤픈 (RAW 단계).
+    pub capture: Capture,
 }
 
 impl Photo {
@@ -103,10 +106,12 @@ pub struct Look<'a> {
     pub skin: f32,
     /// 피부를 찾을 모델. 피부 보정을 켠 사진에 필요하다.
     pub skin_finder: Option<&'a Mutex<SkinFinder>>,
+    /// RAW를 읽을 때 할 캡처 샤픈 (`render`가 쓴다).
+    pub capture: Capture,
 }
 
 impl<'a> Look<'a> {
-    /// LUT도 마스크도 프레임도 없이 보정 값만.
+    /// LUT도 마스크도 프레임도 캡처 샤픈도 없이 보정 값만.
     pub fn new(params: &'a Params) -> Self {
         Self {
             params,
@@ -117,6 +122,7 @@ impl<'a> Look<'a> {
             overlay: None,
             skin: 0.0,
             skin_finder: None,
+            capture: Capture::off(),
         }
     }
 }
@@ -133,8 +139,10 @@ pub struct Areas {
 /// 읽어 들인 사진: 보정을 적용하기 전의 카메라 RGB와 현상에 필요한 값들.
 /// 읽기(디모자익, 노이즈 제거)는 오래 걸리고 보정을 바꿀 때마다 되풀이할 필요가 없어서 따로 둔다.
 pub struct Loaded {
-    /// 카메라 RGB (선형, 출력 영역으로 잘린 것).
+    /// 카메라 RGB (선형, 출력 영역으로 잘린 것). 캡처 샤픈까지 한 것이다.
     pub cam: crate::Image,
+    /// 캡처 샤픈을 섞은 마스크 (0..1, `cam`과 같은 크기). 샤픈 영역 보기에 쓴다. `load`는 비워 둔다.
+    pub capture_mask: Vec<f32>,
     wb: [f32; 3],
     xyz_to_cam: [[f32; 3]; 3],
     flips: (bool, bool, bool),
@@ -242,17 +250,54 @@ impl Loaded {
     }
 }
 
-/// RAW 한 장을 읽는다. `denoise`는 모델과 강도(0~1), `progress`에는 진행 정도(0~0.6)를 알린다.
-pub fn load(
+/// RAW를 읽어 디모자익(또는 노이즈 제거)까지 한 것과 캡처 샤픈의 재료. 캡처 샤픈 값을 바꿀 때
+/// RAW를 다시 읽지 않도록 따로 둔다.
+pub struct Read {
+    /// 캡처 샤픈 전의 카메라 RGB (선형, 출력 영역으로 잘린 것).
+    plain: crate::Image,
+    prepared: capture::Prepared,
+    wb: [f32; 3],
+    xyz_to_cam: [[f32; 3]; 3],
+    flips: (bool, bool, bool),
+    pub exif: Vec<u8>,
+    shot: Shot,
+}
+
+impl Read {
+    /// 캡처 샤픈을 해서 현상할 수 있게 한다.
+    pub fn sharpened(&self, capture: &Capture) -> Loaded {
+        let timing = Timing::start();
+        let (cam, capture_mask) = capture::sharpen(&self.plain, &self.prepared, capture);
+        timing.mark(t("캡처 샤픈", "capture sharpening"));
+        Loaded {
+            cam,
+            capture_mask,
+            wb: self.wb,
+            xyz_to_cam: self.xyz_to_cam,
+            flips: self.flips,
+            exif: self.exif.clone(),
+            shot: self.shot.clone(),
+        }
+    }
+
+    /// 사진에서 구한 캡처 샤픈의 반경과 대비 문턱.
+    pub fn auto(&self) -> (f32, f32) {
+        (self.prepared.auto_radius, self.prepared.auto_threshold)
+    }
+}
+
+/// RAW 한 장을 읽어 디모자익(또는 노이즈 제거)과 캡처 샤픈의 재료까지 만든다.
+/// `denoise`는 모델과 강도(0~1), `progress`에는 진행 정도(0~0.6)를 알린다.
+pub fn read(
     input: &Path,
     denoise: Option<(&Mutex<Denoiser>, f32)>,
     progress: &dyn Fn(f32),
-) -> Result<Loaded> {
+) -> Result<Read> {
     let timing = Timing::start();
     let raw = raw::decode(input)?;
     timing.mark(t("읽기", "read"));
     progress(0.15);
-    let cam = match denoise {
+    let plain = match denoise {
         Some((model, strength)) if strength > 0.0 => {
             let packed = raw.packed_bayer();
             let (tiles, done) = (denoise::tile_count(&packed) as f32, AtomicUsize::new(0));
@@ -277,15 +322,30 @@ pub fn load(
         _ => raw.demosaic()?,
     };
     timing.mark(t("디모자익/노이즈 제거", "demosaic/denoise"));
+    let prepared = capture::prepare(&plain, raw.wb, &raw.sensor());
+    timing.mark(t("캡처 샤픈 준비", "capture sharpening setup"));
     progress(0.6);
-    Ok(Loaded {
-        cam,
+    Ok(Read {
+        plain,
+        prepared,
         wb: raw.wb,
         xyz_to_cam: raw.xyz_to_cam,
         flips: raw.flips,
         exif: raw.exif,
         shot: raw.shot,
     })
+}
+
+/// RAW 한 장을 읽고 캡처 샤픈까지 한다 (`read` + `Read::sharpened`). 샤픈 영역 마스크는 비워 둔다.
+pub fn load(
+    input: &Path,
+    denoise: Option<(&Mutex<Denoiser>, f32)>,
+    capture: &Capture,
+    progress: &dyn Fn(f32),
+) -> Result<Loaded> {
+    let mut loaded = read(input, denoise, progress)?.sharpened(capture);
+    loaded.capture_mask = Vec::new();
+    Ok(loaded)
 }
 
 /// RAW 한 장을 읽어 현상한다. 미리보기와 내보내기가 같은 과정을 쓴다.
@@ -296,7 +356,7 @@ pub fn render(
     progress: &dyn Fn(f32),
 ) -> Result<Rendered> {
     let timing = Timing::start();
-    let loaded = load(input, denoise, progress)?;
+    let loaded = load(input, denoise, &look.capture, progress)?;
     let areas = loaded.areas(look)?;
     let image = loaded.develop(&loaded.cam, look, &areas);
     timing.mark(t("현상", "develop"));
@@ -645,6 +705,7 @@ pub fn run(
                     segmenter,
                     skin: photo.skin,
                     skin_finder,
+                    capture: photo.capture,
                     ..Look::new(&photo.params)
                 },
                 progress,
@@ -671,6 +732,62 @@ mod tests {
     /// LUT도 마스크도 프레임도 없이 보정 값만.
     fn bare(params: &Params) -> Look<'_> {
         Look::new(params)
+    }
+
+    /// 초록 평면의 라플라시안 절댓값 평균을, 64×64 구역 가운데 대비가 큰 15%(세부)와 작은 25%(평평한 곳)에서 구한다.
+    fn detail_and_flat(image: &crate::Image) -> (f64, f64) {
+        let (w, h) = (image.width, image.height);
+        let g = &image.planes[1];
+        let mut tiles: Vec<(f64, f64)> = Vec::new(); // (대비, 라플라시안 평균)
+        for ty in (64..h - 128).step_by(64) {
+            for tx in (64..w - 128).step_by(64) {
+                let (mut lap, mut grad) = (0f64, 0f64);
+                for y in ty..ty + 64 {
+                    for x in tx..tx + 64 {
+                        let c = g[y * w + x] as f64;
+                        lap += (4.0 * c
+                            - g[(y - 1) * w + x] as f64
+                            - g[(y + 1) * w + x] as f64
+                            - g[y * w + x - 1] as f64
+                            - g[y * w + x + 1] as f64)
+                            .abs();
+                        grad += (g[y * w + x + 2] as f64 - g[y * w + x - 2] as f64).abs();
+                    }
+                }
+                tiles.push((grad, lap / 4096.0));
+            }
+        }
+        tiles.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let n = tiles.len();
+        let mean = |part: &[(f64, f64)]| part.iter().map(|t| t.1).sum::<f64>() / part.len() as f64;
+        (mean(&tiles[n - n * 15 / 100..]), mean(&tiles[..n / 4]))
+    }
+
+    #[test]
+    fn capture_sharpening_adds_detail_but_not_in_flat_areas() {
+        let Some(path) = sample_arw() else { return };
+        let read = read(&path, None, &|_| {}).unwrap();
+        let off = read.sharpened(&Capture::off());
+        let on = read.sharpened(&Capture::default());
+        let (detail_off, flat_off) = detail_and_flat(&off.cam);
+        let (detail_on, flat_on) = detail_and_flat(&on.cam);
+        eprintln!("세부 {detail_off:.5} → {detail_on:.5}, 평평한 곳 {flat_off:.5} → {flat_on:.5}");
+        assert!(
+            detail_on > detail_off * 1.1,
+            "세부 {detail_on} {detail_off}"
+        );
+        assert!(flat_on < flat_off * 1.05, "평평한 곳 {flat_on} {flat_off}");
+        let (radius, threshold) = read.auto();
+        eprintln!("자동 반경 {radius}, 자동 문턱 {threshold}");
+        assert!((0.4..=2.0).contains(&radius) && threshold >= 0.0);
+        // 마스크는 샤픈할 때만 있고, load는 비워 둔다.
+        assert_eq!(on.capture_mask.len(), on.cam.width * on.cam.height);
+        assert!(
+            load(&path, None, &Capture::default(), &|_| {})
+                .unwrap()
+                .capture_mask
+                .is_empty()
+        );
     }
 
     #[test]
@@ -818,7 +935,7 @@ mod tests {
             "LUT_3D_SIZE 2\n0 0 0\n0 0 0\n0 1 0\n0 1 0\n0 0 1\n0 0 1\n0 1 1\n0 1 1\n",
         )
         .unwrap();
-        let loaded = load(&input, None, &|_| {}).unwrap();
+        let loaded = load(&input, None, &Capture::off(), &|_| {}).unwrap();
         let small = crate::preview::downscale(&loaded.cam, 400).unwrap();
         let plain = means(&loaded.develop(&small, bare(&Params::default()), &Areas::default()));
 
@@ -874,6 +991,7 @@ mod tests {
                 frame: None,
                 masks: vec![],
                 skin: 0.0,
+                capture: Capture::off(),
             },
             Photo {
                 input,
@@ -884,6 +1002,7 @@ mod tests {
                 frame: None,
                 masks: vec![],
                 skin: 0.0,
+                capture: Capture::off(),
             },
         ];
         let (outcome, _) = run(
@@ -910,7 +1029,7 @@ mod tests {
     fn a_frame_goes_round_the_upright_picture() {
         use crate::frame::{Frame, Layout};
         let Some(input) = sample_arw() else { return };
-        let loaded = load(&input, None, &|_| {}).unwrap();
+        let loaded = load(&input, None, &Capture::off(), &|_| {}).unwrap();
         let small = crate::preview::downscale(&loaded.cam, 400).unwrap();
         let params = Params::default();
         let plain = loaded.develop(&small, bare(&params), &Areas::default());
@@ -1019,7 +1138,7 @@ mod tests {
     fn a_mask_adjusts_only_the_area_it_selects() {
         use crate::mask::Mask;
         let Some(input) = sample_arw() else { return };
-        let loaded = load(&input, None, &|_| {}).unwrap();
+        let loaded = load(&input, None, &Capture::off(), &|_| {}).unwrap();
         let small = crate::preview::downscale(&loaded.cam, 400).unwrap();
         let params = Params::default();
         let plain = loaded.develop(&small, bare(&params), &Areas::default());
@@ -1085,7 +1204,7 @@ mod tests {
     fn the_selected_area_can_be_shown_in_red() {
         use crate::mask::Mask;
         let Some(input) = sample_arw() else { return };
-        let loaded = load(&input, None, &|_| {}).unwrap();
+        let loaded = load(&input, None, &Capture::off(), &|_| {}).unwrap();
         let small = crate::preview::downscale(&loaded.cam, 400).unwrap();
         let params = Params::default();
         let plain = loaded.develop(&small, bare(&params), &Areas::default());
@@ -1130,6 +1249,7 @@ mod tests {
             frame: None,
             masks,
             skin: 0.0,
+            capture: Capture::off(),
         };
         let click = Point {
             x: 0.5,
@@ -1186,7 +1306,7 @@ mod tests {
             return;
         }
         let segmenter = Mutex::new(segmenter);
-        let loaded = load(&photo, None, &|_| {}).unwrap();
+        let loaded = load(&photo, None, &Capture::off(), &|_| {}).unwrap();
         let small = crate::preview::downscale(&loaded.cam, 800).unwrap();
         let params = Params::default();
         let masks = [Mask {
@@ -1241,7 +1361,7 @@ mod tests {
     #[test]
     fn skin_retouch_changes_only_the_skin_area() {
         let Some(input) = sample_arw() else { return };
-        let loaded = load(&input, None, &|_| {}).unwrap();
+        let loaded = load(&input, None, &Capture::off(), &|_| {}).unwrap();
         let small = crate::preview::downscale(&loaded.cam, 400).unwrap();
         let params = Params::default();
         let plain = loaded.develop(&small, bare(&params), &Areas::default());
@@ -1293,7 +1413,7 @@ mod tests {
             return;
         };
         let finder = Mutex::new(finder);
-        let loaded = load(&input, None, &|_| {}).unwrap();
+        let loaded = load(&input, None, &Capture::off(), &|_| {}).unwrap();
         let params = Params::default();
         let off = Look {
             skin_finder: Some(&finder),

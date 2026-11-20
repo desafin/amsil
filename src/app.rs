@@ -4,6 +4,7 @@
 //! 화면 밖에서 해야 할 일(썸네일 만들기, 내보내기 등)을 `Effect`로 돌려준다. 화면 코드는 상태를 읽어
 //! 그리기만 한다.
 
+use crate::capture::{self, Capture};
 use crate::edit::Params;
 use crate::export::{self, Report};
 use crate::frame::Frame;
@@ -70,6 +71,8 @@ pub struct Open {
     pub compare: bool,
     /// 비교할 때 보여 줄 보정 전 그림 (한 장만 둔다).
     pub original: Option<Original>,
+    /// 사진에서 구한 캡처 샤픈의 (사진 번호, 반경, 대비 문턱). 가장 최근에 읽은 사진의 것만 둔다.
+    pub capture_auto: Option<(usize, f32, f32)>,
     pub export: ExportState,
     /// 미리보기 요청 번호. 늦게 도착한 옛 결과를 버리는 데 쓴다.
     generation: u64,
@@ -205,6 +208,17 @@ pub enum Action {
         value: f32,
         commit: bool,
     },
+    /// 선택한 사진들의 캡처 샤픈 값. 범위를 벗어난 값은 범위 안으로 들인다.
+    SetCapture {
+        value: Capture,
+        commit: bool,
+    },
+    /// 워커가 사진을 읽으며 구한 캡처 샤픈의 반경과 대비 문턱 (값을 정하지 않았을 때 쓰는 것).
+    CaptureAuto {
+        index: usize,
+        radius: f32,
+        threshold: f32,
+    },
     /// 프리셋, 수동 조정, LUT, 피부 보정을 지운다 (노이즈 제거, 프레임, 마스크는 그대로).
     ResetLook,
     SetExportFolder(PathBuf),
@@ -259,6 +273,8 @@ pub enum Action {
 
 /// 화면 밖에서 해야 할 일.
 #[derive(Debug, PartialEq)]
+// 효과는 동작 하나에 몇 개만 만든다. 변형마다 크기가 달라도 상관없다.
+#[allow(clippy::large_enum_variant)]
 pub enum Effect {
     /// (사진 번호, 파일 경로)들의 썸네일을 만든다.
     Thumbnails(Vec<(usize, PathBuf)>),
@@ -279,6 +295,8 @@ pub enum Effect {
         overlay: Option<usize>,
         /// 피부 보정의 세기.
         skin: f32,
+        /// 캡처 샤픈 (RAW 단계).
+        capture: Capture,
     },
     /// 아무 보정도 하지 않은 사진을 만든다 (전후 비교의 보정 전 칸). 결과는 `Action::OriginalReady`로 온다.
     Original {
@@ -614,12 +632,38 @@ impl App {
                     edit.skin = value.clamp(0.0, 1.0)
                 })?;
             }
+            Action::SetCapture { value, commit } => {
+                let value = Capture {
+                    iterations: value
+                        .iterations
+                        .clamp(*capture::ITERATIONS.start(), *capture::ITERATIONS.end()),
+                    radius: value
+                        .radius
+                        .map(|r| r.clamp(*capture::RADIUS.start(), *capture::RADIUS.end())),
+                    threshold: value
+                        .threshold
+                        .map(|t| t.clamp(*capture::THRESHOLD.start(), *capture::THRESHOLD.end())),
+                    corner: value
+                        .corner
+                        .clamp(*capture::CORNER.start(), *capture::CORNER.end()),
+                    ..value
+                };
+                open.change_look(commit, &self.presets, &mut effects, |edit| {
+                    edit.capture = value
+                })?;
+            }
+            Action::CaptureAuto {
+                index,
+                radius,
+                threshold,
+            } => open.capture_auto = Some((index, radius, threshold)),
             Action::ResetLook => {
                 open.change_look(true, &self.presets, &mut effects, |edit| {
                     *edit = Edit {
                         denoise: edit.denoise,
                         frame: edit.frame,
                         masks: std::mem::take(&mut edit.masks),
+                        capture: edit.capture,
                         ..Edit::default()
                     };
                 })?;
@@ -664,6 +708,7 @@ impl App {
                             frame: open.edit(index).frame,
                             masks: open.edit(index).masks,
                             skin: open.edit(index).skin,
+                            capture: open.edit(index).capture,
                         }
                     })
                     .collect();
@@ -777,6 +822,7 @@ impl App {
             show_mask: true,
             compare: false,
             original: None,
+            capture_auto: None,
             export: ExportState::Idle,
             generation: 0,
             preview_serial: 0,
@@ -933,6 +979,7 @@ impl Open {
             masks: edit.masks,
             overlay: editing.filter(|_| self.show_mask),
             skin: edit.skin,
+            capture: edit.capture,
         }
     }
 
@@ -1576,6 +1623,84 @@ mod tests {
     }
 
     #[test]
+    fn resetting_the_look_keeps_capture_sharpening() {
+        let mut fx = Fixture::with_photos("reset-capture");
+        fx.app.handle(Action::Select {
+            index: 1,
+            extend: false,
+        });
+        let off = Capture::off();
+        let (folder, relative) = {
+            let open = fx.open();
+            (open.photos[1].folder, open.photos[1].relative.clone())
+        };
+        let mut edit = fx.open().edit(1);
+        edit.capture = off;
+        fx.app
+            .open
+            .as_mut()
+            .unwrap()
+            .project
+            .set_edit(folder, &relative, edit);
+        fx.app.handle(Action::ResetLook);
+        assert_eq!(fx.open().edit(1).capture, off);
+    }
+
+    #[test]
+    fn capture_settings_go_to_every_selected_photo_and_the_preview() {
+        let mut fx = Fixture::with_photos("capture");
+        fx.app.handle(Action::Select {
+            index: 0,
+            extend: false,
+        });
+        fx.app.handle(Action::Select {
+            index: 1,
+            extend: true,
+        });
+        let value = Capture {
+            iterations: 40,
+            ..Capture::default()
+        };
+        let effects = fx.app.handle(Action::SetCapture {
+            value,
+            commit: true,
+        });
+        assert_eq!(fx.open().edit(0).capture, value);
+        assert_eq!(fx.open().edit(1).capture, value);
+        assert!(
+            matches!(&effects[..], [Effect::Preview { capture, .. }] if *capture == value),
+            "{effects:?}"
+        );
+        // 범위를 벗어난 값은 범위 안으로 들인다.
+        fx.app.handle(Action::SetCapture {
+            value: Capture {
+                iterations: 500,
+                radius: Some(9.0),
+                threshold: Some(-1.0),
+                corner: 3.0,
+                ..Capture::default()
+            },
+            commit: true,
+        });
+        let kept = fx.open().edit(0).capture;
+        assert_eq!(
+            (kept.iterations, kept.radius, kept.threshold, kept.corner),
+            (100, Some(2.0), Some(0.0), 0.5)
+        );
+    }
+
+    #[test]
+    fn the_automatic_capture_values_are_kept_with_their_photo() {
+        let mut fx = Fixture::with_photos("capture-auto");
+        fx.app.handle(Action::CaptureAuto {
+            index: 0,
+            radius: 0.68,
+            threshold: 0.12,
+        });
+        assert_eq!(fx.open().capture_auto, Some((0, 0.68, 0.12)));
+    }
+
+    #[test]
     fn reset_clears_the_look_but_keeps_denoise() {
         let mut fx = Fixture::with_photos("reset");
         fx.app.handle(Action::Select {
@@ -1766,6 +1891,7 @@ mod tests {
                     frame: None,
                     masks: Vec::new(),
                     skin: 0.0,
+                    capture: Capture::default(),
                 },
                 export::Photo {
                     input: src.join("c.ARW"),
@@ -1776,6 +1902,7 @@ mod tests {
                     frame: None,
                     masks: Vec::new(),
                     skin: 0.0,
+                    capture: Capture::default(),
                 },
                 export::Photo {
                     input: src.join("sub/b.ARW"),
@@ -1786,6 +1913,7 @@ mod tests {
                     frame: None,
                     masks: Vec::new(),
                     skin: 0.0,
+                    capture: Capture::default(),
                 },
             ]
         );

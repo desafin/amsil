@@ -73,6 +73,7 @@ git push origin v0.1.0
 | `job.rs` | 배치 실행기, 메모리 예산, 남은 시간, 폴더 탐색 |
 | `raw.rs` | RAW 읽기 |
 | `rcd.rs` | RAW의 색 복원 (RCD 디모자익). 원본 C 코드와 결과가 같은지 `tests/data/rcd/`의 정답지로 확인한다. 정답지는 `scripts/rcd-reference/make-fixtures.sh`로 다시 만든다 (gcc 필요) |
+| `capture.rs` | 캡처 샤픈 (RawTherapee 방식의 Richardson–Lucy 디컨볼루션). RAW를 읽을 때 밝기의 흐림을 되돌린다 |
 | `develop.rs` | 화이트밸런스, 색행렬, 톤 매핑, sRGB 변환, 공간 필터 |
 | `edit.rs` | 보정 값과 색 보정 (Oklab) |
 | `preset.rs` | 프리셋 파일 |

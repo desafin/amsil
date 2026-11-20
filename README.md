@@ -275,6 +275,7 @@ amsil 사진폴더 출력폴더          # 폴더 전체 (하위 폴더 포함)
 |---|---|---|
 | RAW 읽기, EXIF | [rawler](https://github.com/dnglab/dnglab) | LGPL-2.1 |
 | RAW의 색 복원 (옮겨 온 알고리즘) | [RCD](https://github.com/LuisSR/RCD-Demosaicing) (Luis Sanz Rodríguez) | GPL-3.0 |
+| 캡처 샤픈 (옮겨 온 알고리즘) | [RawTherapee](https://github.com/RawTherapee/RawTherapee)의 Capture Sharpening (Ingo Weyrich) | GPL-3.0 이상 |
 | HEIF 쓰기 | [libheif](https://github.com/strukturag/libheif) | LGPL-3.0 |
 | HEVC 인코더 | [x265](https://www.x265.org) | GPL-2.0 이상 |
 | HEVC 디코더 | [libde265](https://github.com/strukturag/libde265) | LGPL-3.0 |

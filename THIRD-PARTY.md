@@ -31,6 +31,7 @@ Ubuntu 24.04의 패키지에서 가져온 것이다. 정확한 버전은 묶음 
 | 이름 | 쓰는 곳 | 원 저작자 | 라이선스 | 소스 |
 |---|---|---|---|---|
 | RCD (Ratio Corrected Demosaicing) | RAW의 색 복원 (`src/rcd.rs`) | Luis Sanz Rodríguez | GPL-3.0 | <https://github.com/LuisSR/RCD-Demosaicing> |
+| Capture Sharpening (RawTherapee) | 캡처 샤픈 (`src/capture.rs`) | Ingo Weyrich | GPL-3.0-or-later | <https://github.com/RawTherapee/RawTherapee> (`rtengine/capturesharpening.cc`, `rt_algo.cc`, `boxblur.cc`) |
 
 LGPL 라이브러리(libheif, rawler)를 고친 것으로 바꿔 쓰려면 저장소의 소스에서 다시 빌드하면 된다 (`BUILD.md`).
 

@@ -1,4 +1,5 @@
 mod app;
+mod capture;
 mod cli;
 mod credits;
 mod denoise;
@@ -29,6 +30,7 @@ use lang::t;
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 /// 작업용 이미지. 채널별 평면(R, G, B), 값은 f32.
+#[derive(Clone)]
 pub struct Image {
     pub width: usize,
     pub height: usize,

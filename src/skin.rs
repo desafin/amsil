@@ -363,7 +363,13 @@ mod tests {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("DCIM/10161107");
         let finder = std::sync::Mutex::new(load_finder().unwrap());
         for file in ["DSC04290.ARW", "DSC04367.ARW"] {
-            let loaded = crate::export::load(&dir.join(file), None, &|_| {}).unwrap();
+            let loaded = crate::export::load(
+                &dir.join(file),
+                None,
+                &crate::capture::Capture::off(),
+                &|_| {},
+            )
+            .unwrap();
             let params = crate::edit::Params::default();
             let look = Look {
                 skin: 1.0,

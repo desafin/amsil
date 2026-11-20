@@ -655,6 +655,8 @@ fn edit_panel(
             ui.separator();
             frame_panel(ui, open, actions);
             ui.separator();
+            capture_panel(ui, open, actions);
+            ui.separator();
             denoise_panel(ui, app, open, actions);
         });
 }
@@ -671,6 +673,11 @@ fn slider(
             .text(label)
             .fixed_decimals(2),
     );
+    commit_of(&response)
+}
+
+/// 슬라이더가 바뀌었으면 `Some(놓았는가)`. 끄는 동안에는 거짓, 놓을 때 참이다.
+fn commit_of(response: &egui::Response) -> Option<bool> {
     if response.drag_stopped() {
         Some(true)
     } else if response.changed() {
@@ -678,6 +685,133 @@ fn slider(
         Some(!response.dragged())
     } else {
         None
+    }
+}
+
+/// 캡처 샤픈: RAW의 흐림을 되돌린다. 선택한 사진 전체에 적용된다.
+fn capture_panel(ui: &mut egui::Ui, open: &Open, actions: &mut Vec<Action>) {
+    ui.heading(t("캡처 샤픈", "Capture sharpening"));
+    ui.weak(t(
+        "렌즈와 센서 앞 필터 때문에 RAW에 생긴 흐림을 되돌립니다 (RawTherapee 방식).",
+        "Undoes the blur the lens and the filter in front of the sensor leave in the RAW (RawTherapee's method).",
+    ));
+    let Some(current) = open.current else {
+        ui.weak(t("사진을 고르세요", "Pick a photo"));
+        return;
+    };
+    let before = open.edit(current).capture;
+    let mut capture = before;
+    let mut commit = true;
+    // 지금 사진에서 구한 반경과 문턱 (워커가 알려 준 것)
+    let auto = open
+        .capture_auto
+        .filter(|(index, _, _)| *index == current)
+        .map(|(_, radius, threshold)| (radius, threshold));
+
+    ui.checkbox(
+        &mut capture.enabled,
+        t("캡처 샤픈 켜기", "Use capture sharpening"),
+    );
+    ui.add_enabled_ui(capture.enabled, |ui| {
+        let response = ui
+            .add(
+                egui::Slider::new(&mut capture.iterations, crate::capture::ITERATIONS)
+                    .text(t("반복 횟수", "Iterations")),
+            )
+            .on_hover_text(t(
+                "반복할수록 흐림을 더 많이 되돌립니다",
+                "More iterations undo more of the blur",
+            ));
+        if let Some(done) = commit_of(&response) {
+            commit = done;
+        }
+        ui.weak(match capture.iterations {
+            0..=20 => t("기본 (RawTherapee는 20)", "Default (RawTherapee uses 20)"),
+            21..=50 => t("강하게", "Stronger"),
+            _ => t(
+                "아주 강하게: 경계에 넘침이 생길 수 있습니다",
+                "Very strong: edges may overshoot",
+            ),
+        });
+        ui.collapsing(t("세부 설정", "More settings"), |ui| {
+            // 반경: 자동이면 사진에서 구한 값을 보여 준다. 자동을 끄면 RawTherapee의 기본 0.75에서 시작한다.
+            let mut auto_radius = capture.radius.is_none();
+            if ui
+                .checkbox(&mut auto_radius, t("반경 자동", "Auto radius"))
+                .changed()
+            {
+                capture.radius = (!auto_radius).then_some(0.75);
+            }
+            match capture.radius.as_mut() {
+                Some(radius) => {
+                    if let Some(done) =
+                        slider(ui, t("반경", "Radius"), radius, crate::capture::RADIUS)
+                    {
+                        commit = done;
+                    }
+                }
+                None => {
+                    if let Some((radius, _)) = auto {
+                        ui.weak(t(
+                            format!("자동: {radius:.2}"),
+                            format!("Auto: {radius:.2}"),
+                        ));
+                    }
+                }
+            }
+
+            // 대비 문턱: 자동을 끄면 RawTherapee의 기본 0.10에서 시작한다.
+            let mut auto_threshold = capture.threshold.is_none();
+            if ui
+                .checkbox(&mut auto_threshold, t("문턱 자동", "Auto threshold"))
+                .changed()
+            {
+                capture.threshold = (!auto_threshold).then_some(0.10);
+            }
+            match capture.threshold.as_mut() {
+                Some(threshold) => {
+                    let label = t("대비 문턱", "Contrast threshold");
+                    if let Some(done) = slider(ui, label, threshold, crate::capture::THRESHOLD) {
+                        commit = done;
+                    }
+                }
+                None => {
+                    if let Some((_, threshold)) = auto {
+                        ui.weak(t(
+                            format!("자동: {threshold:.2}"),
+                            format!("Auto: {threshold:.2}"),
+                        ));
+                    }
+                }
+            }
+            ui.weak(t(
+                "문턱이 높을수록 뚜렷한 경계만 샤픈합니다",
+                "A higher threshold sharpens only clear edges",
+            ));
+
+            let label = t("모서리 반경", "Corner radius");
+            if let Some(done) = slider(ui, label, &mut capture.corner, crate::capture::CORNER) {
+                commit = done;
+            }
+            ui.checkbox(
+                &mut capture.auto_stop,
+                t("넘치면 멈추기", "Stop when it overshoots"),
+            )
+            .on_hover_text(t(
+                "경계가 넘치기 시작한 곳은 반복을 멈춥니다",
+                "Stops iterating where edges start to overshoot",
+            ));
+        });
+    });
+    ui.weak(t(
+        "선예도는 100%로 확대해서 보세요",
+        "Judge sharpness at 100% zoom",
+    ));
+    if capture != before {
+        actions.push(Action::SetCapture {
+            value: capture,
+            commit,
+        });
     }
 }
 
@@ -2195,7 +2329,8 @@ mod tests {
             });
         };
         preview_arrives();
-        let mut harness = screen.harness();
+        // 오른쪽 패널이 길어 아래쪽 묶음이 1100×700 창에서는 잘린다 (실제 화면에서는 스크롤된다).
+        let mut harness = screen.harness_sized(egui::vec2(1100.0, 1000.0));
         harness.run();
         harness.get_by_label("선택한 1장에 적용됩니다");
         harness.get_by_label("적용").click();
@@ -2372,6 +2507,7 @@ mod tests {
                 overlay: None,
                 skin: 0.0,
                 skin_finder: None,
+                capture: crate::capture::Capture::off(),
             },
             &|_| {},
         )
@@ -2431,6 +2567,7 @@ mod tests {
                 overlay: None,
                 skin: 0.0,
                 skin_finder: None,
+                capture: crate::capture::Capture::off(),
             },
             &|_| {},
         )
@@ -2517,6 +2654,7 @@ mod tests {
                 overlay: None,
                 skin: 0.0,
                 skin_finder: None,
+                capture: crate::capture::Capture::off(),
             },
             &|_| {},
         )
@@ -2546,7 +2684,8 @@ mod tests {
                 include: true,
             });
             let masks = screen.app.borrow().open.as_ref().unwrap().edit(7).masks;
-            let loaded = crate::export::load(&path, None, &|_| {}).unwrap();
+            let loaded =
+                crate::export::load(&path, None, &crate::capture::Capture::off(), &|_| {}).unwrap();
             let params = crate::edit::Params::default();
             let look = crate::export::Look {
                 masks: &masks,
@@ -3082,6 +3221,77 @@ mod tests {
         harness.run_steps(3);
         harness.get_by_label("마스크: 모델 없음");
         assert!(harness.query_by_label("새 마스크").is_none());
+    }
+
+    #[test]
+    fn the_capture_panel_changes_the_selected_photos() {
+        let screen = Screen::with_photos("capture-panel");
+        screen.app.borrow_mut().handle(Action::Select {
+            index: 0,
+            extend: false,
+        });
+        // 오른쪽 패널이 길어 아래쪽 묶음이 1100×700 창에서는 잘린다 (실제 화면에서는 스크롤된다).
+        let mut harness = screen.harness_sized(egui::vec2(1100.0, 1000.0));
+        harness.run_steps(3);
+        harness.get_by_label("캡처 샤픈");
+        assert!(harness.query_all_by_label("반복 횟수").count() > 0);
+        // 반경과 문턱은 "세부 설정" 안에 있고, 처음에 자동이다.
+        assert!(harness.query_by_label("반경 자동").is_none(), "접혀 있다");
+        harness.get_by_label("세부 설정").click();
+        harness.run_steps(3);
+        harness.get_by_label("반경 자동").click();
+        // 미리보기를 기다리는 동안 스피너가 계속 다시 그리므로 run() 대신 정해진 횟수만 돈다.
+        harness.run_steps(3);
+        let capture = screen.app.borrow().open.as_ref().unwrap().edit(0).capture;
+        assert_eq!(
+            capture.radius,
+            Some(0.75),
+            "자동을 끄면 RawTherapee의 기본 반경에서 시작한다"
+        );
+        harness.get_by_label("캡처 샤픈 켜기").click();
+        harness.run_steps(3);
+        assert!(
+            !screen
+                .app
+                .borrow()
+                .open
+                .as_ref()
+                .unwrap()
+                .edit(0)
+                .capture
+                .enabled
+        );
+    }
+
+    #[test]
+    fn the_automatic_capture_values_are_shown_when_known() {
+        let screen = Screen::with_photos("capture-auto-ui");
+        let handle = |action| {
+            screen.app.borrow_mut().handle(action);
+        };
+        handle(Action::Select {
+            index: 0,
+            extend: false,
+        });
+        handle(Action::CaptureAuto {
+            index: 0,
+            radius: 0.68,
+            threshold: 0.12,
+        });
+        // 오른쪽 패널이 길어 아래쪽 묶음이 1100×700 창에서는 잘린다 (실제 화면에서는 스크롤된다).
+        let mut harness = screen.harness_sized(egui::vec2(1100.0, 1000.0));
+        harness.run_steps(3);
+        harness.get_by_label("세부 설정").click();
+        harness.run_steps(3);
+        assert_eq!(shown(&harness, "자동: 0.68"), 1);
+        assert_eq!(shown(&harness, "자동: 0.12"), 1);
+        // 다른 사진의 값이면 보여 주지 않는다.
+        handle(Action::Select {
+            index: 1,
+            extend: false,
+        });
+        harness.run_steps(3);
+        assert_eq!(shown(&harness, "자동: 0.68"), 0);
     }
 
     #[test]

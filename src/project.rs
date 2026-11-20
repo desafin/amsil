@@ -3,6 +3,7 @@
 //! 프로젝트 파일에는 가져온 폴더, 사진별 편집, 내보내기 설정이 들어간다. 사진 폴더에는 아무것도 쓰지 않는다.
 
 use crate::Result;
+use crate::capture::Capture;
 use crate::edit::Params;
 use crate::frame::Frame;
 use crate::lang::{t, text};
@@ -68,6 +69,9 @@ pub struct Edit {
     /// 피부 보정의 세기 (0~1).
     #[serde(skip_serializing_if = "is_zero")]
     pub skin: f32,
+    /// 캡처 샤픈 (RAW 단계). 이 항목이 없던 예전 파일은 기본값(켜짐)으로 읽힌다.
+    #[serde(skip_serializing_if = "Capture::is_default")]
+    pub capture: Capture,
 }
 
 /// 사진에 입힐 LUT 파일과 강도.
@@ -94,6 +98,7 @@ impl Default for Edit {
             frame: None,
             masks: Vec::new(),
             skin: 0.0,
+            capture: Capture::default(),
         }
     }
 }
@@ -317,6 +322,32 @@ mod tests {
             },
         );
         project
+    }
+
+    #[test]
+    fn capture_sharpening_is_on_for_old_projects_and_saved_only_when_changed() {
+        // 이 항목이 없던 프로젝트 파일
+        let old: Edit = toml::from_str("denoise = 0.5\n").unwrap();
+        assert_eq!(old.capture, Capture::default());
+        assert!(old.capture.enabled);
+        // 기본값은 파일에 쓰지 않는다
+        let text = toml::to_string(&Edit::default()).unwrap();
+        assert!(!text.contains("capture"), "{text}");
+        let changed = Edit {
+            capture: Capture {
+                iterations: 35,
+                radius: Some(0.8),
+                ..Capture::default()
+            },
+            ..Edit::default()
+        };
+        let text = toml::to_string(&changed).unwrap();
+        assert!(
+            text.contains("iterations = 35") && !text.contains("threshold"),
+            "{text}"
+        );
+        let back: Edit = toml::from_str(&text).unwrap();
+        assert_eq!(back, changed);
     }
 
     #[test]

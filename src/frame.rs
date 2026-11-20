@@ -563,7 +563,13 @@ mod tests {
         let params = crate::edit::Params::default();
         // 세로 사진 한 장과 가로 사진 한 장
         for (file, name) in [("DSC04551.ARW", "portrait"), ("DSC04553.ARW", "landscape")] {
-            let loaded = crate::export::load(&dir.join(file), None, &|_| {}).unwrap();
+            let loaded = crate::export::load(
+                &dir.join(file),
+                None,
+                &crate::capture::Capture::off(),
+                &|_| {},
+            )
+            .unwrap();
             let small = crate::preview::downscale(&loaded.cam, 1600).unwrap();
             let frames = [
                 ("band", Layout::Band, false),

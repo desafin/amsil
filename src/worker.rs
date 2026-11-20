@@ -1,6 +1,7 @@
 //! `Effect`를 백그라운드 스레드에서 실행하고, 결과를 `Action`으로 돌려보낸다.
 
 use crate::app::{Action, Backend, Effect};
+use crate::capture::Capture;
 use crate::gpu::Denoiser;
 use crate::lang::Text;
 use crate::lut::Lut;
@@ -32,6 +33,15 @@ const QUICK_SIDE: usize = 1200;
 struct Base {
     path: PathBuf,
     denoise: f32,
+    /// RAW 읽기와 디모자익(또는 노이즈 제거), 캡처 샤픈의 재료.
+    read: export::Read,
+    /// 캡처 샤픈한 것. 캡처 샤픈 값이 같으면 다시 쓴다.
+    sharpened: Mutex<Option<Arc<Sharpened>>>,
+}
+
+/// 캡처 샤픈까지 한 사진과, 그 그림에서 모델로 구한 것들.
+struct Sharpened {
+    capture: Capture,
     loaded: export::Loaded,
     /// 빠른 미리보기용으로 줄인 카메라 RGB. 원본이 이미 작으면 없다.
     small: Option<crate::Image>,
@@ -178,7 +188,7 @@ impl Workers {
     /// 미리보기에 쓸 영역(마스크가 고른 곳, 피부)을 구한다. 모델의 결과는 사진에 붙여 두고 다시 쓴다.
     fn areas(
         &self,
-        base: &Base,
+        base: &Sharpened,
         masks: &[Mask],
         skin: f32,
     ) -> std::result::Result<export::Areas, Text> {
@@ -235,15 +245,15 @@ impl Workers {
         Ok(areas)
     }
 
-    /// 사진을 읽는다. 방금 읽은 사진(같은 노이즈 제거 레벨)이면 다시 읽지 않는다.
+    /// 사진을 읽는다. 방금 읽은 사진(같은 노이즈 제거 레벨)이면 다시 읽지 않는다. 새로 읽었으면 `true`.
     /// 여러 요청이 동시에 와도 한 번만 읽도록, 읽는 동안 잠금을 쥐고 있는다.
-    fn base(&self, path: &Path, denoise: f32) -> std::result::Result<Arc<Base>, Text> {
+    fn base(&self, path: &Path, denoise: f32) -> std::result::Result<(Arc<Base>, bool), Text> {
         let mut slot = self.base.lock().unwrap();
         if let Some(base) = slot
             .as_ref()
             .filter(|base| base.path == path && base.denoise == denoise)
         {
-            return Ok(base.clone());
+            return Ok((base.clone(), false));
         }
         let denoiser = if denoise > 0.0 {
             Some(self.denoiser()?)
@@ -251,19 +261,35 @@ impl Workers {
             None
         };
         let model = denoiser.as_deref().map(|model| (model, denoise));
-        let loaded = export::load(path, model, &|_| {}).map_err(|e| Text::of(&e))?;
-        let small = preview::downscale(&loaded.cam, QUICK_SIDE);
+        let read = export::read(path, model, &|_| {}).map_err(|e| Text::of(&e))?;
         let base = Arc::new(Base {
             path: path.to_owned(),
             denoise,
+            read,
+            sharpened: Mutex::default(),
+        });
+        *slot = Some(base.clone());
+        Ok((base, true))
+    }
+
+    /// 읽어 둔 사진을 캡처 샤픈한다. 같은 값으로 이미 했으면 다시 쓴다.
+    fn sharpened(&self, base: &Base, capture: &Capture) -> Arc<Sharpened> {
+        let mut slot = base.sharpened.lock().unwrap();
+        if let Some(done) = slot.as_ref().filter(|done| done.capture == *capture) {
+            return done.clone();
+        }
+        let loaded = base.read.sharpened(capture);
+        let small = preview::downscale(&loaded.cam, QUICK_SIDE);
+        let done = Arc::new(Sharpened {
+            capture: *capture,
             loaded,
             small,
             embedding: Mutex::default(),
             areas: Mutex::default(),
             skin: Mutex::default(),
         });
-        *slot = Some(base.clone());
-        Ok(base)
+        *slot = Some(done.clone());
+        done
     }
 
     // ponytail: 경로만 보고 재사용한다. 프로그램을 켜 둔 채 LUT 파일을 고치면 사진을 다시 골라도 옛 내용이 보인다.
@@ -316,6 +342,7 @@ impl Workers {
                 masks,
                 overlay,
                 skin,
+                capture,
             } => {
                 self.latest_preview.store(generation, SeqCst);
                 std::thread::spawn(move || {
@@ -341,7 +368,19 @@ impl Workers {
                             skin,
                             ..export::Look::new(&params)
                         };
-                        let base = workers.base(&path, denoise)?;
+                        let (base, new) = workers.base(&path, denoise)?;
+                        if new {
+                            let (radius, threshold) = base.read.auto();
+                            workers.send(Action::CaptureAuto {
+                                index,
+                                radius,
+                                threshold,
+                            });
+                        }
+                        if stale() {
+                            return Ok(());
+                        }
+                        let base = workers.sharpened(&base, &capture);
                         if stale() {
                             return Ok(());
                         }
@@ -394,17 +433,19 @@ impl Workers {
                     }
                     // 읽어 둔 사진(`base`)은 보정 후 미리보기의 것이라 건드리지 않는다.
                     // 여기서 바꾸면 보정 후 쪽이 노이즈 제거를 다시 하게 된다.
-                    let result = export::load(&path, None, &|_| {})
-                        .map(|loaded| {
-                            let params = crate::edit::Params::default();
-                            let full = loaded.develop(
-                                &loaded.cam,
-                                export::Look::new(&params),
-                                &export::Areas::default(),
-                            );
-                            preview::shrink(&full, workers.preview_side.load(SeqCst) as usize)
-                        })
-                        .map_err(|e| Text::of(&e));
+                    // 보정 전 그림에는 캡처 샤픈도 걸지 않는다 (비교하면 효과가 보이게).
+                    let result =
+                        export::load(&path, None, &crate::capture::Capture::off(), &|_| {})
+                            .map(|loaded| {
+                                let params = crate::edit::Params::default();
+                                let full = loaded.develop(
+                                    &loaded.cam,
+                                    export::Look::new(&params),
+                                    &export::Areas::default(),
+                                );
+                                preview::shrink(&full, workers.preview_side.load(SeqCst) as usize)
+                            })
+                            .map_err(|e| Text::of(&e));
                     if !stale() {
                         workers.send(Action::OriginalReady {
                             generation,
@@ -523,6 +564,7 @@ mod tests {
             masks: Vec::new(),
             overlay: None,
             skin: 0.0,
+            capture: Capture::off(),
         });
         // 빠른 작은 미리보기가 먼저 오고, 원본 크기에 가까운 것이 뒤따른다.
         let mut seen = wait_for(&rx, |action| {
@@ -547,6 +589,15 @@ mod tests {
             [(800, 1200), (1365, 2048)],
             "세로 사진: 긴 변 1200짜리가 먼저, 2048짜리가 나중"
         );
+        // 사진을 새로 읽으면 사진에서 구한 캡처 샤픈 값도 알려 준다.
+        assert!(
+            seen.iter().any(|action| matches!(
+                action,
+                Action::CaptureAuto { index: 0, radius, threshold }
+                    if (0.4..=2.0).contains(radius) && *threshold >= 0.0
+            )),
+            "CaptureAuto가 오지 않았다"
+        );
 
         // 같은 사진의 보정만 바꾸면 파일을 다시 읽지 않는다. 파일을 지워도 미리보기가 나오는 것으로 확인한다.
         // (걸린 시간으로 재면 다른 테스트가 함께 돌 때 흔들린다.)
@@ -566,6 +617,7 @@ mod tests {
             masks: Vec::new(),
             overlay: None,
             skin: 0.0,
+            capture: Capture::off(),
         });
         let seen = wait_for(&rx, |action| {
             matches!(action, Action::PreviewReady { generation: 8, .. })
@@ -581,9 +633,49 @@ mod tests {
             px[0].abs_diff(px[1]) <= 1 && px[1].abs_diff(px[2]) <= 1,
             "흑백이어야 한다: {px:?}"
         );
-        wait_for(
+        let full_mono = wait_for(
             &rx,
             |action| matches!(action, Action::PreviewReady { generation: 8, result: Ok(preview), .. } if preview.height == 2048),
+        );
+        let Some(Action::PreviewReady {
+            result: Ok(full_mono),
+            ..
+        }) = full_mono.last()
+        else {
+            unreachable!()
+        };
+
+        // 캡처 샤픈 값만 바꿔도 (지운) 파일을 다시 읽지 않고, 그림은 달라진다.
+        workers.run(Effect::Preview {
+            generation: 9,
+            index: 0,
+            path: copy.clone(),
+            denoise: 0.0,
+            params: mono,
+            lut: None,
+            frame: None,
+            masks: Vec::new(),
+            overlay: None,
+            skin: 0.0,
+            capture: Capture::default(),
+        });
+        let seen = wait_for(
+            &rx,
+            |action| matches!(action, Action::PreviewReady { generation: 9, result, .. } if result.as_ref().is_err_and(|_| true) || result.as_ref().is_ok_and(|p| p.height == 2048)),
+        );
+        let Some(Action::PreviewReady {
+            result: Ok(sharpened),
+            ..
+        }) = seen.last()
+        else {
+            panic!(
+                "캡처 샤픈만 바꿨는데 (지운) 사진 파일을 다시 읽으려 했다: {:?}",
+                seen.last().map(|_| ())
+            )
+        };
+        assert!(
+            sharpened.rgba != full_mono.rgba,
+            "캡처 샤픈을 켜면 그림이 달라야 한다"
         );
 
         let output = dir.join("sub/out.heic");
@@ -596,6 +688,7 @@ mod tests {
             frame: None,
             masks: Vec::new(),
             skin: 0.0,
+            capture: crate::capture::Capture::default(),
         }];
         workers.run(Effect::Export {
             photos,
@@ -633,6 +726,7 @@ mod tests {
             masks: Vec::new(),
             overlay: None,
             skin: 0.0,
+            capture: Capture::off(),
         });
         workers.run(Effect::Preview {
             generation: 2,
@@ -645,6 +739,7 @@ mod tests {
             masks: Vec::new(),
             overlay: None,
             skin: 0.0,
+            capture: Capture::off(),
         });
         let seen = wait_for(&rx, |action| {
             matches!(action, Action::PreviewReady { generation: 2, .. })
@@ -688,6 +783,7 @@ mod tests {
                 }],
                 overlay,
                 skin: 0.0,
+                capture: Capture::off(),
             });
             let seen = wait_for(
                 &rx,
@@ -753,6 +849,7 @@ mod tests {
             masks: Vec::new(),
             overlay: None,
             skin: 0.0,
+            capture: Capture::off(),
         });
         let seen_preview = wait_for(
             &rx,

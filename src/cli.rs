@@ -1,5 +1,6 @@
 //! 명령행 도구.
 
+use crate::capture::Capture;
 use crate::edit::Params;
 use crate::export::{self, Look, Photo, Report, Settings};
 use crate::frame::{Frame, Layout};
@@ -39,6 +40,8 @@ pub struct Args {
     skin: f32,
     /// 출력 품질.
     quality: u8,
+    /// 캡처 샤픈.
+    pub capture: Capture,
 }
 
 /// 사용법 안내.
@@ -59,7 +62,13 @@ pub fn usage() -> &'static str {
   --quality=N          출력 품질 (40~100, 기본 55. 55가 JPEG 90 수준이다)
   --overwrite          이미 있는 출력 파일도 다시 만든다 (기본은 건너뜀)
   --jobs=N             동시에 처리할 장수 (기본: CPU 코어 수)
-  --memory=GB          사용할 메모리 한도 (기본: 남은 메모리의 70%)",
+  --memory=GB          사용할 메모리 한도 (기본: 남은 메모리의 70%)
+  --no-capture         캡처 샤픈을 하지 않는다 (기본은 한다: RAW의 흐림을 되돌린다)
+  --capture-iterations=N  캡처 샤픈의 반복 횟수 (1~100, 기본 20. 많을수록 강하게)
+  --capture-radius=R   되돌릴 흐림의 반경 (0.4~2, 주지 않으면 사진에서 구한다)
+  --capture-threshold=T  대비 문턱 (0~2, 높을수록 뚜렷한 경계만. 주지 않으면 사진에서 구한다)
+  --capture-corner=X   모서리로 갈수록 반경에 더하는 값 (-0.5~0.5, 기본 0)
+  --capture-no-auto-stop  넘침이 생겨도 반복을 멈추지 않는다",
         "Usage: amsil [options] <input RAW> <output.heic>
        amsil [options] <input folder> <output folder>     converts everything, subfolders included
 Options:
@@ -75,7 +84,13 @@ Options:
   --quality=N          output quality (40 to 100, default 55; 55 is about JPEG 90)
   --overwrite          redo output files that already exist (skipped by default)
   --jobs=N             photos to process at once (default: number of CPU cores)
-  --memory=GB          memory limit (default: 70% of the available memory)",
+  --memory=GB          memory limit (default: 70% of the available memory)
+  --no-capture         skip capture sharpening (on by default: it undoes the blur in the RAW)
+  --capture-iterations=N  capture sharpening iterations (1 to 100, default 20; more is stronger)
+  --capture-radius=R   radius of the blur to undo (0.4 to 2; worked out from the photo if not given)
+  --capture-threshold=T  contrast threshold (0 to 2; higher sharpens only clear edges; from the photo if not given)
+  --capture-corner=X   radius added towards the corners (-0.5 to 0.5, default 0)
+  --capture-no-auto-stop  keep iterating even when overshoot appears",
     )
 }
 
@@ -86,6 +101,7 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> std::result::Resu
     let (mut layout, mut frame_black) = (None::<Layout>, false);
     let mut skin = 0.0;
     let mut quality = export::QUALITY;
+    let mut capture = Capture::default();
     let mut paths = Vec::new();
     for arg in args {
         let Some(option) = arg.to_str().filter(|text| text.starts_with("--")) else {
@@ -166,6 +182,52 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> std::result::Resu
                         "The skin amount must be a number from 0 to 1",
                     ))?;
             }
+            ("--no-capture", None) => capture.enabled = false,
+            ("--capture-no-auto-stop", None) => capture.auto_stop = false,
+            ("--capture-iterations", Some(value)) => {
+                capture.iterations = value
+                    .parse()
+                    .ok()
+                    .filter(|n| crate::capture::ITERATIONS.contains(n))
+                    .ok_or(text!(
+                        "캡처 샤픈의 반복 횟수는 1에서 100 사이의 정수여야 합니다",
+                        "The capture sharpening iterations must be a whole number from 1 to 100",
+                    ))?;
+            }
+            ("--capture-radius", Some(value)) => {
+                capture.radius = Some(
+                    value
+                        .parse()
+                        .ok()
+                        .filter(|r| crate::capture::RADIUS.contains(r))
+                        .ok_or(text!(
+                            "캡처 샤픈의 반경은 0.4에서 2 사이의 숫자여야 합니다",
+                            "The capture sharpening radius must be a number from 0.4 to 2",
+                        ))?,
+                );
+            }
+            ("--capture-threshold", Some(value)) => {
+                capture.threshold = Some(
+                    value
+                        .parse()
+                        .ok()
+                        .filter(|t| crate::capture::THRESHOLD.contains(t))
+                        .ok_or(text!(
+                            "캡처 샤픈의 대비 문턱은 0에서 2 사이의 숫자여야 합니다",
+                            "The capture sharpening threshold must be a number from 0 to 2",
+                        ))?,
+                );
+            }
+            ("--capture-corner", Some(value)) => {
+                capture.corner = value
+                    .parse()
+                    .ok()
+                    .filter(|c| crate::capture::CORNER.contains(c))
+                    .ok_or(text!(
+                        "캡처 샤픈의 모서리 반경은 -0.5에서 0.5 사이의 숫자여야 합니다",
+                        "The capture sharpening corner boost must be a number from -0.5 to 0.5",
+                    ))?;
+            }
             _ => {
                 return Err(text!(
                     format!("모르는 옵션: {option}"),
@@ -199,6 +261,7 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> std::result::Resu
             frame,
             skin,
             quality,
+            capture,
         }),
         Err(_) => Err(text!(
             "입력과 출력을 하나씩 지정해야 합니다",
@@ -315,6 +378,7 @@ fn run_folder(
             frame: args.frame,
             masks: Vec::new(),
             skin: args.skin,
+            capture: args.capture,
         })
         .collect();
     let denoiser = load_denoiser(args.denoise > 0.0)?;
@@ -376,6 +440,7 @@ pub fn run(args: &Args) -> Result<()> {
                 frame: args.frame.as_ref(),
                 skin: args.skin,
                 skin_finder: skin_finder.as_ref(),
+                capture: args.capture,
                 ..Look::new(&params_for(args, std::slice::from_ref(&args.input))?[0])
             },
             &|_| {},
@@ -548,6 +613,7 @@ mod tests {
             frame: None,
             skin: 0.0,
             quality: export::QUALITY,
+            capture: Capture::off(),
         };
 
         let mut last = None;
@@ -591,6 +657,43 @@ mod tests {
             status_line(&report),
             "[##########..........] 142/309 · 50% · 약 6분 남음 · CPU 87% · 메모리 18.0/24.0GB · GPU 96% · 처리 중 12장"
         );
+    }
+
+    #[test]
+    fn capture_sharpening_options() {
+        assert_eq!(args(&["in", "out"]).unwrap().capture, Capture::default());
+        assert!(
+            !args(&["--no-capture", "in", "out"])
+                .unwrap()
+                .capture
+                .enabled
+        );
+        let a = args(&[
+            "--capture-iterations=40",
+            "--capture-radius=0.9",
+            "--capture-threshold=0.2",
+            "--capture-corner=0.3",
+            "--capture-no-auto-stop",
+            "in",
+            "out",
+        ])
+        .unwrap()
+        .capture;
+        assert_eq!(
+            (a.iterations, a.radius, a.threshold, a.corner, a.auto_stop),
+            (40, Some(0.9), Some(0.2), 0.3, false)
+        );
+        for bad in [
+            "--capture-iterations=0",
+            "--capture-radius=3",
+            "--capture-threshold=-1",
+            "--capture-corner=0.8",
+        ] {
+            assert!(args(&[bad, "in", "out"]).is_err(), "{bad}");
+        }
+        assert!(usage().contains("--capture-iterations"));
+        crate::lang::set(crate::lang::Lang::En);
+        assert!(usage().contains("--no-capture"));
     }
 
     #[test]
