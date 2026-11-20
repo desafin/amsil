@@ -819,6 +819,47 @@ mod tests {
         (mean(&tiles[n - n * 15 / 100..]), mean(&tiles[..n / 4]))
     }
 
+    /// 디모자익 비교용 그림을 만든다 (`scripts/sharpness/demosaic.py`가 읽는다).
+    /// `cargo test --release -- --ignored render_for_demosaic_comparison`
+    ///
+    /// 샘플마다 RCD(지금 쓰는 것), rawler의 PPG(예전에 쓰던 것), AI 노이즈 제거 모델(레벨 1, 모델이 있을 때)로
+    /// 색을 복원해, 캡처 샤픈 없이 보정 없이 현상한 2048×2048 영역을 `demosaic/`에 쓴다.
+    #[test]
+    #[ignore = "샘플 사진이 필요하다"]
+    fn render_for_demosaic_comparison() {
+        use crate::raw16::{PHOTOS, SIDE};
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let out = crate::raw16::dir().join("demosaic");
+        std::fs::create_dir_all(&out).unwrap();
+        let model = load_denoiser().ok().map(Mutex::new);
+        let params = Params::default();
+        for (photo, y0, x0) in PHOTOS {
+            let name = photo.rsplit('/').next().unwrap();
+            let path = root.join(format!("DCIM/{photo}.ARW"));
+            let raw = raw::decode(&path).unwrap();
+            let upright = |cam: &crate::Image| {
+                let image = develop::develop(cam, raw.wb, raw.xyz_to_cam, &params);
+                let (transpose, flip_h, flip_v) = raw.flips;
+                develop::orient(image, transpose, flip_h, flip_v)
+            };
+            let mut methods = vec![
+                ("rcd", upright(&raw.demosaic().unwrap())),
+                ("ppg", upright(&raw.demosaic_ppg_for_tests().unwrap())),
+            ];
+            if let Some(model) = &model {
+                let loaded = read(&path, Some((model, 1.0)), &|_| {})
+                    .unwrap()
+                    .sharpened(&Capture::off());
+                methods.push(("ai", upright(&loaded.cam)));
+            }
+            for (method, image) in methods {
+                let file = out.join(format!("{name}-{method}.raw"));
+                crate::raw16::write(&image, (x0, y0), (SIDE, SIDE), &file);
+                eprintln!("{}", file.display());
+            }
+        }
+    }
+
     /// 선예도 측정용 그림을 만든다 (`scripts/sharpness/measure.py`가 읽는다).
     /// `cargo test --release -- --ignored render_for_sharpness_measurement`
     ///
@@ -827,21 +868,9 @@ mod tests {
     #[test]
     #[ignore = "샘플 사진이 필요하고 몇 분 걸린다"]
     fn render_for_sharpness_measurement() {
-        use libheif_rs::{ColorSpace, HeifContext, LibHeif, RgbChroma};
+        use crate::raw16::{PHOTOS, SIDE};
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let out = std::path::PathBuf::from(
-            std::env::var("AMSIL_SHARPNESS_DIR").unwrap_or("/tmp/amsil-sharpness".into()),
-        );
-        std::fs::create_dir_all(&out).unwrap();
-        // (사진, 자를 곳의 왼쪽 위 y, x): 2026-11-20 측정에서 세부가 가장 많던 2048 창
-        let photos = [
-            ("10361110/DSC04551", 3328, 0),
-            ("10361110/DSC04546", 3072, 0),
-            ("10361110/DSC04545", 768, 1536),
-            ("10161107/DSC04249", 1792, 256),
-            ("10161107/DSC04311", 1792, 768),
-            ("10161107/DSC04286", 768, 1536),
-        ];
+        let out = crate::raw16::dir();
         let base = Capture::default();
         let t = |threshold: f32| Capture {
             threshold: Some(threshold),
@@ -850,11 +879,19 @@ mod tests {
         // (이름, 캡처 샤픈, 그 위에 더하는 창작 샤픈)
         let conditions = [
             ("off", Capture::off(), 0.0),
-            ("it20", base, 0.0),
+            (
+                "it20",
+                Capture {
+                    threshold: None,
+                    ..base
+                },
+                0.0,
+            ),
             (
                 "it10",
                 Capture {
                     iterations: 10,
+                    threshold: None,
                     ..base
                 },
                 0.0,
@@ -863,6 +900,7 @@ mod tests {
                 "it40",
                 Capture {
                     iterations: 40,
+                    threshold: None,
                     ..base
                 },
                 0.0,
@@ -883,23 +921,8 @@ mod tests {
             ("it20-t0.4-s0.1", t(0.4), 0.1),
             ("it20-t0.4-s0.3", t(0.4), 0.3),
         ];
-        let side = 2048;
-        let save = |image: &crate::Image, y0: usize, x0: usize, path: &std::path::Path| {
-            let mut bytes = Vec::with_capacity(8 + side * side * 6);
-            bytes.extend((side as u32).to_le_bytes());
-            bytes.extend((side as u32).to_le_bytes());
-            for y in y0..y0 + side {
-                for x in x0..x0 + side {
-                    for c in 0..3 {
-                        let v = image.planes[c][y * image.width + x].clamp(0.0, 1.0);
-                        bytes.extend(((v * 65535.0 + 0.5) as u16).to_le_bytes());
-                    }
-                }
-            }
-            std::fs::write(path, bytes).unwrap();
-        };
         let mut results = String::from("photo\tcondition\tbytes\tseconds\tradius\tthreshold\n");
-        for (photo, y0, x0) in photos {
+        for (photo, y0, x0) in PHOTOS {
             let name = photo.rsplit('/').next().unwrap();
             let read = read(&root.join(format!("DCIM/{photo}.ARW")), None, &|_| {}).unwrap();
             let (radius, threshold) = read.auto();
@@ -912,31 +935,13 @@ mod tests {
                 };
                 let image = loaded.develop(&loaded.cam, Look::new(&params), &Areas::default());
                 let seconds = started.elapsed().as_secs_f32();
-                save(&image, y0, x0, &out.join(format!("{name}-{label}-pre.raw")));
-                let encoded = heif::encode(&image, 55, None, cores()).unwrap();
-                let ctx = HeifContext::read_from_bytes(&encoded.bytes).unwrap();
-                let handle = ctx.primary_image_handle().unwrap();
-                let decoded = LibHeif::new()
-                    .decode(&handle, ColorSpace::Rgb(RgbChroma::HdrRgbLe), None)
-                    .unwrap();
-                let planes = decoded.planes();
-                let p = planes.interleaved.unwrap();
-                let (w, h) = (image.width, image.height);
-                let mut back = crate::Image {
-                    width: w,
-                    height: h,
-                    planes: [0, 1, 2].map(|_| vec![0f32; w * h]),
+                let crop = |image: &crate::Image, suffix: &str| {
+                    let path = out.join(format!("{name}-{label}-{suffix}.raw"));
+                    crate::raw16::write(image, (x0, y0), (SIDE, SIDE), &path);
                 };
-                for y in 0..h {
-                    for x in 0..w {
-                        for c in 0..3 {
-                            let i = y * p.stride + (x * 3 + c) * 2;
-                            back.planes[c][y * w + x] =
-                                u16::from_le_bytes([p.data[i], p.data[i + 1]]) as f32 / 1023.0;
-                        }
-                    }
-                }
-                save(&back, y0, x0, &out.join(format!("{name}-{label}-post.raw")));
+                crop(&image, "pre");
+                let encoded = heif::encode(&image, 55, None, cores()).unwrap();
+                crop(&heif::decode(&encoded.bytes).unwrap(), "post");
                 results.push_str(&format!(
                     "{name}\t{label}\t{}\t{seconds:.2}\t{radius:.3}\t{threshold:.3}\n",
                     encoded.bytes.len()

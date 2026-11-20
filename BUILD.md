@@ -35,7 +35,7 @@ cargo test --locked
 - 화면 테스트는 창을 띄우지 않고 돈다 (`egui_kittest`).
 - 눈으로 확인할 화면 그림은 `cargo test -- --ignored render`로 `target/ui/`에 만든다 (샘플 사진 필요).
 - README의 화면 그림(한국어 `assets/screenshots/workspace.jpg`, 영어 `workspace.en.jpg`)은 `cargo test -- --ignored render_readme_screenshot`으로 다시 만든다. 공개 저장소에 올라가는 그림이라, 쓸 사진(사람이 나오지 않는 것)의 목록이 그 테스트 안에 적혀 있다.
-- 캡처 샤픈의 기본값은 `scripts/sharpness/`의 측정으로 정했다. 다시 재려면 `cargo test --release -- --ignored render_for_sharpness_measurement`로 그림을 만들고 `python3 scripts/sharpness/measure.py`를 돌린다 (샘플 사진, numpy, Pillow 필요).
+- 선예도 측정 도구는 `scripts/sharpness/`에 있다 (캡처 샤픈 조건, 카메라 JPEG의 처리, 샤픈 필터 맞추기, 인코더 설정, 디모자익 방식). 순서와 읽는 법은 그 폴더의 README. 샘플 사진, numpy, Pillow가 필요하다.
 - 캡처 샤픈의 화면(샤픈 영역 보기, 카메라 JPEG 비교)은 `cargo test -- --ignored render_capture_views`로 `target/ui/`에 그려 볼 수 있다.
 
 커밋을 올리면 GitHub Actions가 깨끗한 Ubuntu 24.04에서 같은 절차로 빌드하고 테스트한다 ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
@@ -74,6 +74,7 @@ git push origin v0.1.0
 | `export.rs` | 사진 한 장의 변환 과정, 여러 장의 동시 실행, 자원 측정 |
 | `job.rs` | 배치 실행기, 메모리 예산, 남은 시간, 폴더 탐색 |
 | `raw.rs` | RAW 읽기 |
+| `raw16.rs` | (테스트 전용) 측정 도구와 주고받는 16비트 그림 파일, 측정할 샘플 목록 |
 | `rcd.rs` | RAW의 색 복원 (RCD 디모자익). 원본 C 코드와 결과가 같은지 `tests/data/rcd/`의 정답지로 확인한다. 정답지는 `scripts/rcd-reference/make-fixtures.sh`로 다시 만든다 (gcc 필요) |
 | `capture.rs` | 캡처 샤픈 (RawTherapee 방식의 Richardson–Lucy 디컨볼루션). RAW를 읽을 때 밝기의 흐림을 되돌린다 |
 | `develop.rs` | 화이트밸런스, 색행렬, 톤 매핑, sRGB 변환, 공간 필터 |

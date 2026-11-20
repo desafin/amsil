@@ -19,6 +19,8 @@ mod preset;
 mod preview;
 mod project;
 mod raw;
+#[cfg(test)]
+mod raw16;
 mod rcd;
 mod recommend;
 mod skin;

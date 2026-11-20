@@ -33,7 +33,7 @@ fn encode_within(
 ) -> Result<Encoded> {
     let mut quality = quality;
     loop {
-        let bytes = encode_once(img, quality, exif, threads)?;
+        let bytes = encode_once(img, quality, exif, threads, &[])?;
         if bytes.len() <= max_bytes {
             return Ok(Encoded { bytes, quality });
         }
@@ -54,7 +54,14 @@ fn encode_within(
 /// 용량을 맞추려고 품질을 낮출 때의 하한.
 const MIN_QUALITY: u8 = 30;
 
-fn encode_once(img: &Image, quality: u8, exif: Option<&[u8]>, threads: usize) -> Result<Vec<u8>> {
+/// 한 번 인코딩한다. `extra`는 libheif 인코더에 더 줄 매개변수(측정에서 x265 설정을 바꿔 볼 때 쓴다).
+fn encode_once(
+    img: &Image,
+    quality: u8,
+    exif: Option<&[u8]>,
+    threads: usize,
+    extra: &[(&str, &str)],
+) -> Result<Vec<u8>> {
     let (w, h) = (img.width, img.height);
     let mut out = libheif_rs::Image::new(w as u32, h as u32, ColorSpace::Rgb(RgbChroma::HdrRgbLe))?;
     out.create_plane(Channel::Interleaved, w as u32, h as u32, 10)?;
@@ -87,6 +94,9 @@ fn encode_once(img: &Image, quality: u8, exif: Option<&[u8]>, threads: usize) ->
         "x265:pools",
         EncoderParameterValue::String(threads.max(1).to_string()),
     )?;
+    for (name, value) in extra {
+        encoder.set_parameter_value(name, EncoderParameterValue::String((*value).into()))?;
+    }
     let handle = ctx.encode_image(&out, &mut encoder, None)?;
     if let Some(exif) = exif {
         ctx.add_exif_metadata(&handle, exif)?;
@@ -94,9 +104,97 @@ fn encode_once(img: &Image, quality: u8, exif: Option<&[u8]>, threads: usize) ->
     Ok(ctx.write_to_bytes()?)
 }
 
+/// HEIF를 0..1 값의 RGB로 되읽는다 (테스트와 측정에서 쓴다).
+#[cfg(test)]
+pub fn decode(bytes: &[u8]) -> Result<Image> {
+    let ctx = HeifContext::read_from_bytes(bytes)?;
+    let handle = ctx.primary_image_handle()?;
+    let decoded = LibHeif::new().decode(&handle, ColorSpace::Rgb(RgbChroma::HdrRgbLe), None)?;
+    let (w, h) = (decoded.width() as usize, decoded.height() as usize);
+    let planes = decoded.planes();
+    let p = planes.interleaved.ok_or("no interleaved plane")?;
+    let mut out = [0, 1, 2].map(|_| vec![0f32; w * h]);
+    for y in 0..h {
+        for x in 0..w {
+            for (c, plane) in out.iter_mut().enumerate() {
+                let i = y * p.stride + (x * 3 + c) * 2;
+                plane[y * w + x] = u16::from_le_bytes([p.data[i], p.data[i + 1]]) as f32 / 1023.0;
+            }
+        }
+    }
+    Ok(Image {
+        width: w,
+        height: h,
+        planes: out,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 인코더 설정 비교용 그림을 만든다 (`scripts/sharpness/encoder.py`가 읽는다).
+    /// `cargo test --release -- --ignored encode_for_encoder_comparison`
+    ///
+    /// 먼저 `render_for_sharpness_measurement`를 돌려 둔다. 그 그림 가운데 캡처 샤픈을 끈 것(`off`)과
+    /// 기본값인 것(`it20-t0.4`)의 압축 전 영역을 x265 설정마다 인코딩해 되읽고 `encoder/`에 쓴다.
+    /// 크기는 `encoder/sizes.tsv`.
+    #[test]
+    #[ignore = "render_for_sharpness_measurement의 그림이 필요하다"]
+    fn encode_for_encoder_comparison() {
+        use rayon::prelude::*;
+        let dir = crate::raw16::dir();
+        let out = dir.join("encoder");
+        std::fs::create_dir_all(&out).unwrap();
+        /// (이름, 품질, libheif 매개변수)
+        type Variant = (&'static str, u8, &'static [(&'static str, &'static str)]);
+        let variants: &[Variant] = &[
+            ("q55", 55, &[]),
+            ("q60", 60, &[]),
+            ("q65", 65, &[]),
+            ("q55-grain", 55, &[("tune", "grain")]),
+            (
+                "q55-psy2",
+                55,
+                &[("x265:psy-rd", "2.0"), ("x265:psy-rdoq", "2.0")],
+            ),
+            ("q55-aq3", 55, &[("x265:aq-mode", "3")]),
+            ("q55-444", 55, &[("chroma", "444")]),
+            ("q55-psnr", 55, &[("tune", "psnr")]),
+        ];
+        let inputs: Vec<(String, std::path::PathBuf)> = crate::raw16::PHOTOS
+            .iter()
+            .flat_map(|(photo, _, _)| {
+                let name = photo.rsplit('/').next().unwrap().to_owned();
+                ["off", "it20-t0.4"].map(|condition| {
+                    let stem = format!("{name}-{condition}");
+                    let path = dir.join(format!("{stem}-pre.raw"));
+                    (stem, path)
+                })
+            })
+            .collect();
+        let rows = std::sync::Mutex::new(Vec::new());
+        inputs.par_iter().for_each(|(stem, path)| {
+            assert!(
+                path.exists(),
+                "먼저 render_for_sharpness_measurement를 돌린다: {}",
+                path.display()
+            );
+            let image = crate::raw16::read(path);
+            for (label, quality, extra) in variants {
+                let bytes = encode_once(&image, *quality, None, 2, extra).unwrap();
+                let back = decode(&bytes).unwrap();
+                let file = out.join(format!("{stem}__{label}.raw"));
+                crate::raw16::write(&back, (0, 0), (back.width, back.height), &file);
+                rows.lock()
+                    .unwrap()
+                    .push(format!("{stem}\t{label}\t{}", bytes.len()));
+            }
+        });
+        let mut rows = rows.into_inner().unwrap();
+        rows.sort();
+        std::fs::write(out.join("sizes.tsv"), rows.join("\n") + "\n").unwrap();
+    }
 
     fn gradient(w: usize, h: usize) -> Image {
         let mut planes = [vec![0f32; w * h], vec![0f32; w * h], vec![0f32; w * h]];
