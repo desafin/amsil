@@ -761,13 +761,13 @@ fn capture_panel(ui: &mut egui::Ui, open: &Open, actions: &mut Vec<Action>) {
                 }
             }
 
-            // 대비 문턱: 자동을 끄면 RawTherapee의 기본 0.10에서 시작한다.
+            // 대비 문턱: 기본은 0.4로 정해 두었다. 자동이면 RawTherapee처럼 사진에서 구한다.
             let mut auto_threshold = capture.threshold.is_none();
             if ui
                 .checkbox(&mut auto_threshold, t("문턱 자동", "Auto threshold"))
                 .changed()
             {
-                capture.threshold = (!auto_threshold).then_some(0.10);
+                capture.threshold = (!auto_threshold).then_some(crate::capture::DEFAULT_THRESHOLD);
             }
             match capture.threshold.as_mut() {
                 Some(threshold) => {
@@ -3341,6 +3341,10 @@ mod tests {
         harness.get_by_label("세부 설정").click();
         harness.run_steps(3);
         assert_eq!(shown(&harness, "자동: 0.68"), 1);
+        // 대비 문턱은 기본이 0.4로 정해져 있어 자동 값을 보여 주지 않는다. 자동을 켜면 보인다.
+        assert_eq!(shown(&harness, "자동: 0.12"), 0);
+        harness.get_by_label("문턱 자동").click();
+        harness.run_steps(3);
         assert_eq!(shown(&harness, "자동: 0.12"), 1);
         // 다른 사진의 값이면 보여 주지 않는다.
         handle(Action::Select {
@@ -3657,11 +3661,19 @@ mod tests {
             } else {
                 handle(Action::SetCompare(true));
                 handle(Action::SetCompareBefore(crate::project::Before::Jpeg));
-                let generation = screen.app.borrow().open.as_ref().unwrap().original_generation();
+                let generation = screen
+                    .app
+                    .borrow()
+                    .open
+                    .as_ref()
+                    .unwrap()
+                    .original_generation();
                 handle(Action::OriginalReady {
                     generation,
                     index: 0,
-                    result: Ok(crate::worker::camera_jpeg(&folder.join("DSC04551.JPG"), 4096).unwrap()),
+                    result: Ok(
+                        crate::worker::camera_jpeg(&folder.join("DSC04551.JPG"), 4096).unwrap(),
+                    ),
                 });
             }
             let look = crate::export::Look {
@@ -3669,7 +3681,13 @@ mod tests {
                 ..crate::export::Look::new(&params)
             };
             let image = loaded.develop(&loaded.cam, look, &crate::export::Areas::default());
-            let generation = screen.app.borrow().open.as_ref().unwrap().preview_generation();
+            let generation = screen
+                .app
+                .borrow()
+                .open
+                .as_ref()
+                .unwrap()
+                .preview_generation();
             handle(Action::PreviewReady {
                 generation,
                 index: 0,
@@ -3752,8 +3770,16 @@ mod tests {
             let open = app.open.as_ref().unwrap();
             (open.photo_path(0), open.params(0, &app.presets))
         };
-        let rendered =
-            crate::export::render(&path, None, crate::export::Look::new(&params), &|_| {}).unwrap();
+        let rendered = crate::export::render(
+            &path,
+            None,
+            crate::export::Look {
+                capture: crate::capture::Capture::default(),
+                ..crate::export::Look::new(&params)
+            },
+            &|_| {},
+        )
+        .unwrap();
         let generation = screen
             .app
             .borrow()

@@ -8,7 +8,6 @@ highlights = -0.20
 shadows = 0.15
 vibrance = 0.35
 clarity = 0.25
-sharpen = 0.30
 
 [params.hsl]
 green = { sat = 0.12 }

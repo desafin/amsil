@@ -66,7 +66,7 @@ pub fn usage() -> &'static str {
   --no-capture         캡처 샤픈을 하지 않는다 (기본은 한다: RAW의 흐림을 되돌린다)
   --capture-iterations=N  캡처 샤픈의 반복 횟수 (1~100, 기본 20. 많을수록 강하게)
   --capture-radius=R   되돌릴 흐림의 반경 (0.4~2, 주지 않으면 사진에서 구한다)
-  --capture-threshold=T  대비 문턱 (0~2, 높을수록 뚜렷한 경계만. 주지 않으면 사진에서 구한다)
+  --capture-threshold=T  대비 문턱 (0~2, 기본 0.4. 높을수록 뚜렷한 경계만. auto면 사진에서 구한다)
   --capture-corner=X   모서리로 갈수록 반경에 더하는 값 (-0.5~0.5, 기본 0)
   --capture-no-auto-stop  넘침이 생겨도 반복을 멈추지 않는다",
         "Usage: amsil [options] <input RAW> <output.heic>
@@ -88,7 +88,7 @@ Options:
   --no-capture         skip capture sharpening (on by default: it undoes the blur in the RAW)
   --capture-iterations=N  capture sharpening iterations (1 to 100, default 20; more is stronger)
   --capture-radius=R   radius of the blur to undo (0.4 to 2; worked out from the photo if not given)
-  --capture-threshold=T  contrast threshold (0 to 2; higher sharpens only clear edges; from the photo if not given)
+  --capture-threshold=T  contrast threshold (0 to 2, default 0.4; higher sharpens only clear edges; auto works it out from the photo)
   --capture-corner=X   radius added towards the corners (-0.5 to 0.5, default 0)
   --capture-no-auto-stop  keep iterating even when overshoot appears",
     )
@@ -206,6 +206,7 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> std::result::Resu
                         ))?,
                 );
             }
+            ("--capture-threshold", Some("auto")) => capture.threshold = None,
             ("--capture-threshold", Some(value)) => {
                 capture.threshold = Some(
                     value
@@ -682,6 +683,13 @@ mod tests {
         assert_eq!(
             (a.iterations, a.radius, a.threshold, a.corner, a.auto_stop),
             (40, Some(0.9), Some(0.2), 0.3, false)
+        );
+        assert_eq!(
+            args(&["--capture-threshold=auto", "in", "out"])
+                .unwrap()
+                .capture
+                .threshold,
+            None
         );
         for bad in [
             "--capture-iterations=0",

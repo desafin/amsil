@@ -819,6 +819,137 @@ mod tests {
         (mean(&tiles[n - n * 15 / 100..]), mean(&tiles[..n / 4]))
     }
 
+    /// 선예도 측정용 그림을 만든다 (`scripts/sharpness/measure.py`가 읽는다).
+    /// `cargo test --release -- --ignored render_for_sharpness_measurement`
+    ///
+    /// 샘플 6장을 캡처 샤픈 조건마다 보정 없이 현상해, 세부가 많은 2048×2048 영역을 16비트로 쓴다
+    /// (압축 전 `-pre`, 품질 55로 압축했다 푼 `-post`). 장마다 압축한 크기와 걸린 시간은 `results.tsv`.
+    #[test]
+    #[ignore = "샘플 사진이 필요하고 몇 분 걸린다"]
+    fn render_for_sharpness_measurement() {
+        use libheif_rs::{ColorSpace, HeifContext, LibHeif, RgbChroma};
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let out = std::path::PathBuf::from(
+            std::env::var("AMSIL_SHARPNESS_DIR").unwrap_or("/tmp/amsil-sharpness".into()),
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        // (사진, 자를 곳의 왼쪽 위 y, x): 2026-11-20 측정에서 세부가 가장 많던 2048 창
+        let photos = [
+            ("10361110/DSC04551", 3328, 0),
+            ("10361110/DSC04546", 3072, 0),
+            ("10361110/DSC04545", 768, 1536),
+            ("10161107/DSC04249", 1792, 256),
+            ("10161107/DSC04311", 1792, 768),
+            ("10161107/DSC04286", 768, 1536),
+        ];
+        let base = Capture::default();
+        let t = |threshold: f32| Capture {
+            threshold: Some(threshold),
+            ..base
+        };
+        // (이름, 캡처 샤픈, 그 위에 더하는 창작 샤픈)
+        let conditions = [
+            ("off", Capture::off(), 0.0),
+            ("it20", base, 0.0),
+            (
+                "it10",
+                Capture {
+                    iterations: 10,
+                    ..base
+                },
+                0.0,
+            ),
+            (
+                "it40",
+                Capture {
+                    iterations: 40,
+                    ..base
+                },
+                0.0,
+            ),
+            ("it20-t0.2", t(0.2), 0.0),
+            ("it20-t0.3", t(0.3), 0.0),
+            ("it20-t0.4", t(0.4), 0.0),
+            ("it20-t0.5", t(0.5), 0.0),
+            (
+                "it10-t0.2",
+                Capture {
+                    iterations: 10,
+                    threshold: Some(0.2),
+                    ..base
+                },
+                0.0,
+            ),
+            ("it20-t0.4-s0.1", t(0.4), 0.1),
+            ("it20-t0.4-s0.3", t(0.4), 0.3),
+        ];
+        let side = 2048;
+        let save = |image: &crate::Image, y0: usize, x0: usize, path: &std::path::Path| {
+            let mut bytes = Vec::with_capacity(8 + side * side * 6);
+            bytes.extend((side as u32).to_le_bytes());
+            bytes.extend((side as u32).to_le_bytes());
+            for y in y0..y0 + side {
+                for x in x0..x0 + side {
+                    for c in 0..3 {
+                        let v = image.planes[c][y * image.width + x].clamp(0.0, 1.0);
+                        bytes.extend(((v * 65535.0 + 0.5) as u16).to_le_bytes());
+                    }
+                }
+            }
+            std::fs::write(path, bytes).unwrap();
+        };
+        let mut results = String::from("photo\tcondition\tbytes\tseconds\tradius\tthreshold\n");
+        for (photo, y0, x0) in photos {
+            let name = photo.rsplit('/').next().unwrap();
+            let read = read(&root.join(format!("DCIM/{photo}.ARW")), None, &|_| {}).unwrap();
+            let (radius, threshold) = read.auto();
+            for (label, capture, sharpen) in conditions {
+                let started = std::time::Instant::now();
+                let loaded = read.sharpened(&capture);
+                let params = Params {
+                    sharpen,
+                    ..Params::default()
+                };
+                let image = loaded.develop(&loaded.cam, Look::new(&params), &Areas::default());
+                let seconds = started.elapsed().as_secs_f32();
+                save(&image, y0, x0, &out.join(format!("{name}-{label}-pre.raw")));
+                let encoded = heif::encode(&image, 55, None, cores()).unwrap();
+                let ctx = HeifContext::read_from_bytes(&encoded.bytes).unwrap();
+                let handle = ctx.primary_image_handle().unwrap();
+                let decoded = LibHeif::new()
+                    .decode(&handle, ColorSpace::Rgb(RgbChroma::HdrRgbLe), None)
+                    .unwrap();
+                let planes = decoded.planes();
+                let p = planes.interleaved.unwrap();
+                let (w, h) = (image.width, image.height);
+                let mut back = crate::Image {
+                    width: w,
+                    height: h,
+                    planes: [0, 1, 2].map(|_| vec![0f32; w * h]),
+                };
+                for y in 0..h {
+                    for x in 0..w {
+                        for c in 0..3 {
+                            let i = y * p.stride + (x * 3 + c) * 2;
+                            back.planes[c][y * w + x] =
+                                u16::from_le_bytes([p.data[i], p.data[i + 1]]) as f32 / 1023.0;
+                        }
+                    }
+                }
+                save(&back, y0, x0, &out.join(format!("{name}-{label}-post.raw")));
+                results.push_str(&format!(
+                    "{name}\t{label}\t{}\t{seconds:.2}\t{radius:.3}\t{threshold:.3}\n",
+                    encoded.bytes.len()
+                ));
+                eprintln!(
+                    "{name} {label}: {} bytes, {seconds:.2} s",
+                    encoded.bytes.len()
+                );
+            }
+        }
+        std::fs::write(out.join("results.tsv"), results).unwrap();
+    }
+
     #[test]
     fn the_sharpened_area_is_shown_in_red_or_as_a_map() {
         let Some(path) = sample_arw() else { return };
@@ -872,11 +1003,27 @@ mod tests {
         let (detail_off, flat_off) = detail_and_flat(&off.cam);
         let (detail_on, flat_on) = detail_and_flat(&on.cam);
         eprintln!("세부 {detail_off:.5} → {detail_on:.5}, 평평한 곳 {flat_off:.5} → {flat_on:.5}");
+        // 기본값(문턱 0.4)은 뚜렷한 경계만 샤픈한다. 이 사진(f/2.8, 대부분 초점 밖)에서는 세부가 조금 는다.
         assert!(
-            detail_on > detail_off * 1.1,
+            detail_on > detail_off * 1.03,
             "세부 {detail_on} {detail_off}"
         );
-        assert!(flat_on < flat_off * 1.05, "평평한 곳 {flat_on} {flat_off}");
+        assert!(flat_on < flat_off * 1.02, "평평한 곳 {flat_on} {flat_off}");
+        // 문턱을 사진에서 구하면(RawTherapee의 자동) 더 넓게, 더 세게 샤픈한다.
+        let auto = read.sharpened(&Capture {
+            threshold: None,
+            ..Capture::default()
+        });
+        let (detail_auto, flat_auto) = detail_and_flat(&auto.cam);
+        eprintln!("자동 문턱: 세부 {detail_auto:.5}, 평평한 곳 {flat_auto:.5}");
+        assert!(
+            detail_auto > detail_on * 1.2,
+            "자동 {detail_auto} 기본 {detail_on}"
+        );
+        assert!(
+            flat_auto < flat_off * 1.05,
+            "평평한 곳 {flat_auto} {flat_off}"
+        );
         let (radius, threshold) = read.auto();
         eprintln!("자동 반경 {radius}, 자동 문턱 {threshold}");
         assert!((0.4..=2.0).contains(&radius) && threshold >= 0.0);

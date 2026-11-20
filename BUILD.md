@@ -35,6 +35,8 @@ cargo test --locked
 - 화면 테스트는 창을 띄우지 않고 돈다 (`egui_kittest`).
 - 눈으로 확인할 화면 그림은 `cargo test -- --ignored render`로 `target/ui/`에 만든다 (샘플 사진 필요).
 - README의 화면 그림(한국어 `assets/screenshots/workspace.jpg`, 영어 `workspace.en.jpg`)은 `cargo test -- --ignored render_readme_screenshot`으로 다시 만든다. 공개 저장소에 올라가는 그림이라, 쓸 사진(사람이 나오지 않는 것)의 목록이 그 테스트 안에 적혀 있다.
+- 캡처 샤픈의 기본값은 `scripts/sharpness/`의 측정으로 정했다. 다시 재려면 `cargo test --release -- --ignored render_for_sharpness_measurement`로 그림을 만들고 `python3 scripts/sharpness/measure.py`를 돌린다 (샘플 사진, numpy, Pillow 필요).
+- 캡처 샤픈의 화면(샤픈 영역 보기, 카메라 JPEG 비교)은 `cargo test -- --ignored render_capture_views`로 `target/ui/`에 그려 볼 수 있다.
 
 커밋을 올리면 GitHub Actions가 깨끗한 Ubuntu 24.04에서 같은 절차로 빌드하고 테스트한다 ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
 

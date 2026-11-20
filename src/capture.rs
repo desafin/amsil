@@ -27,7 +27,7 @@ pub struct Capture {
     /// 되돌릴 흐림의 반경(σ, 화소). 없으면 사진에서 구한다.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub radius: Option<f32>,
-    /// 대비 문턱. 높을수록 뚜렷한 경계만 샤픈한다. 없으면 사진에서 구한다.
+    /// 대비 문턱. 높을수록 뚜렷한 경계만 샤픈한다. 없으면 사진에서 구한다 (RawTherapee의 자동).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub threshold: Option<f32>,
     /// 모서리로 갈수록 반경에 더하는 값.
@@ -36,13 +36,18 @@ pub struct Capture {
     pub auto_stop: bool,
 }
 
+/// 대비 문턱의 기본값. RawTherapee는 사진에서 구하지만(자동), 그러면 카메라 JPEG보다 1.3배쯤 강하고
+/// 나무·잔디의 결과 노이즈까지 샤픈해 용량이 28% 는다. 2026-11-20 측정(`scripts/sharpness`)에서 0.4가
+/// 압축 후 카메라 JPEG와 같은 수준(1.02배)이었고 용량은 10% 늘었다. 사용자가 이 값으로 정했다.
+pub const DEFAULT_THRESHOLD: f32 = 0.4;
+
 impl Default for Capture {
     fn default() -> Self {
         Self {
             enabled: true,
             iterations: 20,
             radius: None,
-            threshold: None,
+            threshold: Some(DEFAULT_THRESHOLD),
             corner: 0.0,
             auto_stop: true,
         }
@@ -746,13 +751,14 @@ mod tests {
     }
 
     #[test]
-    fn the_defaults_are_rawtherapees() {
+    fn the_defaults_match_the_camera_jpeg() {
+        // 반복 횟수와 반경(자동)은 RawTherapee의 기본값, 대비 문턱은 측정으로 정한 0.4.
         let capture = Capture::default();
         assert!(capture.enabled && capture.auto_stop && capture.is_default());
         assert_eq!(capture.iterations, 20);
         assert_eq!(
             (capture.radius, capture.threshold, capture.corner),
-            (None, None, 0.0)
+            (None, Some(0.4), 0.0)
         );
     }
 

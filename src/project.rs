@@ -357,7 +357,7 @@ mod tests {
         };
         let text = toml::to_string(&changed).unwrap();
         assert!(
-            text.contains("iterations = 35") && !text.contains("threshold"),
+            text.contains("iterations = 35") && text.contains("radius = 0.8"),
             "{text}"
         );
         let back: Edit = toml::from_str(&text).unwrap();

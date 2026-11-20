@@ -12,8 +12,8 @@ Batch-develops camera RAW photos and exports them as compact HEIF files.
 
 Take a lot of photos and the RAW files fill your disk fast. Amsil takes a whole folder of RAW files, develops them, and turns them into HEIF (10-bit HEVC).
 
-- **Small files.** 309 photos at 24 megapixels (11 GB of RAW) come out as 1.1 GB. That is 40–45% smaller than JPEG at the same quality.
-- **Fast.** Those 309 photos convert in 4 min 30 s (on a 16-core laptop). It uses every CPU core, and when memory runs short it works on fewer photos at once by itself.
+- **Small files.** 309 photos at 24 megapixels (11 GB of RAW) come out as 840 MB. That is 40–45% smaller than JPEG at the same quality.
+- **Fast.** Those 309 photos convert in 10 minutes (on a 16-core laptop). It uses every CPU core, and when memory runs short it works on fewer photos at once by itself.
 - **Easy.** One click on a preset and the photo is done. It can also tell whether a photo is food, a portrait or a landscape, and pick the preset that fits.
 - **Your originals are never touched.** Edits are stored in a single project file. Nothing is written to the RAW files or the photo folders.
 
@@ -25,7 +25,8 @@ A hobby project by one person. Tested with RAW files from a Sony DSLR-A900.
 |---|---|
 | Whole-folder conversion | Imports and exports a folder, subfolders included. Shows a progress bar, the time left, and CPU, memory and GPU use |
 | Presets | Food, Portrait, Landscape, Night, Black & white. Adjust the strength, or set exposure, contrast, temperature, saturation and more by hand |
-| Before/after | Shows the unedited RAW and the edited photo side by side. Zoom or pan one and the other follows |
+| Before/after | Shows the unedited RAW (or the JPEG the camera saved alongside) and the edited photo side by side. Zoom or pan one and the other follows |
+| Capture sharpening | Undoes the blur the lens and the filter in front of the sensor leave in the RAW, so photos come out as sharp as the camera's JPEG. Shows where it sharpens as a red overlay or a black-and-white map |
 | Preset suggestions (AI) | Recognises what a photo shows and marks the matching preset with ★. Can apply them to many photos at once |
 | Noise reduction (AI) | Removes noise from high-ISO photos. Runs on the GPU if there is one, otherwise on the CPU |
 | Masks (AI) | Click an object in the photo, such as the sky, a building or a person, to select it, then adjust only that area |
@@ -120,7 +121,7 @@ The picture at the top shows the workspace.
 | Top bar | Project name, [Import folder], [Screenshot], [Close project], AI backend (`GPU`) and [AI info], [Open log], light/dark mode, language |
 | Left | The imported photos. Next to each name is the kind of photo it is (landscape, food, and so on) |
 | Middle | Preview of the selected photo. Edits show up immediately. Turn on [Compare] above it to see the unedited photo alongside |
-| Right | Presets, masks, skin retouch, frame, noise reduction |
+| Right | Presets, masks, skin retouch, frame, capture sharpening, noise reduction |
 | Bottom bar | Output folder, quality, [Export selected], [Export all] |
 | Very bottom | Notices, and during export the resource use, progress bar and time left |
 
@@ -135,7 +136,7 @@ When the window is narrow, the buttons in the top and bottom bars wrap onto the 
 | Zoom the preview | Mouse wheel (centred on the cursor, up to 400%) |
 | Pan the preview | Drag |
 | Switch between fit-to-window and 100% | Double-click the preview |
-| See before and after side by side | [Compare] above the preview. Zoom or pan one side and the other follows. Choose the split with [Auto], [Side by side] or [Top and bottom] |
+| See before and after side by side | [Compare] above the preview. Zoom or pan one side and the other follows. Choose the split with [Auto], [Side by side] or [Top and bottom], and what the left pane shows with [Unedited RAW] or [Camera JPEG] |
 | Save the window as an image | [Screenshot] or F12 (saved in a `screenshots` folder next to the project file) |
 | Change the language or light/dark mode | [한국어] [English] and [Light] [Dark] at the top |
 
@@ -145,7 +146,7 @@ Edits apply to **all selected photos**. Masks are the exception: they apply only
 
 - Clicking a preset applies it right away. **Strength** sets how strong it is (0–150%).
 - Open **[Details]** to set exposure, contrast, highlights, shadows, temperature, tint, saturation, vibrance, clarity, sharpen, vignette and monochrome by hand. **[By colour]** has saturation and luminance for eight colours, from red to magenta.
-- **[Reset adjustments]** clears the preset, fine adjustments, LUT and skin retouch. Noise reduction, the frame and masks stay.
+- **[Reset adjustments]** clears the preset, fine adjustments, LUT and skin retouch. Noise reduction, the frame, masks and capture sharpening stay.
 
 **Preset suggestions.** When you import photos, each one is classified as food, portrait, landscape, night, architecture or other. Only when the confidence is 60% or more is the kind written next to the photo's name, and the matching preset button gets a ★. **[Apply recommended presets]** gives each selected photo its matching preset in one go. Architecture and other have no matching preset, so nothing is suggested for them. A suggestion is only a suggestion: after applying it you can still change or remove it.
 
@@ -215,6 +216,19 @@ Sony DSLR-A900
 - Values the photo does not record (such as the lens name) are left out.
 - Padding to a ratio makes the image bigger (a landscape photo padded to 9:16 has nearly three times the pixels), and it takes that much more memory.
 
+### Capture sharpening
+
+A RAW file is softer than the camera's JPEG to begin with. The lens and the filter in front of the sensor (the low-pass filter that prevents moiré) spread the light a little, and the camera undoes that with sharpening when it makes its JPEG. Amsil does the same when it reads the RAW. It is RawTherapee's Capture Sharpening, ported: it undoes the blur in the luminance (Richardson–Lucy deconvolution) and blends it in only where there are clear edges. Flat areas such as sky and walls, and the surroundings of blown-out highlights, are left alone.
+
+- It is on for every photo by default. The defaults (20 iterations, contrast threshold 0.4) were chosen by comparing five photos with the camera's JPEGs: after compression at quality 55, detail is about the same as in the camera's JPEG (about 0.7× with it off), and files grow by about 10%.
+- Change it in the **Capture sharpening** group on the right. It applies to all selected photos.
+  - **Iterations** (1–100): more iterations undo more of the blur.
+  - **[More settings]**: radius (the size of the blur to undo, worked out from the photo by default), contrast threshold (higher sharpens only clear edges; on auto it is worked out from the photo, which comes out about 1.3× stronger than the camera's JPEG and makes files bigger), corner radius (adds to the radius towards the corners, for lenses that are softer there), and stop when it overshoots.
+- **Show sharpened area**: shows where capture sharpening applies, as a [Red overlay] on the photo or as a [Black-and-white map] (white is sharpened). The frame is left out while you look.
+- Judge sharpness at 100% zoom. Choose [Camera JPEG] in the before/after comparison to see the camera's JPEG with the same name alongside.
+- [Reset adjustments] leaves capture sharpening alone.
+- Projects made with a version that did not have this feature open with capture sharpening on. Exported again, they come out sharper and a little larger.
+
 ### Noise reduction
 
 Set the level and click **[Apply]** to store it on the selected photos.
@@ -224,7 +238,7 @@ Set the level and click **[Apply]** to store it on the selected photos.
 
 ### Quality
 
-The default of 55 is recommended; it looks about as good as JPEG at 90. Here are the file sizes for two 24-megapixel photos (the camera's own JPEGs were 8.1 MB and 7.4 MB):
+The default of 55 is recommended; it looks about as good as JPEG at 90. Here are the file sizes for two 24-megapixel photos (the camera's own JPEGs were 8.1 MB and 7.4 MB). They were measured before capture sharpening was added; the default capture sharpening makes files about 10% larger.
 
 | Quality | Clean photo | Noisy photo |
 |---|---|---|
@@ -262,6 +276,12 @@ amsil photos out                # a whole folder (subfolders included)
 | `--overwrite` | Redoes output files that already exist |
 | `--jobs=N` | Photos to process at once (default: number of CPU cores) |
 | `--memory=GB` | Memory limit (default: 70% of the available memory) |
+| `--no-capture` | Skip capture sharpening (on by default) |
+| `--capture-iterations=N` | Capture sharpening iterations (1 to 100, default 20) |
+| `--capture-radius=R` | Radius of the blur to undo (0.4 to 2; worked out from the photo if not given) |
+| `--capture-threshold=T` | Capture sharpening contrast threshold (0 to 2, default 0.4; `auto` works it out from the photo) |
+| `--capture-corner=X` | Radius added towards the corners (-0.5 to 0.5, default 0) |
+| `--capture-no-auto-stop` | Keep iterating even when overshoot appears |
 
 Masks can only be made in the window.
 
