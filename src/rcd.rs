@@ -1,23 +1,27 @@
-//! RCD (Ratio Corrected Demosaicing) 디모자익.
+//! RCD (Ratio Corrected Demosaicing) demosaic.
 //!
-//! 원본: Luis Sanz Rodríguez, "RATIO CORRECTED DEMOSAICING", Release 2.3 @ 171125
-//! (<https://github.com/LuisSR/RCD-Demosaicing>, 커밋 0aa9d6e234f5), GPL-3.0.
-//! 원본의 C 코드를 계산 순서까지 그대로 Rust로 옮겼다. 그래서 안쪽 화소는 원본과 결과가 같다
-//! (`scripts/rcd-reference`의 정답지로 확인한다). 원본과 다른 점은 두 가지다.
-//! - 시작 열: 원본은 `4 + FC(row, 0) & 1`이 연산자 우선순위 때문에 `(4 + FC) & 1`로 계산되어
-//!   0~3열도 처리하며 앞 줄의 끝을 읽는다 (4행에서는 버퍼 앞까지 읽는다). 여기서는 의도대로
-//!   4열 또는 5열부터 시작한다. 영향은 8열까지다.
-//! - 가장자리: 원본은 바깥 4화소를 3×3 같은 색 평균으로 채운다. 원본은 0으로 시작하는 버퍼 때문에
-//!   그 안쪽(4~9화소)이 어두워지므로, 여기서는 바깥 10화소를 같은 방식으로 채운다.
+//! Original: Luis Sanz Rodríguez, "RATIO CORRECTED DEMOSAICING", Release 2.3 @ 171125
+//! (<https://github.com/LuisSR/RCD-Demosaicing>, commit 0aa9d6e234f5), GPL-3.0.
+//! The original C code is ported to Rust as is, down to the order of operations, so interior pixels
+//! match the original exactly (verified against the reference data in `scripts/rcd-reference`). It
+//! differs from the original in two ways.
+//! - Start column: in the original, operator precedence makes `4 + FC(row, 0) & 1` evaluate as
+//!   `(4 + FC) & 1`, so it also processes columns 0–3 and reads the end of the previous row (on row
+//!   4 it reads before the start of the buffer). Here it starts at column 4 or 5 as intended. The
+//!   effect reaches up to column 8.
+//! - Borders: the original fills the outer 4 pixels with a 3×3 same-color average. Because its
+//!   buffer starts at zero, the pixels just inside (4–9) come out dark, so here the outer 10 pixels
+//!   are filled the same way.
 
 use crate::Image;
 
-/// 3×3 같은 색 평균으로 채우는 바깥 띠의 폭 (화소).
+/// Width (pixels) of the outer band filled with the 3×3 same-color average.
 pub const BORDER: usize = 10;
 
-/// RCD로 Bayer CFA를 RGB로 복원한다. `cfa`는 센서 전체(width × height)의 0..1 값이고,
-/// 화이트밸런스를 곱해 [0, 1]로 자른 것이어야 한다 (원본이 dcraw에서 받는 것과 같은 상태).
-/// `red`는 첫 R 화소의 위치 (x, y), 각각 0 또는 1. 결과도 0..1이고 화이트밸런스가 곱해진 채다.
+/// Demosaics a Bayer CFA to RGB with RCD. `cfa` holds 0..1 values for the full sensor
+/// (width × height) and must already be multiplied by white balance and clipped to [0, 1] (the same
+/// state the original receives from dcraw). `red` is the position (x, y) of the first R pixel, each
+/// 0 or 1. The result is also 0..1 and still has white balance applied.
 pub fn demosaic(cfa: &[f32], width: usize, height: usize, red: (usize, usize)) -> Image {
     assert_eq!(cfa.len(), width * height);
     let mut rgb = [0, 1, 2].map(|_| vec![0f32; width * height]);
@@ -27,7 +31,8 @@ pub fn demosaic(cfa: &[f32], width: usize, height: usize, red: (usize, usize)) -
             rgb[colour_at(x, y, red)][i] = cfa[i];
         }
     }
-    // 원본의 알고리즘은 사방 4화소 안쪽에서만 돈다. 그보다 작으면 가장자리 채우기만 한다.
+    // The original algorithm only runs at least 4 pixels in from every edge. Anything smaller only
+    // gets the border fill.
     if width > 8 && height > 8 {
         let rcd = Rcd {
             cfa,
@@ -50,7 +55,7 @@ pub fn demosaic(cfa: &[f32], width: usize, height: usize, red: (usize, usize)) -
     }
 }
 
-/// (x, y) 화소의 색: 0 = R, 1 = G, 2 = B.
+/// Color of pixel (x, y): 0 = R, 1 = G, 2 = B.
 pub fn colour_at(x: usize, y: usize, red: (usize, usize)) -> usize {
     match ((x + red.0).is_multiple_of(2), (y + red.1).is_multiple_of(2)) {
         (true, true) => 0,
@@ -59,12 +64,13 @@ pub fn colour_at(x: usize, y: usize, red: (usize, usize)) -> usize {
     }
 }
 
-/// 원본의 허용 오차 (0으로 나누지 않게).
+/// The original's epsilon (to avoid division by zero).
 const EPS: f32 = 1e-5;
 const EPSSQ: f32 = 1e-10;
 
-/// 방향 판별에 쓰는 이차식의 40항: (계수, a, b) → 계수·x_a·x_b. x_k는 가운데에서 k칸 떨어진 값이다.
-/// 원본(RCD:57-58, 131-132)에 적힌 순서 그대로다. 결과를 원본과 비트 단위로 맞추려면 이 순서로 더해야 한다.
+/// The 40 terms of the quadratic used for direction detection: (coef, a, b) → coef·x_a·x_b, where
+/// x_k is the value k steps from the center. Listed in the same order as the original (RCD:57-58,
+/// 131-132). They must be summed in this order to match the original bit for bit.
 #[rustfmt::skip]
 const TERMS: [(f32, i8, i8); 40] = [
     (-18.0, 0, -1), (-18.0, 0, 1), (-36.0, 0, -2), (-36.0, 0, 2), (18.0, 0, -3), (18.0, 0, 3),
@@ -79,9 +85,10 @@ const TERMS: [(f32, i8, i8); 40] = [
     (1.0, -4, -4), (1.0, 4, 4),
 ];
 
-/// 한 방향으로 늘어선 9화소(가운데에서 −4..4)의 국소 고주파 세기. 원본의 V_Stat 등 (`MAX(…, epssq)`까지).
+/// Local high-frequency strength of 9 pixels along one direction (−4..4 from the center). The
+/// original's V_Stat and friends (including `MAX(…, epssq)`).
 fn stat(x: impl Fn(isize) -> f32) -> f32 {
-    // C의 `a - 18.f * b * c`는 `a + (-18.f * b) * c`와 비트 단위로 같다 (부호 바꾸기는 정확하다).
+    // C's `a - 18.f * b * c` is bit-identical to `a + (-18.f * b) * c` (negation is exact).
     let mut sum = 0f32;
     for (coefficient, a, b) in TERMS {
         sum += (coefficient * x(a as isize)) * x(b as isize);
@@ -89,7 +96,8 @@ fn stat(x: impl Fn(isize) -> f32) -> f32 {
     sum.max(EPSSQ)
 }
 
-/// 원본의 기울기: `eps + fabs(d1) + fabs(d2) + …`. `fabs`가 double을 돌려주므로 double로 더한 뒤 float로 담는다.
+/// The original's gradient: `eps + fabs(d1) + fabs(d2) + …`. `fabs` returns double, so the sum is
+/// taken in double and then stored as float.
 fn gradient(differences: &[f32]) -> f32 {
     let mut sum = EPS as f64;
     for d in differences {
@@ -98,7 +106,8 @@ fn gradient(differences: &[f32]) -> f32 {
     sum as f32
 }
 
-/// 가운데 값과 대각 네 이웃의 평균 가운데 0.5에서 더 먼 쪽 (원본의 `*_Disc`).
+/// Whichever of the center value and the mean of its four diagonal neighbors is farther from 0.5
+/// (the original's `*_Disc`).
 fn discriminate(central: f32, neighbours: [f32; 4]) -> f32 {
     let neighbourhood = 0.25 * (neighbours[0] + neighbours[1] + neighbours[2] + neighbours[3]);
     if (0.5 - central).abs() < (0.5 - neighbourhood).abs() {
@@ -120,12 +129,13 @@ impl Rcd<'_> {
         colour_at(x, y, self.red)
     }
 
-    /// 이 행에서 R·B 화소가 시작하는 열 (`from` 이상). 원본은 `from + FC(row, 0) & 1`로 쓰려던 것이다.
+    /// Column where R/B pixels start in this row (at least `from`). What the original meant by
+    /// `from + FC(row, 0) & 1`.
     fn red_blue_start(&self, y: usize, from: usize) -> usize {
         from + usize::from(self.colour(0, y) == 1)
     }
 
-    /// 이 행에서 초록 화소가 시작하는 열 (4 이상).
+    /// Column where green pixels start in this row (at least 4).
     fn green_start(&self, y: usize) -> usize {
         4 + usize::from(self.colour(1, y) == 1)
     }
@@ -134,7 +144,7 @@ impl Rcd<'_> {
         self.cfa[i.wrapping_add_signed(offset)]
     }
 
-    /// 1.1단계: 세로·가로 판별 (RCD:54-63).
+    /// Step 1.1: vertical/horizontal discrimination (RCD:54-63).
     fn vh_direction(&self) -> Vec<f32> {
         let (w, h) = (self.width, self.height);
         let w1 = w as isize;
@@ -150,7 +160,7 @@ impl Rcd<'_> {
         vh_dir
     }
 
-    /// 2.1단계: R·B 자리의 저역 필터 (RCD:71-79).
+    /// Step 2.1: low-pass filter at R/B sites (RCD:71-79).
     fn low_pass(&self) -> Vec<f32> {
         let (w, h) = (self.width, self.height);
         let w1 = w as isize;
@@ -167,7 +177,7 @@ impl Rcd<'_> {
         lpf
     }
 
-    /// 3.1단계: R·B 자리의 초록 (RCD:87-116).
+    /// Step 3.1: green at R/B sites (RCD:87-116).
     fn green_at_red_blue(&self, vh_dir: &[f32], lpf: &[f32], rgb: &mut [Vec<f32>; 3]) {
         let (w, h) = (self.width, self.height);
         let (w1, w2, w3, w4) = (w as isize, 2 * w as isize, 3 * w as isize, 4 * w as isize);
@@ -204,7 +214,7 @@ impl Rcd<'_> {
         }
     }
 
-    /// 4.1단계: 대각 P(↘)·Q(↙) 판별 (RCD:126-137).
+    /// Step 4.1: diagonal P(↘)/Q(↙) discrimination (RCD:126-137).
     fn pq_direction(&self) -> Vec<f32> {
         let (w, h) = (self.width, self.height);
         let w1 = w as isize;
@@ -220,7 +230,7 @@ impl Rcd<'_> {
         pq_dir
     }
 
-    /// 4.2단계: B 자리의 R, R 자리의 B (RCD:140-169).
+    /// Step 4.2: R at B sites, B at R sites (RCD:140-169).
     fn red_blue_at_blue_red(&self, pq_dir: &[f32], rgb: &mut [Vec<f32>; 3]) {
         let (w, h) = (self.width, self.height);
         let (w1, w2, w3) = (w as isize, 2 * w as isize, 3 * w as isize);
@@ -267,7 +277,7 @@ impl Rcd<'_> {
         }
     }
 
-    /// 4.3단계: 초록 자리의 R와 B (RCD:174-206).
+    /// Step 4.3: R and B at green sites (RCD:174-206).
     fn red_blue_at_green(&self, vh_dir: &[f32], rgb: &mut [Vec<f32>; 3]) {
         let (w, h) = (self.width, self.height);
         let (w1, w2, w3) = (w as isize, 2 * w as isize, 3 * w as isize);
@@ -314,8 +324,9 @@ impl Rcd<'_> {
     }
 }
 
-/// 바깥 `BORDER`화소 띠의 화소마다, 제 색이 아닌 채널을 3×3 안의 같은 색 화소 평균으로 채운다
-/// (dcraw의 `border_interpolate`와 같은 규칙).
+/// For each pixel in the outer `BORDER`-pixel band, fills the channels other than its own color
+/// with the average of same-color pixels in the 3×3 neighborhood (same rule as dcraw's
+/// `border_interpolate`).
 fn fill_border(
     cfa: &[f32],
     width: usize,
@@ -351,7 +362,7 @@ fn fill_border(
 mod tests {
     use super::*;
 
-    /// 정답지 하나: 크기, R 위치, 입력, 원본의 출력.
+    /// One reference case: size, R position, input, and the original's output.
     struct Reference {
         width: usize,
         height: usize,
@@ -395,19 +406,20 @@ mod tests {
         }
     }
 
-    /// 원본의 출력 변환: `(ushort)CLIP(65535.f * v)`, 곧 0..65535로 자른 버림.
+    /// The original's output conversion: `(ushort)CLIP(65535.f * v)`, i.e. clip to 0..65535 and
+    /// truncate.
     fn quantise(v: f32) -> u16 {
         ((65535.0 * v) as i32).clamp(0, 65535) as u16
     }
 
     #[test]
     fn colours_follow_the_bayer_layout() {
-        // RGGB: 짝수 행은 R G R G, 홀수 행은 G B G B
+        // RGGB: even rows are R G R G, odd rows are G B G B
         assert_eq!(
             [(0, 0), (1, 0), (0, 1), (1, 1)].map(|(x, y)| colour_at(x, y, (0, 0))),
             [0, 1, 1, 2]
         );
-        // GBRG: 첫 R는 (0, 1)
+        // GBRG: first R is at (0, 1)
         assert_eq!(
             [(0, 0), (1, 0), (0, 1), (1, 1)].map(|(x, y)| colour_at(x, y, (0, 1))),
             [1, 2, 0, 1]
@@ -437,7 +449,7 @@ mod tests {
                 }
                 assert!(
                     differ.is_empty(),
-                    "{name}: {}곳이 다르다. 처음 몇 개 (x, y, 채널, 우리, 원본): {:?}",
+                    "{name}: {} pixels differ. First few (x, y, channel, ours, original): {:?}",
                     differ.len(),
                     &differ[..differ.len().min(5)]
                 );
@@ -479,7 +491,7 @@ mod tests {
         ] {
             for c in 0..3 {
                 if c == colour_at(x, y, r.red) {
-                    continue; // 제 색은 그대로다 (위 테스트)
+                    continue; // Own color is unchanged (test above)
                 }
                 let mut samples = Vec::new();
                 for sy in y.saturating_sub(1)..(y + 2).min(r.height) {

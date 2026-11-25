@@ -1,41 +1,41 @@
-//! 프레임: 사진 둘레에 여백을 두르고 촬영 정보를 적는다.
+//! Frames: puts a margin around the photo and writes the shooting information.
 
 use crate::Image;
 use crate::lang::{Text, text};
 use ab_glyph::{Font, FontRef, ScaleFont};
 use serde::{Deserialize, Serialize};
 
-/// 프로그램에 넣은 글꼴(나눔고딕). 화면과 프레임이 함께 쓴다.
+/// The font built into the program (NanumGothic). Shared by the screen and frames.
 pub const FONT: &[u8] = include_bytes!("../assets/fonts/NanumGothic-Regular.ttf");
 
-/// 프레임에 적을 촬영 정보. 사진에 없는 값은 비어 있다.
+/// Shooting information to write on the frame. Values missing from the photo are empty.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Shot {
-    /// 제조사와 기종.
+    /// Make and model.
     pub camera: String,
     pub lens: Option<String>,
     pub focal_mm: Option<f32>,
     pub f_number: Option<f32>,
-    /// 노출 시간(초)의 분자와 분모.
+    /// Numerator and denominator of the exposure time (seconds).
     pub exposure: Option<(u32, u32)>,
     pub iso: Option<u32>,
-    /// EXIF 형식의 촬영 시각 (`2026:11:07 13:27:19`).
+    /// Capture time in EXIF format (`2026:11:07 13:27:19`).
     pub date: Option<String>,
 }
 
-/// 프레임의 모양.
+/// The frame's shape.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub enum Layout {
-    /// 사진 아래에 띠만 붙인다.
+    /// Only attaches a band below the photo.
     Band,
-    /// 위와 양옆에 얇은 테두리, 아래에 글자가 들어갈 넓은 여백.
+    /// A thin border on top and both sides, and a wide margin below for the text.
     Border,
-    /// 테두리를 두른 뒤, 여백을 더해 이 비율(가로:세로)로 맞춘다.
+    /// After adding the border, adds margin to match this ratio (width:height).
     Ratio(u32, u32),
 }
 
-/// 비율로 쓸 수 있는 가장 길쭉한 모양 (3:1). 더 길쭉하면 그림이 터무니없이 커진다.
+/// The most elongated shape allowed as a ratio (3:1). Longer makes the image absurdly large.
 const MAX_RATIO: u32 = 3;
 
 impl std::str::FromStr for Layout {
@@ -87,39 +87,39 @@ impl From<Layout> for String {
     }
 }
 
-/// 사진에 두를 프레임.
+/// The frame to put around a photo.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Frame {
     pub layout: Layout,
-    /// 검은 바탕에 밝은 글자. 아니면 흰 바탕에 어두운 글자.
+    /// Light text on a black background. Otherwise dark text on a white background.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dark: bool,
 }
 
-// 치수는 모두 사진의 짧은 변에 대한 비율이라, 미리보기와 내보내기에서 같은 모양이 나온다.
-/// 위와 양옆의 테두리 두께.
+// All dimensions are ratios of the photo's short side, so preview and export look the same.
+/// Border thickness on top and both sides.
 const MARGIN: f64 = 0.04;
-/// 글자가 들어가는 아래 여백의 높이.
+/// Height of the bottom margin that holds the text.
 const CAPTION: f64 = 0.10;
-/// 첫 줄(기종)과 둘째 줄(설정)의 글자 크기.
+/// Text size of the first line (model) and the second line (settings).
 const TEXT: [f64; 2] = [0.026, 0.019];
-/// 두 줄 사이의 간격.
+/// Gap between the two lines.
 const LINE_GAP: f64 = 0.010;
 
-/// 가장 가까운 짝수. 4:2:0 인코딩이 짝수 크기를 전제로 하므로 더하는 치수는 모두 짝수로 맞춘다.
+/// The nearest even number. 4:2:0 encoding assumes even sizes, so all added dimensions are even.
 fn even(value: f64) -> usize {
     (value / 2.0).round() as usize * 2
 }
 
-/// 프레임을 두른 그림의 크기와 그 안에서의 배치.
+/// Size of the framed image and the layout within it.
 struct Plan {
     width: usize,
     height: usize,
-    /// 사진의 왼쪽 위 모서리.
+    /// Top-left corner of the photo.
     x: usize,
     y: usize,
-    /// 글자가 들어갈 자리의 높이 (사진 바로 아래).
+    /// Height of the area for the text (right below the photo).
     caption: usize,
 }
 
@@ -131,7 +131,7 @@ impl Frame {
             Layout::Band => 0,
             Layout::Border | Layout::Ratio(..) => even(short * MARGIN),
         };
-        // 테두리까지 두른 크기. 비율을 맞출 때는 모자란 쪽에 여백을 더한다.
+        // Size including the border. When matching a ratio, margin is added to the short side.
         let (inner_w, inner_h) = (width + 2 * margin, height + margin + caption);
         let (full_w, full_h) = match self.layout {
             Layout::Ratio(w, h) if inner_w as u64 * h as u64 > inner_h as u64 * w as u64 => (
@@ -153,20 +153,22 @@ impl Frame {
         }
     }
 
-    /// 프레임을 두른 그림의 크기.
+    /// Size of the framed image.
     pub fn size(&self, width: usize, height: usize) -> (usize, usize) {
         let plan = self.plan(width, height);
         (plan.width, plan.height)
     }
 
-    /// 프레임을 두르면 화소 수가 몇 배가 되는지. 메모리를 얼마나 더 잡을지 가늠하는 데 쓴다.
+    /// How many times the pixel count grows with the frame. Used to gauge how much more memory to
+    /// reserve.
     pub fn growth(&self, width: usize, height: usize) -> f64 {
         let (w, h) = self.size(width, height);
         (w * h) as f64 / (width * height) as f64
     }
 }
 
-/// 프레임에 적을 두 줄: 기종과 렌즈, 촬영 설정과 날짜. 없는 값은 건너뛴다.
+/// The two lines to write on the frame: model and lens, shooting settings and date. Missing values
+/// are skipped.
 pub fn caption(shot: &Shot) -> [String; 2] {
     let first = [Some(&shot.camera), shot.lens.as_ref()]
         .into_iter()
@@ -183,7 +185,7 @@ pub fn caption(shot: &Shot) -> [String; 2] {
             return None;
         }
         let (seconds, inverse) = (n as f32 / d as f32, d as f32 / n as f32);
-        // 1초보다 짧고 분모가 정수로 떨어지면 카메라처럼 1/N로 적는다.
+        // Shorter than 1 second with a whole-number denominator: write 1/N like a camera.
         Some(
             if seconds < 1.0 && (inverse - inverse.round()).abs() < 0.05 {
                 format!("1/{inverse:.0}s")
@@ -202,7 +204,8 @@ pub fn caption(shot: &Shot) -> [String; 2] {
     .flatten()
     .collect::<Vec<_>>()
     .join("  ");
-    // "2026:11:07 13:27:19" → "2026.11.07". 시계를 맞추지 않은 카메라의 0000:00:00은 적지 않는다.
+    // "2026:11:07 13:27:19" → "2026.11.07". The 0000:00:00 of a camera whose clock was never set is
+    // not written.
     let date = shot
         .date
         .as_deref()
@@ -220,7 +223,8 @@ pub fn caption(shot: &Shot) -> [String; 2] {
     [first, second]
 }
 
-/// 사진에 프레임을 두르고 촬영 정보를 적은 새 그림을 만든다. 값은 sRGB 감마(0~1)로 본다.
+/// Makes a new image with a frame around the photo and the shooting information written. Values are
+/// taken as sRGB gamma (0–1).
 pub fn apply(image: &Image, frame: &Frame, shot: &Shot) -> Image {
     let plan = frame.plan(image.width, image.height);
     let (paper, ink) = if frame.dark {
@@ -240,8 +244,9 @@ pub fn apply(image: &Image, frame: &Frame, shot: &Shot) -> Image {
         }
     }
 
-    // 글자: 두 줄을 사진 바로 아래 여백의 가운데에 놓는다. 너무 길면 줄여서 넣는다.
-    let font = FontRef::try_from_slice(FONT).expect("프로그램에 넣은 글꼴을 읽을 수 없다");
+    // Text: place the two lines in the middle of the margin right below the photo. Shrink them if
+    // too long.
+    let font = FontRef::try_from_slice(FONT).expect("cannot read the font built into the program");
     let short = image.width.min(image.height) as f64;
     let room = image.width as f32 - 2.0 * (short * MARGIN) as f32;
     let lines: Vec<(String, f32, f32)> = caption(shot)
@@ -267,8 +272,8 @@ pub fn apply(image: &Image, frame: &Frame, shot: &Shot) -> Image {
     out
 }
 
-/// 글자 크기 `size`(화소)로 적었을 때 한 줄의 너비.
-// ponytail: 글자 사이 간격 보정(커닝)은 하지 않는다. 캡션 크기에서는 눈에 띄지 않는다.
+/// Width of one line written at text size `size` (pixels).
+// ponytail: no kerning. It is not noticeable at caption size.
 fn line_width(font: &FontRef, text: &str, size: f32) -> f32 {
     let scaled = font.as_scaled(size);
     text.chars()
@@ -276,7 +281,7 @@ fn line_width(font: &FontRef, text: &str, size: f32) -> f32 {
         .sum()
 }
 
-/// 한 줄을 `centre`를 가운데로, `top`을 윗변으로 해서 밝기 `ink`로 적는다.
+/// Writes one line centred on `centre` with `top` as its top edge, at lightness `ink`.
 fn draw_line(
     image: &mut Image,
     font: &FontRef,
@@ -328,7 +333,7 @@ mod tests {
         }
     }
 
-    /// 한 가지 값으로 채운 그림.
+    /// An image filled with one value.
     fn flat(width: usize, height: usize, value: f32) -> Image {
         Image {
             width,
@@ -348,7 +353,7 @@ mod tests {
         }
     }
 
-    /// 가로 `xs`, 세로 `ys` 범위에서 글자(바탕과 뚜렷이 다른 화소)가 있는 열의 범위.
+    /// The column range with text (pixels clearly unlike the background) within `xs` and `ys`.
     fn text_columns(
         image: &Image,
         ys: std::ops::Range<usize>,
@@ -409,7 +414,7 @@ mod tests {
         assert_eq!(line((4, 10)), "0.4s");
         assert_eq!(line((13, 10)), "1.3s");
         assert_eq!(line((30, 1)), "30s");
-        assert_eq!(line((1, 0)), "", "잘못된 값은 적지 않는다");
+        assert_eq!(line((1, 0)), "", "invalid values are not written");
     }
 
     #[test]
@@ -435,22 +440,22 @@ mod tests {
     fn band_adds_a_strip_below_and_leaves_the_picture_alone() {
         let image = flat(600, 400, 0.5);
         let framed = apply(&image, &white(Layout::Band), &shot());
-        // 띠의 높이는 짧은 변의 10%
+        // Band height is 10% of the short side
         assert_eq!((framed.width, framed.height), (600, 440));
         assert_eq!(pixel(&framed, 0, 0), [0.5; 3]);
         assert_eq!(pixel(&framed, 599, 399), [0.5; 3]);
-        assert_eq!(pixel(&framed, 0, 400), [1.0; 3], "띠는 흰색");
+        assert_eq!(pixel(&framed, 0, 400), [1.0; 3], "the band is white");
         assert_eq!(pixel(&framed, 599, 439), [1.0; 3]);
-        // 글자는 띠 안에, 가운데 맞춰 들어간다.
-        let (left, right) = text_columns(&framed, 400..440, 1.0).expect("글자가 없다");
+        // The text goes inside the band, centred.
+        let (left, right) = text_columns(&framed, 400..440, 1.0).expect("no text");
         assert!(left > 20 && right < 580, "{left}..{right}");
         assert!(
             ((left + right) as i32 - 600).abs() <= 4,
-            "가운데가 아니다: {left}..{right}"
+            "not centred: {left}..{right}"
         );
         assert!(
             text_columns(&framed, 0..400, 0.5).is_none(),
-            "사진 위에는 쓰지 않는다"
+            "nothing is written over the photo"
         );
     }
 
@@ -473,7 +478,7 @@ mod tests {
     fn border_goes_all_round_with_room_for_the_caption_below() {
         let image = flat(600, 400, 0.5);
         let framed = apply(&image, &white(Layout::Border), &shot());
-        // 위와 양옆은 짧은 변의 4%, 아래는 10%
+        // Top and sides are 4% of the short side, bottom 10%
         assert_eq!((framed.width, framed.height), (632, 456));
         assert_eq!(pixel(&framed, 15, 15), [1.0; 3]);
         assert_eq!(pixel(&framed, 16, 16), [0.5; 3]);
@@ -485,24 +490,24 @@ mod tests {
     #[test]
     fn a_ratio_pads_the_bordered_picture_to_that_shape() {
         let image = flat(600, 400, 0.5);
-        // 테두리를 두른 크기는 632×456. 1:1이면 위아래를 똑같이 늘려 632×632가 된다.
+        // The bordered size is 632×456. At 1:1, top and bottom grow equally to 632×632.
         let square = apply(&image, &white(Layout::Ratio(1, 1)), &shot());
         assert_eq!((square.width, square.height), (632, 632));
         assert_eq!(pixel(&square, 16, 103), [1.0; 3]);
         assert_eq!(
             pixel(&square, 16, 104),
             [0.5; 3],
-            "사진은 (632-456)/2+16 = 104번째 줄부터"
+            "the photo starts at row (632-456)/2+16 = 104"
         );
         assert!(
             text_columns(&square, 504..544, 1.0).is_some(),
-            "글자는 사진 바로 아래"
+            "text right below the photo"
         );
 
-        // 세로로 긴 9:16이면 높이가 632×16/9 = 1124 (짝수로 맞춘다).
+        // A tall 9:16 gives a height of 632×16/9 = 1124 (made even).
         let tall = apply(&image, &white(Layout::Ratio(9, 16)), &shot());
         assert_eq!((tall.width, tall.height), (632, 1124));
-        // 가로로 더 긴 16:9이면 양옆을 늘린다: 456×16/9 = 810.
+        // A wider 16:9 grows the sides: 456×16/9 = 810.
         let wide = apply(&image, &white(Layout::Ratio(16, 9)), &shot());
         assert_eq!((wide.width, wide.height), (810, 456));
         assert_eq!(pixel(&wide, (810 - 632) / 2 + 16, 16), [0.5; 3]);
@@ -517,16 +522,16 @@ mod tests {
         };
         let framed = apply(&image, &white(Layout::Band), &long);
         assert_eq!((framed.width, framed.height), (200, 620));
-        let (left, right) = text_columns(&framed, 600..620, 1.0).expect("글자가 없다");
+        let (left, right) = text_columns(&framed, 600..620, 1.0).expect("no text");
         assert!(
             left >= 4 && right <= 195,
-            "가장자리에 닿았다: {left}..{right}"
+            "touched the edge: {left}..{right}"
         );
     }
 
     #[test]
     fn framed_sizes_stay_even_for_the_encoder() {
-        // 4:2:0 인코딩은 짝수 크기를 전제로 한다. 짝수 크기의 사진은 프레임을 둘러도 짝수여야 한다.
+        // 4:2:0 encoding assumes even sizes. An even-sized photo must stay even with a frame.
         for (width, height) in [(6048, 4032), (4032, 6048), (5998, 3998), (1202, 802)] {
             for layout in [
                 Layout::Band,
@@ -548,20 +553,20 @@ mod tests {
     #[test]
     fn growth_says_how_much_bigger_the_framed_picture_is() {
         assert_eq!(white(Layout::Band).growth(600, 400), 1.1);
-        // 세로 9:16에 가로 사진을 넣으면 훨씬 커진다. 메모리를 그만큼 더 잡아야 한다.
+        // A landscape photo in a tall 9:16 grows a lot. That much more memory must be taken.
         let tall = white(Layout::Ratio(9, 16)).growth(600, 400);
         assert!((tall - 632.0 * 1124.0 / 240_000.0).abs() < 1e-6, "{tall}");
     }
 
-    /// 눈으로 확인하기 위한 그림을 `target/ui/`에 남긴다. `cargo test -- --ignored render_frames`
+    /// Leaves images in `target/ui/` for checking by eye. `cargo test -- --ignored render_frames`
     #[test]
-    #[ignore = "샘플 사진이 필요하고, 그림 파일을 남기는 용도"]
+    #[ignore = "needs sample photos, and leaves image files"]
     fn render_frames() {
         let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/ui");
         std::fs::create_dir_all(&out).unwrap();
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("DCIM/10361110");
         let params = crate::edit::Params::default();
-        // 세로 사진 한 장과 가로 사진 한 장
+        // One portrait photo and one landscape photo
         for (file, name) in [("DSC04551.ARW", "portrait"), ("DSC04553.ARW", "landscape")] {
             let loaded = crate::export::load(
                 &dir.join(file),

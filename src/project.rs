@@ -1,6 +1,7 @@
-//! 프로젝트 파일(`이름.amsil`)과 프로그램 설정 파일.
+//! The project file (`name.amsil`) and the program settings file.
 //!
-//! 프로젝트 파일에는 가져온 폴더, 사진별 편집, 내보내기 설정이 들어간다. 사진 폴더에는 아무것도 쓰지 않는다.
+//! The project file holds the imported folders, per-photo edits, and export settings. Nothing is
+//! written to the photo folders.
 
 use crate::Result;
 use crate::capture::Capture;
@@ -12,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// 이 프로그램이 읽고 쓰는 프로젝트 파일 형식의 버전.
+/// Version of the project file format this program reads and writes.
 const VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -21,14 +22,14 @@ pub struct Project {
     pub name: String,
     #[serde(default)]
     pub export: Export,
-    /// 가져온 폴더들.
+    /// Imported folders.
     #[serde(default, rename = "folder")]
     pub folders: Vec<Folder>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Export {
-    /// 내보낼 폴더. 아직 정하지 않았으면 None.
+    /// Folder to export to. None if not chosen yet.
     pub folder: Option<PathBuf>,
     pub quality: u8,
 }
@@ -36,49 +37,49 @@ pub struct Export {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Folder {
     pub path: PathBuf,
-    /// 기본값과 다른 사진만 기록한다. 키는 `path` 기준 상대 경로.
+    /// Only photos that differ from the defaults are recorded. Keys are paths relative to `path`.
     #[serde(default, rename = "photo")]
     pub photos: BTreeMap<String, Edit>,
 }
 
-/// 사진 한 장의 편집 내용. 기본값과 같은 항목은 파일에 적지 않는다.
+/// The edits of one photo. Fields equal to the default are not written to the file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Edit {
-    /// 노이즈 제거 강도 (0~1).
+    /// Noise reduction strength (0–1).
     #[serde(skip_serializing_if = "is_zero")]
     pub denoise: f32,
-    /// 프리셋의 식별자.
+    /// Identifier of the preset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preset: Option<String>,
-    /// 프리셋의 강도. 1이 프리셋 그대로다.
+    /// Strength of the preset. 1 is the preset as is.
     #[serde(skip_serializing_if = "is_one")]
     pub strength: f32,
-    /// 프리셋 위에 더하는 수동 조정.
+    /// Manual adjustments added on top of the preset.
     #[serde(skip_serializing_if = "Params::is_neutral")]
     pub adjust: Params,
-    /// 마지막에 입히는 LUT.
+    /// LUT applied last.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lut: Option<LutRef>,
-    /// 사진에 두르는 프레임.
+    /// Frame put around the photo.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frame: Option<Frame>,
-    /// 부분 보정 마스크.
+    /// Local adjustment masks.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub masks: Vec<Mask>,
-    /// 피부 보정의 세기 (0~1).
+    /// Skin retouch strength (0–1).
     #[serde(skip_serializing_if = "is_zero")]
     pub skin: f32,
-    /// 캡처 샤픈 (RAW 단계). 이 항목이 없던 예전 파일은 기본값(켜짐)으로 읽힌다.
+    /// Capture sharpening (RAW stage). Older files without this field read as the default (on).
     #[serde(skip_serializing_if = "Capture::is_default")]
     pub capture: Capture,
 }
 
-/// 사진에 입힐 LUT 파일과 강도.
+/// The LUT file to apply to a photo and its strength.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LutRef {
     pub file: PathBuf,
-    /// 1이면 LUT 그대로, 0이면 원본.
+    /// 1 is the LUT as is, 0 is the original.
     #[serde(default = "one", skip_serializing_if = "is_one")]
     pub strength: f32,
 }
@@ -132,7 +133,7 @@ impl Project {
 
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)?;
-        // 버전부터 본다. 형식이 달라졌을 수 있는 파일을 억지로 읽지 않는다.
+        // Check the version first. Don't force-read a file whose format may have changed.
         #[derive(Deserialize)]
         struct Header {
             version: u32,
@@ -163,12 +164,13 @@ impl Project {
         })?)
     }
 
-    /// 임시 파일에 쓴 뒤 이름을 바꾼다. 저장 도중 꺼져도 기존 파일이 깨지지 않는다.
+    /// Writes to a temp file, then renames it. The existing file survives even if power is lost
+    /// while saving.
     pub fn save(&self, path: &Path) -> Result<()> {
         write_atomically(path, &toml::to_string(self)?)
     }
 
-    /// 사진의 편집 내용. 기록이 없으면 기본값.
+    /// The edits of a photo. The default if there is no record.
     pub fn edit(&self, folder: usize, photo: &str) -> Edit {
         self.folders
             .get(folder)
@@ -177,7 +179,7 @@ impl Project {
             .unwrap_or_default()
     }
 
-    /// 사진의 편집 내용을 바꾼다. 기본값으로 돌아가면 기록을 지운다.
+    /// Changes the edits of a photo. Removes the record when it returns to the default.
     pub fn set_edit(&mut self, folder: usize, photo: &str, edit: Edit) {
         let Some(folder) = self.folders.get_mut(folder) else {
             return;
@@ -189,7 +191,8 @@ impl Project {
         }
     }
 
-    /// 폴더마다 출력 폴더 안에서 쓸 이름. 이름이 같은 폴더가 있으면 번호를 붙여 구분한다.
+    /// The name each folder uses inside the output folder. Folders with the same name get a number
+    /// to tell them apart.
     pub fn export_names(&self) -> Vec<String> {
         let mut seen: BTreeMap<String, usize> = BTreeMap::new();
         self.folders
@@ -224,27 +227,27 @@ fn write_atomically(path: &Path, text: &str) -> Result<()> {
     Ok(())
 }
 
-/// 프로그램 설정 (`~/.config/amsil/config.toml`).
+/// Program settings (`~/.config/amsil/config.toml`).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Config {
-    /// 화면에서 고른 언어. 고른 적이 없으면 시스템 언어를 따른다.
+    /// Language chosen on screen. Follows the system language if never chosen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lang: Option<crate::lang::Lang>,
-    /// 화면에서 고른 밝기 모드. 고른 적이 없으면 시스템의 설정을 따른다.
+    /// Brightness mode chosen on screen. Follows the system setting if never chosen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<Theme>,
-    /// 전후 비교에서 미리보기를 나누는 방향.
+    /// Direction the preview is split in the before/after comparison.
     #[serde(default)]
     pub compare_split: Split,
-    /// 전후 비교의 보정 전 칸에 무엇을 보여 줄지.
+    /// What to show in the before pane of the before/after comparison.
     #[serde(default)]
     pub compare_before: Before,
-    /// 최근에 연 프로젝트. 최신이 맨 앞.
+    /// Recently opened projects. Newest first.
     #[serde(default)]
     pub recent: Vec<PathBuf>,
 }
 
-/// 화면의 밝기 모드.
+/// The screen's brightness mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Theme {
@@ -252,35 +255,35 @@ pub enum Theme {
     Dark,
 }
 
-/// 전후 비교에서 미리보기를 나누는 방향.
+/// Direction the preview is split in the before/after comparison.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Split {
-    /// 사진이 더 크게 들어가는 쪽으로.
+    /// Whichever way the photo fits larger.
     #[default]
     Auto,
-    /// 좌우로 (보정 전이 왼쪽).
+    /// Side by side (before on the left).
     Side,
-    /// 위아래로 (보정 전이 위).
+    /// Top and bottom (before on top).
     Stacked,
 }
 
-/// 전후 비교의 보정 전 칸에 보여 줄 것.
+/// What to show in the before pane of the before/after comparison.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Before {
-    /// 아무 보정도 하지 않은 RAW.
+    /// The RAW with no adjustments at all.
     #[default]
     Raw,
-    /// 같은 폴더에 같은 이름으로 있는 카메라 JPEG (없으면 RAW).
+    /// The camera JPEG with the same name in the same folder (the RAW if there is none).
     Jpeg,
 }
 
-/// 최근 프로젝트 목록의 최대 길이.
+/// Maximum length of the recent projects list.
 const MAX_RECENT: usize = 10;
 
 impl Config {
-    /// 없거나 읽을 수 없으면 기본값.
+    /// The default if missing or unreadable.
     pub fn load(path: &Path) -> Self {
         std::fs::read_to_string(path)
             .ok()
@@ -292,14 +295,14 @@ impl Config {
         write_atomically(path, &toml::to_string(self)?)
     }
 
-    /// 프로젝트를 최근 목록의 맨 앞에 올린다. 목록은 10개까지.
+    /// Moves the project to the front of the recent list. The list holds up to 10.
     pub fn remember(&mut self, project: &Path) {
         self.recent.retain(|p| p != project);
         self.recent.insert(0, project.to_owned());
         self.recent.truncate(MAX_RECENT);
     }
 
-    /// 설정 파일의 위치.
+    /// Location of the settings file.
     pub fn path() -> PathBuf {
         let base = std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
@@ -340,11 +343,11 @@ mod tests {
 
     #[test]
     fn capture_sharpening_is_on_for_old_projects_and_saved_only_when_changed() {
-        // 이 항목이 없던 프로젝트 파일
+        // A project file without this field
         let old: Edit = toml::from_str("denoise = 0.5\n").unwrap();
         assert_eq!(old.capture, Capture::default());
         assert!(old.capture.enabled);
-        // 기본값은 파일에 쓰지 않는다
+        // Defaults are not written to the file
         let text = toml::to_string(&Edit::default()).unwrap();
         assert!(!text.contains("capture"), "{text}");
         let changed = Edit {
@@ -433,7 +436,7 @@ mod tests {
         project.set_edit(0, "10161107/DSC04307.ARW", Edit::default());
         assert!(
             project.folders[0].photos.is_empty(),
-            "기본값으로 돌아가면 기록을 지운다"
+            "returning to the default removes the record"
         );
     }
 
@@ -461,7 +464,7 @@ mod tests {
         assert_eq!(
             loaded.edit(0, "10161107/DSC04307.ARW").strength,
             1.0,
-            "적지 않은 강도는 1"
+            "an unwritten strength is 1"
         );
 
         let text = std::fs::read_to_string(&path).unwrap();
@@ -473,7 +476,7 @@ mod tests {
         assert!(text.contains("exposure = 0.3"), "{text}");
         assert!(
             !text.contains("contrast") && !text.contains("blue"),
-            "0인 값은 적지 않는다:\n{text}"
+            "zero values are not written:\n{text}"
         );
     }
 
@@ -530,7 +533,7 @@ mod tests {
         assert_eq!(
             project.folders[0].photos.len(),
             1,
-            "기본값이 되면 기록을 지운다"
+            "becoming the default removes the record"
         );
     }
 
@@ -551,7 +554,10 @@ mod tests {
         let dir = temp("config");
         let path = dir.join("amsil/config.toml");
         let mut config = Config::load(&path);
-        assert!(config.recent.is_empty(), "설정 파일이 없으면 기본값");
+        assert!(
+            config.recent.is_empty(),
+            "the default when there is no settings file"
+        );
         for i in 0..12 {
             config.remember(Path::new(&format!("/p/{i}.amsil")));
         }
@@ -578,7 +584,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("amsil-config-lang-{}", std::process::id()));
         let path = dir.join("config.toml");
         let mut config = Config::load(&path);
-        assert_eq!(config.lang, None, "고르기 전에는 시스템 언어를 따른다");
+        assert_eq!(
+            config.lang, None,
+            "follows the system language before choosing"
+        );
         config.lang = Some(crate::lang::Lang::En);
         config.save(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
@@ -616,7 +625,7 @@ mod tests {
             text.contains("layout = \"4:5\"") && text.contains("dark = true"),
             "{text}"
         );
-        // 손으로 고친 파일에 터무니없는 비율이 있으면 열 때 알린다.
+        // If a hand-edited file has an absurd ratio, report it when opening.
         std::fs::write(&path, text.replace("4:5", "1:100")).unwrap();
         let error = Project::load(&path).unwrap_err().to_string();
         std::fs::remove_dir_all(dir).unwrap();
@@ -694,7 +703,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("amsil-config-theme-{}", std::process::id()));
         let path = dir.join("config.toml");
         let mut config = Config::load(&path);
-        assert_eq!(config.theme, None, "고르기 전에는 시스템의 모드를 따른다");
+        assert_eq!(
+            config.theme, None,
+            "follows the system mode before choosing"
+        );
         config.theme = Some(Theme::Light);
         config.save(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
@@ -712,7 +724,7 @@ mod tests {
         assert_eq!(
             config.compare_before,
             Before::Raw,
-            "고르기 전에는 보정 전 RAW"
+            "the unadjusted RAW before choosing"
         );
         config.compare_before = Before::Jpeg;
         config.save(&path).unwrap();
@@ -730,7 +742,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("amsil-config-split-{}", std::process::id()));
         let path = dir.join("config.toml");
         let mut config = Config::load(&path);
-        assert_eq!(config.compare_split, Split::Auto, "고르기 전에는 자동");
+        assert_eq!(
+            config.compare_split,
+            Split::Auto,
+            "automatic before choosing"
+        );
         config.compare_split = Split::Stacked;
         config.save(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
@@ -738,7 +754,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(text.contains("compare_split = \"stacked\""), "{text}");
         assert_eq!(loaded.compare_split, Split::Stacked);
-        // 이 항목이 없던 예전 설정 파일도 그대로 읽힌다 (못 읽으면 최근 프로젝트 목록이 사라진다).
+        // Older settings files without this field still read fine (otherwise the recent projects
+        // list would be lost).
         let old: Config = toml::from_str("recent = [\"/a.amsil\"]\n").unwrap();
         assert_eq!(old.compare_split, Split::Auto);
         assert_eq!(old.recent.len(), 1);

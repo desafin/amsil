@@ -1,4 +1,4 @@
-//! `Effect`를 백그라운드 스레드에서 실행하고, 결과를 `Action`으로 돌려보낸다.
+//! Runs an `Effect` on a background thread and sends the result back as an `Action`.
 
 use crate::app::{Action, Backend, Effect};
 use crate::capture::Capture;
@@ -15,69 +15,73 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
-/// 썸네일의 긴 변 (화소).
+/// Long side of a thumbnail (pixels).
 const THUMBNAIL_SIDE: usize = 160;
-/// 사진을 분류할 때 쓰는 그림의 긴 변 (화소). 짧은 변이 모델 입력(224)보다 작아지지 않게 넉넉히 잡는다.
+/// Long side of the image used to classify a photo (pixels). Generous so the short side doesn't
+/// drop below the model input (224).
 const CLASSIFY_SIDE: usize = 448;
-/// 미리보기의 긴 변 (화소)의 기본값. 화면 쪽에서 GPU가 받을 수 있는 크기를 알려 주면 그 값으로 바뀐다.
+/// Default long side of the preview (pixels). Replaced by the size the GPU accepts once the UI
+/// reports it.
 const PREVIEW_SIDE: usize = 2048;
 
 type SharedDenoiser = Arc<Mutex<Denoiser>>;
-/// (파일 경로, 읽은 LUT)
+/// (file path, loaded LUT)
 type CachedLut = (PathBuf, Arc<Lut>);
 
-/// 보정을 바꿀 때 바로 보여 주는 작은 미리보기의 긴 변 (화소).
+/// Long side of the small preview shown right away when adjustments change (pixels).
 const QUICK_SIDE: usize = 1200;
 
-/// 읽어 둔 사진. 보정만 바꿀 때는 다시 읽지 않고 이것으로 현상만 다시 한다.
+/// A loaded photo. When only adjustments change, it is re-developed from this without re-reading.
 struct Base {
     path: PathBuf,
     denoise: f32,
-    /// RAW 읽기와 디모자익(또는 노이즈 제거), 캡처 샤픈의 재료.
+    /// Result of RAW reading and demosaicing (or denoising); input to capture sharpening.
     read: export::Read,
-    /// 캡처 샤픈한 것. 캡처 샤픈 값이 같으면 다시 쓴다.
+    /// The capture-sharpened image. Reused while the capture sharpening value is unchanged.
     sharpened: Mutex<Option<Arc<Sharpened>>>,
 }
 
-/// 캡처 샤픈까지 한 사진과, 그 그림에서 모델로 구한 것들.
+/// A capture-sharpened photo and what the models derived from it.
 struct Sharpened {
     capture: Capture,
     loaded: export::Loaded,
-    /// 빠른 미리보기용으로 줄인 카메라 RGB. 원본이 이미 작으면 없다.
+    /// Camera RGB scaled down for the quick preview. None if the original is already small.
     small: Option<crate::Image>,
-    /// 마스크 모델의 인코더 출력. 이 사진에 마스크를 처음 쓸 때 만든다.
+    /// Mask model encoder output. Made the first time a mask is used on this photo.
     embedding: Mutex<Option<Arc<mask::Embedding>>>,
-    /// 누른 자리들로 이미 구해 둔 영역. 보정 슬라이더를 끄는 동안 다시 계산하지 않게 한다.
+    /// Areas already computed from the clicked points. Avoids recomputing while an adjustment
+    /// slider is dragged.
     areas: Mutex<Vec<(Vec<Point>, Low)>>,
-    /// 피부인 곳. 이 사진에 피부 보정을 처음 쓸 때 구한다.
+    /// Where the skin is. Found the first time skin adjustment is used on this photo.
     skin: Mutex<Option<Low>>,
 }
 
 #[derive(Clone)]
 pub struct Workers {
     tx: Sender<Action>,
-    /// 결과가 도착했으니 화면을 다시 그리라고 알린다.
+    /// Signals that a result has arrived and the screen should be redrawn.
     wake: Arc<dyn Fn() + Send + Sync>,
-    /// 노이즈 제거 모델. 처음 필요할 때 읽고 미리보기와 내보내기가 함께 쓴다.
+    /// Denoising model. Loaded when first needed and shared by preview and export.
     denoiser: Arc<Mutex<Option<SharedDenoiser>>>,
     cancel: Arc<AtomicBool>,
-    /// 가장 최근의 미리보기 요청 번호.
+    /// Number of the latest preview request.
     latest_preview: Arc<AtomicU64>,
-    /// 미리보기의 긴 변 한도.
+    /// Limit on the preview's long side.
     preview_side: Arc<AtomicU64>,
-    /// 가장 최근의 보정 전 그림 요청 번호.
+    /// Number of the latest before-adjustment image request.
     latest_original: Arc<AtomicU64>,
-    /// 보정 전 그림은 한 번에 한 장만 읽는다 (사진을 빠르게 넘길 때 무거운 읽기가 쌓이지 않게).
+    /// Before-adjustment images are read one at a time (so heavy reads don't pile up when flipping
+    /// through photos quickly).
     original_lock: Arc<Mutex<()>>,
-    /// 미리보기 중인 사진 한 장.
+    /// The one photo being previewed.
     base: Arc<Mutex<Option<Arc<Base>>>>,
-    /// 마지막으로 읽은 LUT. 강도 슬라이더를 끄는 동안 파일을 다시 읽지 않게 한다.
+    /// The last loaded LUT. Avoids re-reading the file while the strength slider is dragged.
     lut: Arc<Mutex<Option<CachedLut>>>,
-    /// 사진 분류 모델. 처음 필요할 때 읽는다.
+    /// Photo classification model. Loaded when first needed.
     classifier: Arc<Mutex<Option<Arc<Mutex<Classifier>>>>>,
-    /// 마스크 모델. 처음 필요할 때 읽는다.
+    /// Mask model. Loaded when first needed.
     segmenter: Arc<Mutex<Option<Arc<Mutex<Segmenter>>>>>,
-    /// 피부를 찾는 모델. 처음 필요할 때 읽는다.
+    /// Skin detection model. Loaded when first needed.
     skin_finder: Arc<Mutex<Option<Arc<Mutex<SkinFinder>>>>>,
 }
 
@@ -103,23 +107,25 @@ impl Workers {
     }
 
     fn send(&self, action: Action) {
-        // 받는 쪽이 사라졌다면 프로그램이 끝나는 중이다.
+        // If the receiver is gone, the program is shutting down.
         let _ = self.tx.send(action);
         (self.wake)();
     }
 
-    /// 화면 갈무리처럼 화면 쪽에서 나중에 도착하는 결과를 넣는 통로.
+    /// Channel for results that arrive later from the UI side, such as screen captures.
     pub fn sender(&self) -> impl Fn(Action) + Send + Sync + 'static {
         let workers = self.clone();
         move |action| workers.send(action)
     }
 
-    /// 미리보기를 얼마나 크게 만들지 정한다. 확대해서 볼 수 있도록 GPU 텍스처가 허용하는 만큼 크게 준다.
+    /// Sets how large previews are made. As large as the GPU texture allows, so they can be viewed
+    /// zoomed in.
     pub fn set_preview_side(&self, side: usize) {
         self.preview_side.store(side as u64, SeqCst);
     }
 
-    /// 모델을 읽어 GPU를 쓸 수 있는지 알아본다. 프로그램을 켤 때와 언어를 바꿀 때 한다.
+    /// Loads the models to check whether the GPU can be used. Done at startup and on language
+    /// change.
     fn probe_backend(&self) {
         let workers = self.clone();
         std::thread::spawn(move || {
@@ -132,7 +138,8 @@ impl Workers {
             };
             workers.send(Action::Backend(backend));
             workers.send(Action::Recommender(workers.classifier().err()));
-            // 마스크 모델은 크고, 쓰지 않는 사람도 많다. 여기서는 파일이 있는지만 본다.
+            // The mask model is large and many people never use it. Only check that the file
+            // exists here.
             workers.send(Action::Segmenter(mask::missing()));
             workers.send(Action::SkinModel(skin::missing()));
         });
@@ -143,7 +150,7 @@ impl Workers {
         if let Some(denoiser) = slot.as_ref() {
             return Ok(denoiser.clone());
         }
-        // 실패는 기억해 두지 않는다. 모델 파일을 받아 놓으면 다음에는 읽힌다.
+        // Failures aren't remembered. Once the model file is downloaded, it loads next time.
         let denoiser = Arc::new(Mutex::new(
             export::load_denoiser().map_err(|e| Text::of(&e))?,
         ));
@@ -185,14 +192,15 @@ impl Workers {
         Ok(finder)
     }
 
-    /// 미리보기에 쓸 영역(마스크가 고른 곳, 피부)을 구한다. 모델의 결과는 사진에 붙여 두고 다시 쓴다.
+    /// Computes the areas for a preview (mask selections, skin). Model results are kept on the
+    /// photo and reused.
     fn areas(
         &self,
         base: &Sharpened,
         masks: &[Mask],
         skin: f32,
     ) -> std::result::Result<export::Areas, Text> {
-        /// 사진 한 장에 기억해 두는 마스크 영역의 수.
+        /// Number of mask areas remembered per photo.
         const REMEMBERED: usize = 16;
         let mut areas = export::Areas::default();
         if !masks.is_empty() {
@@ -245,8 +253,8 @@ impl Workers {
         Ok(areas)
     }
 
-    /// 사진을 읽는다. 방금 읽은 사진(같은 노이즈 제거 레벨)이면 다시 읽지 않는다. 새로 읽었으면 `true`.
-    /// 여러 요청이 동시에 와도 한 번만 읽도록, 읽는 동안 잠금을 쥐고 있는다.
+    /// Reads the photo. Skips re-reading if it was just read (at the same denoise level). `true` if
+    /// it was newly read. Holds the lock while reading so concurrent requests read only once.
     fn base(&self, path: &Path, denoise: f32) -> std::result::Result<(Arc<Base>, bool), Text> {
         let mut slot = self.base.lock().unwrap();
         if let Some(base) = slot
@@ -272,7 +280,7 @@ impl Workers {
         Ok((base, true))
     }
 
-    /// 읽어 둔 사진을 캡처 샤픈한다. 같은 값으로 이미 했으면 다시 쓴다.
+    /// Capture-sharpens the loaded photo. Reuses the result if already done with the same value.
     fn sharpened(&self, base: &Base, capture: &Capture) -> Arc<Sharpened> {
         let mut slot = base.sharpened.lock().unwrap();
         if let Some(done) = slot.as_ref().filter(|done| done.capture == *capture) {
@@ -292,7 +300,8 @@ impl Workers {
         done
     }
 
-    // ponytail: 경로만 보고 재사용한다. 프로그램을 켜 둔 채 LUT 파일을 고치면 사진을 다시 골라도 옛 내용이 보인다.
+    // ponytail: reuse is keyed on the path alone. If a LUT file is edited while the program is
+    // running, the old contents still show even after picking the photo again.
     fn lut(&self, path: &Path) -> std::result::Result<Arc<Lut>, Text> {
         let mut slot = self.lut.lock().unwrap();
         if let Some((_, lut)) = slot.as_ref().filter(|(cached, _)| cached == path) {
@@ -308,10 +317,11 @@ impl Workers {
         match effect {
             Effect::Thumbnails(list) => {
                 std::thread::spawn(move || {
-                    // 분류 모델이 없으면 썸네일만 만든다.
+                    // Without the classification model, only make the thumbnail.
                     let classifier = workers.classifier().ok();
                     list.into_par_iter().for_each(|(index, path)| {
-                        // 분류에 쓸 만큼 큰 그림을 한 번 읽어 분류하고, 썸네일 크기로 줄인다.
+                        // Read one image large enough to classify, classify it, then shrink it to
+                        // thumbnail size.
                         let picture = preview::thumbnail(&path, CLASSIFY_SIDE).ok().flatten();
                         let guess = picture.as_ref().zip(classifier.as_ref()).and_then(
                             |(picture, classifier)| {
@@ -347,7 +357,7 @@ impl Workers {
             } => {
                 self.latest_preview.store(generation, SeqCst);
                 std::thread::spawn(move || {
-                    // 그 사이에 더 새로운 요청이 왔으면 이 요청은 버린다.
+                    // If a newer request arrived in the meantime, drop this one.
                     let stale = || workers.latest_preview.load(SeqCst) != generation;
                     let send = |pixels| {
                         workers.send(Action::PreviewReady {
@@ -390,7 +400,7 @@ impl Workers {
                         if stale() {
                             return Ok(());
                         }
-                        // 먼저 줄인 사본으로 빨리 보여 주고, 이어서 원본 크기로 다시 만든다.
+                        // Show a scaled-down copy quickly first, then remake it at full size.
                         if let Some(small) = &base.small {
                             send(preview::shrink(
                                 &base.loaded.develop(small, look, &areas),
@@ -430,12 +440,12 @@ impl Workers {
                 std::thread::spawn(move || {
                     let stale = || workers.latest_original.load(SeqCst) != generation;
                     let _one_at_a_time = workers.original_lock.lock().unwrap();
-                    // 기다리는 사이에 더 새로운 요청이 왔으면 읽지 않는다.
+                    // If a newer request arrived while waiting, don't read.
                     if stale() {
                         return;
                     }
-                    // 읽어 둔 사진(`base`)은 보정 후 미리보기의 것이라 건드리지 않는다.
-                    // 여기서 바꾸면 보정 후 쪽이 노이즈 제거를 다시 하게 된다.
+                    // The loaded photo (`base`) belongs to the after-adjustment preview, so leave
+                    // it alone. Changing it here would make the after side denoise again.
                     let side = workers.preview_side.load(SeqCst) as usize;
                     if let Some(jpeg) = jpeg {
                         let result = camera_jpeg(&jpeg, side);
@@ -448,7 +458,8 @@ impl Workers {
                         }
                         return;
                     }
-                    // 보정 전 그림에는 캡처 샤픈도 걸지 않는다 (비교하면 효과가 보이게).
+                    // No capture sharpening on the before image either (so the effect shows when
+                    // comparing).
                     let result =
                         export::load(&path, None, &crate::capture::Capture::off(), &|_| {})
                             .map(|loaded| {
@@ -480,7 +491,8 @@ impl Workers {
                         } else {
                             None
                         };
-                        // 마스크나 피부 모델을 읽지 못하면, 그것을 쓰는 사진만 그 이유와 함께 실패로 남는다.
+                        // If the mask or skin model fails to load, only photos that use it fail,
+                        // with that reason.
                         let segmenter = if photos.iter().any(|photo| !photo.masks.is_empty()) {
                             workers.segmenter().ok()
                         } else {
@@ -513,7 +525,8 @@ impl Workers {
     }
 }
 
-/// 카메라 JPEG를 EXIF 방향대로 세워 긴 변이 `side` 안에 들어오게 줄인다 (전후 비교의 보정 전 칸).
+/// Rotates the camera JPEG to its EXIF orientation and scales it so the long side fits in `side`
+/// (the before pane of the before/after comparison).
 pub(crate) fn camera_jpeg(path: &Path, side: usize) -> std::result::Result<preview::Pixels, Text> {
     use image::ImageDecoder;
     let read = || -> crate::Result<image::RgbaImage> {
@@ -557,13 +570,13 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    /// 조건에 맞는 결과가 올 때까지 기다린다. 그 사이에 온 것들도 함께 돌려준다.
+    /// Waits until a matching result arrives. Also returns everything that came in the meantime.
     fn wait_for(rx: &Receiver<Action>, mut wanted: impl FnMut(&Action) -> bool) -> Vec<Action> {
         let mut seen = Vec::new();
         loop {
             let action = rx
                 .recv_timeout(Duration::from_secs(120))
-                .expect("백그라운드 작업이 결과를 보내지 않았다");
+                .expect("the background job sent no result");
             let done = wanted(&action);
             seen.push(action);
             if done {
@@ -580,7 +593,7 @@ mod tests {
             return;
         }
         let pixels = camera_jpeg(&path, 2048).unwrap();
-        // 6048×4032로 저장된 세로 사진이 EXIF 방향대로 선다.
+        // A portrait photo stored as 6048×4032 stands upright per its EXIF orientation.
         assert_eq!((pixels.width, pixels.height), (1365, 2048));
         assert_eq!(pixels.rgba.len(), 1365 * 2048 * 4);
         let error = camera_jpeg(&path.with_extension("없음"), 2048).unwrap_err();
@@ -606,10 +619,10 @@ mod tests {
             guess,
         } = &seen[0]
         else {
-            panic!("썸네일이 아니다")
+            panic!("not a thumbnail")
         };
         assert_eq!(thumb.height, THUMBNAIL_SIDE);
-        // 분류 모델이 있으면 사진의 종류도 함께 온다.
+        // With the classification model, the photo's category comes along too.
         assert_eq!(
             guess.is_some(),
             crate::gpu::model_dir()
@@ -617,7 +630,7 @@ mod tests {
                 .exists()
         );
 
-        // 미리보기는 사진의 사본으로 한다 (아래에서 지워 본다).
+        // Preview a copy of the photo (it gets deleted below).
         let dir = std::env::temp_dir().join(format!("amsil-worker-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let copy = dir.join("copy.ARW");
@@ -636,7 +649,7 @@ mod tests {
             capture: Capture::off(),
             capture_view: None,
         });
-        // 빠른 작은 미리보기가 먼저 오고, 원본 크기에 가까운 것이 뒤따른다.
+        // The quick small preview comes first, followed by one near full size.
         let mut seen = wait_for(&rx, |action| {
             matches!(action, Action::PreviewReady { generation: 7, .. })
         });
@@ -657,20 +670,21 @@ mod tests {
         assert_eq!(
             sizes,
             [(800, 1200), (1365, 2048)],
-            "세로 사진: 긴 변 1200짜리가 먼저, 2048짜리가 나중"
+            "portrait photo: long side 1200 first, then 2048"
         );
-        // 사진을 새로 읽으면 사진에서 구한 캡처 샤픈 값도 알려 준다.
+        // A newly read photo also reports the capture sharpening value derived from it.
         assert!(
             seen.iter().any(|action| matches!(
                 action,
                 Action::CaptureAuto { index: 0, radius, threshold }
                     if (0.4..=2.0).contains(radius) && *threshold >= 0.0
             )),
-            "CaptureAuto가 오지 않았다"
+            "CaptureAuto did not arrive"
         );
 
-        // 같은 사진의 보정만 바꾸면 파일을 다시 읽지 않는다. 파일을 지워도 미리보기가 나오는 것으로 확인한다.
-        // (걸린 시간으로 재면 다른 테스트가 함께 돌 때 흔들린다.)
+        // Changing only the adjustments of the same photo doesn't re-read the file. Checked by
+        // getting a preview after the file is deleted. (Timing it would be flaky when other tests
+        // run alongside.)
         std::fs::remove_file(&copy).unwrap();
         let mono = crate::edit::Params {
             mono: 1.0,
@@ -697,12 +711,12 @@ mod tests {
             result: Ok(quick), ..
         } = seen.last().unwrap()
         else {
-            panic!("보정만 바꿨는데 (지운) 사진 파일을 다시 읽으려 했다")
+            panic!("only adjustments changed, yet it tried to re-read the (deleted) photo file")
         };
         let px = &quick.rgba[..4];
         assert!(
             px[0].abs_diff(px[1]) <= 1 && px[1].abs_diff(px[2]) <= 1,
-            "흑백이어야 한다: {px:?}"
+            "should be monochrome: {px:?}"
         );
         let full_mono = wait_for(
             &rx,
@@ -716,7 +730,8 @@ mod tests {
             unreachable!()
         };
 
-        // 캡처 샤픈 값만 바꿔도 (지운) 파일을 다시 읽지 않고, 그림은 달라진다.
+        // Changing only capture sharpening doesn't re-read the (deleted) file, and the image
+        // changes.
         workers.run(Effect::Preview {
             generation: 9,
             index: 0,
@@ -741,13 +756,13 @@ mod tests {
         }) = seen.last()
         else {
             panic!(
-                "캡처 샤픈만 바꿨는데 (지운) 사진 파일을 다시 읽으려 했다: {:?}",
+                "only capture sharpening changed, yet it re-read the (deleted) photo file: {:?}",
                 seen.last().map(|_| ())
             )
         };
         assert!(
             sharpened.rgba != full_mono.rgba,
-            "캡처 샤픈을 켜면 그림이 달라야 한다"
+            "turning on capture sharpening should change the image"
         );
 
         let output = dir.join("sub/out.heic");
@@ -768,16 +783,16 @@ mod tests {
         });
         let seen = wait_for(&rx, |action| matches!(action, Action::ExportFinished(_)));
         let Action::ExportFinished(Ok((outcome, _))) = seen.last().unwrap() else {
-            panic!("내보내기 실패")
+            panic!("export failed")
         };
         assert_eq!((outcome.done, outcome.failed.len()), (1, 0));
         assert!(output.exists());
         assert!(
             seen.iter()
                 .any(|action| matches!(action, Action::ExportProgress(_))),
-            "진행 상황도 알려야 한다"
+            "should report progress too"
         );
-        assert!(woken.load(SeqCst) >= 3, "결과가 올 때마다 화면을 깨운다");
+        assert!(woken.load(SeqCst) >= 3, "wakes the screen for every result");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -822,17 +837,17 @@ mod tests {
             !seen
                 .iter()
                 .any(|action| matches!(action, Action::PreviewReady { generation: 1, .. })),
-            "옛 요청의 결과는 보내지 않는다"
+            "results of stale requests are not sent"
         );
     }
 
     #[test]
     fn a_preview_marks_the_area_a_mask_selects() {
-        // 마스크 모델과 샘플 사진이 있을 때만 돈다.
+        // Runs only when the mask model and sample photo are present.
         let photo =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("DCIM/10361110/DSC04551.ARW");
         if !photo.exists() || mask::missing().is_some() {
-            eprintln!("마스크 모델이나 샘플 사진이 없어 건너뜀");
+            eprintln!("skipped: no mask model or sample photo");
             return;
         }
         let (workers, rx) = Workers::new(|| {});
@@ -841,7 +856,7 @@ mod tests {
             y: 0.35,
             include: true,
         };
-        // 첫 번째로 오는 빠른 미리보기에서, 건물(누른 자리)과 하늘의 색을 본다.
+        // In the first quick preview, check the colors of the building (clicked point) and the sky.
         let colours = |generation: u64, overlay: Option<usize>| {
             workers.run(Effect::Preview {
                 generation,
@@ -868,7 +883,7 @@ mod tests {
                 result: Ok(pixels), ..
             }) = seen.last()
             else {
-                panic!("미리보기가 오지 않았다")
+                panic!("no preview arrived")
             };
             let at = |x: f32, y: f32| {
                 let i = ((y * pixels.height as f32) as usize * pixels.width
@@ -882,9 +897,9 @@ mod tests {
         let (tower_shown, sky_shown) = colours(2, Some(0));
         assert!(
             tower_shown[0] > tower_plain[0] + 30 && tower_shown[2] < tower_plain[2],
-            "고른 건물은 붉게 표시된다: {tower_plain:?} → {tower_shown:?}"
+            "the selected building is tinted red: {tower_plain:?} → {tower_shown:?}"
         );
-        assert_eq!(sky_shown, sky_plain, "하늘은 그대로");
+        assert_eq!(sky_shown, sky_plain, "the sky is unchanged");
     }
 
     #[test]
@@ -906,12 +921,12 @@ mod tests {
             result: Ok(original),
         }) = seen.last()
         else {
-            panic!("보정 전 그림이 오지 않았다");
+            panic!("no before image arrived");
         };
         assert_eq!(
             (original.width, original.height),
             (1365, 2048),
-            "보정 후 미리보기와 같은 크기 (긴 변 2048)"
+            "same size as the after preview (long side 2048)"
         );
 
         workers.run(Effect::Preview {
@@ -941,7 +956,7 @@ mod tests {
         };
         assert!(
             original.rgba == preview.rgba,
-            "아무 보정도 하지 않은 사진의 미리보기와 화소까지 같아야 한다"
+            "should match the preview of an unadjusted photo pixel for pixel"
         );
     }
 }

@@ -1,5 +1,5 @@
-//! 변환의 실제 작업: 사진 한 장의 처리 과정과, 여러 장을 자원 한도 안에서 동시에 돌리는 일.
-//! 명령행과 GUI가 함께 쓴다.
+//! The actual conversion work: the processing steps for one photo, and running many at once
+//! within resource limits. Shared by the command line and the GUI.
 
 use crate::capture::{self, Capture, CaptureView};
 use crate::edit::Params;
@@ -16,54 +16,57 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 use std::time::Instant;
 
-/// libheif의 품질 값. A900 사진으로 재 보니 55가 JPEG q90 수준이고 70부터는 JPEG보다 파일이 커진다.
+/// libheif quality value. Measured on A900 photos, 55 matches JPEG q90, and from 70 up files get
+/// larger than JPEG.
 pub const QUALITY: u8 = 55;
-/// 고를 수 있는 품질의 범위.
+/// Range of selectable quality.
 pub const QUALITY_RANGE: std::ops::RangeInclusive<u8> = 40..=100;
 
-/// 사진 한 장을 처리하는 데 드는 메모리의 추정값 (센서 화소당 바이트).
-// ponytail: 실측으로 정한 상수 (A900 기준 장당 최대 53바이트/화소). 다른 카메라에서 틀려도 시스템 여유 메모리 감시가 받쳐 준다.
+/// Estimated memory to process one photo (bytes per sensor pixel).
+// ponytail: constant set by measurement (at most 53 bytes/pixel per photo on the A900). If it is
+// wrong for other cameras, the system free-memory watch backs it up.
 const BYTES_PER_PIXEL: u64 = 64;
 
 pub const GB: f64 = (1u64 << 30) as f64;
 
-/// 변환할 사진 한 장.
+/// One photo to convert.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Photo {
     pub input: PathBuf,
     pub output: PathBuf,
-    /// 노이즈 제거 강도 (0~1). 0이면 끈다.
+    /// Denoise strength (0..1). 0 turns it off.
     pub denoise: f32,
-    /// 보정 값 (프리셋 × 강도 + 수동 조정).
+    /// Adjustment values (preset × strength + manual adjustments).
     pub params: Params,
-    /// 마지막에 입힐 LUT 파일과 강도.
+    /// LUT file and strength applied last.
     pub lut: Option<(PathBuf, f32)>,
-    /// 사진에 두를 프레임.
+    /// Frame to put around the photo.
     pub frame: Option<Frame>,
-    /// 부분 보정 마스크.
+    /// Local adjustment masks.
     pub masks: Vec<Mask>,
-    /// 피부 보정의 세기 (0~1). 0이면 끈다.
+    /// Skin adjustment strength (0..1). 0 turns it off.
     pub skin: f32,
-    /// 캡처 샤픈 (RAW 단계).
+    /// Capture sharpening (RAW stage).
     pub capture: Capture,
 }
 
 impl Photo {
-    /// 마스크나 피부 보정처럼, 현상할 때 그림을 한 장 더 들고 있어야 하는 것이 있는가.
+    /// Whether anything, such as masks or skin adjustment, needs one more image held while
+    /// developing.
     fn needs_extra_memory(&self) -> bool {
         !self.masks.is_empty() || self.skin > 0.0
     }
 }
 
-/// 배치 전체에 적용되는 설정.
+/// Settings that apply to the whole batch.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
     pub quality: u8,
-    /// 이미 있는 출력 파일도 다시 만든다.
+    /// Recreate output files that already exist.
     pub overwrite: bool,
-    /// 동시에 처리할 장수. 없으면 CPU 코어 수.
+    /// Number of photos processed at once. Defaults to the CPU core count.
     pub jobs: Option<usize>,
-    /// 메모리 한도(GB). 없으면 남은 메모리의 70%.
+    /// Memory limit (GB). Defaults to 70% of free memory.
     pub memory_gb: Option<f64>,
 }
 
@@ -78,42 +81,42 @@ impl Default for Settings {
     }
 }
 
-/// 변환은 됐지만 알려야 할 일이 있는 사진과 그 내용.
+/// Photos that converted but have something to report, and what it is.
 pub type Warnings = Vec<(PathBuf, Text)>;
 
-/// 현상이 끝난 사진: 바로 세운 sRGB 이미지와 출력 파일에 넣을 EXIF.
+/// A developed photo: the upright sRGB image and the EXIF to put in the output file.
 pub struct Rendered {
     pub image: crate::Image,
     pub exif: Vec<u8>,
 }
 
-/// 사진 한 장에 입힐 것들: 보정 값, LUT, 마스크, 프레임.
+/// What to apply to one photo: adjustment values, LUT, masks, frame.
 #[derive(Clone, Copy)]
 pub struct Look<'a> {
-    /// 보정 값 (프리셋 × 강도 + 수동 조정).
+    /// Adjustment values (preset × strength + manual adjustments).
     pub params: &'a Params,
-    /// 보정 뒤에 입힐 LUT과 강도.
+    /// LUT and strength applied after the adjustments.
     pub lut: Option<(&'a Lut, f32)>,
-    /// 맨 마지막에 두를 프레임.
+    /// Frame put around the photo at the very end.
     pub frame: Option<&'a Frame>,
-    /// 부분 보정 마스크.
+    /// Local adjustment masks.
     pub masks: &'a [Mask],
-    /// 마스크가 고르는 영역을 계산할 모델. 마스크가 있는 사진에 필요하다.
+    /// Model that computes the areas masks select. Needed for photos with masks.
     pub segmenter: Option<&'a Mutex<Segmenter>>,
-    /// 이 번호의 마스크가 고른 영역을 붉게 표시한다 (화면에서 영역을 확인할 때 쓴다).
+    /// Tints red the area selected by the mask with this index (used to check the area on screen).
     pub overlay: Option<usize>,
-    /// 피부 보정의 세기 (0~1). 0이면 끈다.
+    /// Skin adjustment strength (0..1). 0 turns it off.
     pub skin: f32,
-    /// 피부를 찾을 모델. 피부 보정을 켠 사진에 필요하다.
+    /// Model that finds skin. Needed for photos with skin adjustment on.
     pub skin_finder: Option<&'a Mutex<SkinFinder>>,
-    /// RAW를 읽을 때 할 캡처 샤픈 (`render`가 쓴다).
+    /// Capture sharpening to apply when reading the RAW (used by `render`).
     pub capture: Capture,
-    /// 캡처 샤픈이 걸리는 곳을 보여 줄지 (미리보기에서).
+    /// Whether to show where capture sharpening applies (in the preview).
     pub capture_view: Option<CaptureView>,
 }
 
 impl<'a> Look<'a> {
-    /// LUT도 마스크도 프레임도 캡처 샤픈도 없이 보정 값만.
+    /// Adjustment values only, with no LUT, masks, frame or capture sharpening.
     pub fn new(params: &'a Params) -> Self {
         Self {
             params,
@@ -130,36 +133,40 @@ impl<'a> Look<'a> {
     }
 }
 
-/// 모델로 구한 영역들. 사진을 현상할 때 함께 넘긴다.
+/// Areas computed by the models. Passed along when developing the photo.
 #[derive(Default)]
 pub struct Areas {
-    /// `Look::masks`의 마스크마다 고른 곳.
+    /// The area selected by each mask in `Look::masks`.
     pub masks: Vec<Low>,
-    /// 피부인 곳 (피부 보정을 켰을 때).
+    /// Where the skin is (when skin adjustment is on).
     pub skin: Option<Low>,
 }
 
-/// 읽어 들인 사진: 보정을 적용하기 전의 카메라 RGB와 현상에 필요한 값들.
-/// 읽기(디모자익, 노이즈 제거)는 오래 걸리고 보정을 바꿀 때마다 되풀이할 필요가 없어서 따로 둔다.
+/// A loaded photo: camera RGB before adjustments, and the values needed to develop it.
+/// Reading (demosaicing, denoising) is slow and needn't be repeated each time adjustments change,
+/// so it is kept separately.
 pub struct Loaded {
-    /// 카메라 RGB (선형, 출력 영역으로 잘린 것). 캡처 샤픈까지 한 것이다.
+    /// Camera RGB (linear, cropped to the output area). Already capture-sharpened.
     pub cam: crate::Image,
-    /// 캡처 샤픈을 섞은 마스크 (0..1, `cam`과 같은 크기). 샤픈 영역 보기에 쓴다. `load`는 비워 둔다.
+    /// Mask used to blend in capture sharpening (0..1, same size as `cam`). Used to show the
+    /// sharpened areas. `load` leaves it empty.
     pub capture_mask: Vec<f32>,
     wb: [f32; 3],
     xyz_to_cam: [[f32; 3]; 3],
     flips: (bool, bool, bool),
     pub exif: Vec<u8>,
-    /// 프레임에 적을 촬영 정보.
+    /// Shooting info to print on the frame.
     shot: Shot,
 }
 
 impl Loaded {
-    /// 보정을 적용해 현상하고 바로 세운다. `cam`에는 `self.cam`이나 그것을 줄인 것을 준다.
-    /// LUT은 보정 뒤에 입히고, 프레임은 바로 세운 다음에 두른다.
-    /// `areas`는 모델로 구한 영역이다 (`areas`로 구한다). 마스크, 피부 보정 순서로 적용한다.
-    // ponytail: 마스크마다 보정을 더한 그림을 따로 현상해 영역만큼 섞는다. 마스크가 겹치는 곳에서는
-    // 뒤의 마스크가 앞의 것을 덮는다. 화소마다 보정 값을 달리 주는 방식보다 단순하고, 마스크 하나에 현상 한 번이 더 든다.
+    /// Develops with the adjustments applied and makes it upright. Pass `self.cam` or a scaled-down
+    /// copy as `cam`. The LUT goes on after the adjustments, and the frame after making it upright.
+    /// `areas` are the areas computed by the models (via `areas`). Masks are applied first, then
+    /// skin adjustment.
+    // ponytail: for each mask, an image with its adjustments added is developed separately and
+    // blended in over its area. Where masks overlap, later masks cover earlier ones. Simpler than
+    // per-pixel adjustment values, at the cost of one extra develop per mask.
     pub fn develop(&self, cam: &crate::Image, look: Look, areas: &Areas) -> crate::Image {
         let upright = |params: &Params| {
             let mut image = develop::develop(cam, self.wb, self.xyz_to_cam, params);
@@ -205,8 +212,8 @@ impl Loaded {
         }
     }
 
-    /// 캡처 샤픈을 섞은 마스크를 `cam`(원본이나 그것을 줄인 것)의 크기로 맞추고 바로 세운 것.
-    /// 마스크가 없으면(`load`로 읽었으면) None.
+    /// The capture sharpening blend mask, resized to `cam` (the original or a scaled-down copy) and
+    /// made upright. None if there is no mask (read with `load`).
     fn capture_area(&self, cam: &crate::Image) -> Option<Vec<f32>> {
         if self.capture_mask.is_empty() {
             return None;
@@ -227,7 +234,8 @@ impl Loaded {
         Some(plane)
     }
 
-    /// 마스크가 고른 곳과 피부를 모델로 구한다. 마스크도 피부 보정도 없으면 모델이 필요 없다.
+    /// Computes mask selections and skin with the models. No model is needed without masks or skin
+    /// adjustment.
     pub fn areas(&self, look: Look) -> Result<Areas> {
         let mut areas = Areas::default();
         if look.masks.is_empty() && look.skin <= 0.0 {
@@ -269,8 +277,8 @@ impl Loaded {
         Ok(areas)
     }
 
-    /// 마스크 모델과 피부 모델에 넣을 그림: 보정 없이 현상해 바로 세운 것 (긴 변 1024 이하).
-    /// 화면과 내보내기가 같은 그림을 써야 같은 영역이 나온다.
+    /// Image fed to the mask and skin models: developed without adjustments and made upright (long
+    /// side at most 1024). Screen and export must use the same image to get the same areas.
     pub fn model_picture(&self) -> crate::preview::Pixels {
         let small = crate::preview::downscale(&self.cam, mask::INPUT);
         let neutral = Params::default();
@@ -283,7 +291,7 @@ impl Loaded {
     }
 }
 
-/// 평면 하나를 다른 크기로 바꾼다 (줄일 때는 덮는 화소들의 평균, 키울 때는 가장 가까운 화소).
+/// Resizes one plane (averaging covered pixels when shrinking, nearest pixel when enlarging).
 fn resize_plane(src: &[f32], w: usize, h: usize, out_w: usize, out_h: usize) -> Vec<f32> {
     let mut out = vec![0f32; out_w * out_h];
     for oy in 0..out_h {
@@ -306,10 +314,10 @@ fn resize_plane(src: &[f32], w: usize, h: usize, out_w: usize, out_h: usize) -> 
     out
 }
 
-/// RAW를 읽어 디모자익(또는 노이즈 제거)까지 한 것과 캡처 샤픈의 재료. 캡처 샤픈 값을 바꿀 때
-/// RAW를 다시 읽지 않도록 따로 둔다.
+/// A RAW read and demosaiced (or denoised), plus the inputs to capture sharpening. Kept separately
+/// so changing the capture sharpening value doesn't re-read the RAW.
 pub struct Read {
-    /// 캡처 샤픈 전의 카메라 RGB (선형, 출력 영역으로 잘린 것).
+    /// Camera RGB before capture sharpening (linear, cropped to the output area).
     plain: crate::Image,
     prepared: capture::Prepared,
     wb: [f32; 3],
@@ -320,7 +328,7 @@ pub struct Read {
 }
 
 impl Read {
-    /// 캡처 샤픈을 해서 현상할 수 있게 한다.
+    /// Applies capture sharpening so the photo can be developed.
     pub fn sharpened(&self, capture: &Capture) -> Loaded {
         let timing = Timing::start();
         let (cam, capture_mask) = capture::sharpen(&self.plain, &self.prepared, capture);
@@ -336,14 +344,14 @@ impl Read {
         }
     }
 
-    /// 사진에서 구한 캡처 샤픈의 반경과 대비 문턱.
+    /// Capture sharpening radius and contrast threshold derived from the photo.
     pub fn auto(&self) -> (f32, f32) {
         (self.prepared.auto_radius, self.prepared.auto_threshold)
     }
 }
 
-/// RAW 한 장을 읽어 디모자익(또는 노이즈 제거)과 캡처 샤픈의 재료까지 만든다.
-/// `denoise`는 모델과 강도(0~1), `progress`에는 진행 정도(0~0.6)를 알린다.
+/// Reads one RAW and demosaics it (or denoises it), preparing the capture sharpening inputs.
+/// `denoise` is the model and strength (0..1); `progress` receives progress (0..0.6).
 pub fn read(
     input: &Path,
     denoise: Option<(&Mutex<Denoiser>, f32)>,
@@ -358,8 +366,9 @@ pub fn read(
             let packed = raw.packed_bayer();
             let (tiles, done) = (denoise::tile_count(&packed) as f32, AtomicUsize::new(0));
             let full = {
-                // GPU는 하나라서 한 번에 한 장씩 처리한다.
-                // ponytail: 먼저 잡은 사진이 끝까지 쓴다. 화면에서 누른 작업을 먼저 처리해야 하면 우선순위 큐로 바꾼다.
+                // There is one GPU, so photos go through it one at a time.
+                // ponytail: whoever grabs it first keeps it until done. If work requested from the
+                // screen must go first, switch to a priority queue.
                 let mut model = model.lock().unwrap();
                 denoise::run(&packed, |tile| {
                     let out = model.infer(tile);
@@ -368,7 +377,7 @@ pub fn read(
                 })?
             };
             let denoised = raw.crop_model_output(&full)?;
-            // 강도가 1이면 일반 디모자익은 필요 없다.
+            // At strength 1, the regular demosaic isn't needed.
             if strength < 1.0 {
                 denoise::mix(raw.demosaic()?, &denoised, strength)
             } else {
@@ -392,7 +401,8 @@ pub fn read(
     })
 }
 
-/// RAW 한 장을 읽고 캡처 샤픈까지 한다 (`read` + `Read::sharpened`). 샤픈 영역 마스크는 비워 둔다.
+/// Reads one RAW and capture-sharpens it (`read` + `Read::sharpened`). Leaves the sharpened-area
+/// mask empty.
 pub fn load(
     input: &Path,
     denoise: Option<(&Mutex<Denoiser>, f32)>,
@@ -404,7 +414,7 @@ pub fn load(
     Ok(loaded)
 }
 
-/// RAW 한 장을 읽어 현상한다. 미리보기와 내보내기가 같은 과정을 쓴다.
+/// Reads and develops one RAW. Preview and export use the same steps.
 pub fn render(
     input: &Path,
     denoise: Option<(&Mutex<Denoiser>, f32)>,
@@ -423,8 +433,8 @@ pub fn render(
     })
 }
 
-/// RAW 한 장을 HEIF로 바꾼다. `progress`에는 진행 정도(0~1)를 알린다.
-/// 알려야 할 일이 있으면(품질을 낮춘 경우) 그 문구를 돌려준다.
+/// Converts one RAW to HEIF. `progress` receives progress (0..1).
+/// Returns a message if there is something to report (when quality was lowered).
 pub fn convert(
     input: &Path,
     output: &Path,
@@ -440,7 +450,7 @@ pub fn convert(
     timing.mark(t("인코딩", "encode"));
     progress(0.98);
 
-    // 임시 파일에 쓰고 이름을 바꾼다. 도중에 꺼져도 반쯤 쓰인 출력 파일이 남지 않는다.
+    // Write to a temp file, then rename. A crash midway leaves no half-written output file.
     let mut tmp = output.as_os_str().to_owned();
     tmp.push(".tmp");
     std::fs::write(&tmp, encoded.bytes)?;
@@ -454,7 +464,7 @@ pub fn convert(
     }))
 }
 
-/// 내보내기의 결과를 로그에 남긴다: 실패한 사진과 이유, 알릴 일, 요약.
+/// Logs the export result: failed photos and why, warnings, and a summary.
 fn record(outcome: &job::Outcome, warnings: &Warnings, seconds: f32) {
     for (file, reason) in &outcome.failed {
         log::error(format_args!("Failed: {}: {reason}", file.display()));
@@ -471,10 +481,11 @@ fn record(outcome: &job::Outcome, warnings: &Warnings, seconds: f32) {
     ));
 }
 
-/// 사진 한 장을 처리하는 데 잡아 둘 메모리(바이트). `size`는 센서의 가로·세로 화소 수.
-/// 프레임을 두르면 그림이 커지는 만큼 더 잡는다. 사진이 가로로 서 있는지 세로로 서 있는지는
-/// 헤더만으로 알 수 없으므로, 둘 중 더 커지는 쪽으로 잡는다.
-/// 마스크나 피부 보정이 있으면(`extra`) 영역과 그림 한 장만큼(화소당 16바이트) 더 잡는다.
+/// Memory to reserve for processing one photo (bytes). `size` is the sensor width and height in
+/// pixels. A frame adds as much as it enlarges the image. Whether the photo is landscape or
+/// portrait can't be told from the header alone, so the larger of the two is reserved.
+/// With masks or skin adjustment (`extra`), reserves an area and one more image on top (16 bytes
+/// per pixel).
 pub fn memory_needed((width, height): (usize, usize), frame: Option<&Frame>, extra: bool) -> u64 {
     let growth = frame.map_or(1.0, |frame| {
         frame.growth(width, height).max(frame.growth(height, width))
@@ -483,12 +494,13 @@ pub fn memory_needed((width, height): (usize, usize), frame: Option<&Frame>, ext
     ((width * height) as f64 * BYTES_PER_PIXEL as f64 * growth * extra) as u64
 }
 
-/// 논리 코어 수.
+/// Number of logical cores.
 pub fn cores() -> usize {
     std::thread::available_parallelism().map_or(1, |n| n.get())
 }
 
-/// 단계별 소요 시간. 환경변수 `AMSIL_TIMING`이 있을 때만 출력한다 (성능을 조정할 때 쓴다).
+/// Time per stage. Printed only when the `AMSIL_TIMING` environment variable is set (for
+/// performance tuning).
 struct Timing(Option<std::cell::Cell<Instant>>);
 
 impl Timing {
@@ -507,7 +519,7 @@ impl Timing {
     }
 }
 
-/// 노이즈 제거 모델을 읽는다. 모델 파일이 없으면 받는 방법을 알려 준다.
+/// Loads the denoise model. If the model file is missing, explains how to download it.
 pub fn load_denoiser() -> Result<Denoiser> {
     let path = gpu::model_dir().join(gpu::DENOISE_MODEL);
     if !path.exists() {
@@ -525,12 +537,13 @@ pub fn load_denoiser() -> Result<Denoiser> {
     Denoiser::load(&path)
 }
 
-/// GPU를 쓰지 못해 CPU로 돌고 있으면, 느리다는 것과 해결 방법을 알리는 문구.
+/// If running on the CPU because the GPU is unavailable, a message saying it is slow and how to
+/// fix it.
 pub fn cpu_notice(denoiser: &Denoiser) -> Option<Text> {
     let gpu::Backend::Cpu { reason } = &denoiser.backend else {
         return None;
     };
-    // 2,400만 화소 사진 한 장이 48타일이다.
+    // One 24-megapixel photo is 48 tiles.
     let seconds = denoiser.tile_seconds * 48.0;
     Some(text!(
         format!(
@@ -548,26 +561,26 @@ pub fn cpu_notice(denoiser: &Denoiser) -> Option<Text> {
     ))
 }
 
-/// 배치가 도는 동안 주기적으로 알리는 내용.
+/// What is reported periodically while the batch runs.
 #[derive(Debug, Clone, Copy)]
 pub struct Report {
     pub status: job::Status,
-    /// 남은 시간(초). 아직 모르면 None.
+    /// Time left (seconds). None if not known yet.
     pub remaining: Option<f64>,
-    /// 마지막 진행 이후 흐른 시간(초).
+    /// Time since the last progress (seconds).
     pub idle: f64,
-    /// 이 프로그램의 CPU 사용률 (전체 코어 대비 %).
+    /// This program's CPU usage (% of all cores).
     pub cpu: f32,
-    /// 이 프로그램이 쓰는 메모리와 한도 (바이트).
+    /// Memory this program uses, and the limit (bytes).
     pub memory: u64,
     pub memory_limit: u64,
-    /// AI 모델이 실제로 돌고 있던 시간의 비율 (%).
+    /// Share of time the AI model was actually running (%).
     pub gpu: f32,
-    /// 시스템 메모리가 부족해 동시 처리 수를 줄인 상태.
+    /// System memory is low, so fewer photos run at once.
     pub low_memory: bool,
 }
 
-/// 자원 사용량을 재고, 시스템 메모리가 부족해지면 새 작업의 시작을 늦춘다.
+/// Measures resource usage and delays new jobs when system memory runs low.
 struct Monitor {
     system: sysinfo::System,
     pid: sysinfo::Pid,
@@ -575,7 +588,7 @@ struct Monitor {
     memory_limit: u64,
     started: Instant,
     eta: job::Eta,
-    /// 마지막으로 잰 시각과 그때의 GPU 누적 사용 시간.
+    /// Time of the last measurement and the cumulative GPU time at that point.
     measured: (Instant, u64),
     cpu: f32,
     memory: u64,
@@ -606,7 +619,7 @@ impl Monitor {
         let seconds = now.duration_since(self.started).as_secs_f64();
         self.eta.record(seconds, status.progress);
 
-        // 자원은 1초에 한 번만 잰다.
+        // Measure resources at most once a second.
         let since = now.duration_since(self.measured.0).as_secs_f32();
         if since >= 1.0 {
             use sysinfo::{ProcessRefreshKind, ProcessesToUpdate};
@@ -625,7 +638,7 @@ impl Monitor {
             self.gpu = ((busy - self.measured.1) as f32 / 1e9 / since * 100.0).min(100.0);
             self.measured = (now, busy);
 
-            // 시스템 전체의 여유 메모리가 10% 아래로 떨어지면 새 작업을 한 번에 하나만 시작한다.
+            // When system-wide free memory drops below 10%, start new jobs one at a time.
             self.low_memory = self.system.available_memory() < self.system.total_memory() / 10;
             budget.set_low_memory(self.low_memory);
         }
@@ -642,9 +655,10 @@ impl Monitor {
     }
 }
 
-/// 동시에 처리할 장수와 인코더 한 개가 쓸 스레드 수를 정한다.
+/// Decides how many photos to process at once and how many threads each encoder uses.
 ///
-/// 메모리가 허락하는 장수만큼만 동시에 돌리고, 남는 코어는 인코더 스레드로 돌린다.
+/// Runs only as many photos at once as memory allows, and gives the spare cores to encoder
+/// threads.
 fn plan(
     cores: usize,
     jobs: Option<usize>,
@@ -657,7 +671,7 @@ fn plan(
     (workers, (cores / workers).max(1))
 }
 
-/// 사진들을 변환한다. 진행 상황은 `report`로 알리고, 결과와 함께 경고를 돌려준다.
+/// Converts the photos. Reports progress through `report` and returns warnings with the result.
 pub fn run(
     photos: &[Photo],
     settings: &Settings,
@@ -688,7 +702,7 @@ pub fn run(
         .iter()
         .map(|photo| (photo.output.as_path(), photo))
         .collect();
-    // LUT 파일은 한 번씩만 읽는다. 읽지 못한 것은 그 LUT을 쓰는 사진만 실패시킨다.
+    // Each LUT file is read only once. One that fails to load fails only the photos that use it.
     let luts: HashMap<&Path, std::result::Result<Lut, Text>> = photos
         .iter()
         .filter_map(|photo| photo.lut.as_ref())
@@ -701,8 +715,9 @@ pub fn run(
         Some(gb) => (gb * GB) as u64,
         None => system.available_memory() / 10 * 7,
     };
-    // ponytail: 첫 사진의 크기로 전체를 가늠한다. 크기가 제각각인 폴더에서는 어긋날 수 있지만
-    // 실제 입장 제한은 사진마다 따로 계산하므로 안전에는 영향이 없다.
+    // ponytail: the first photo's size is used to size up the whole batch. This can be off in
+    // folders with mixed sizes, but actual admission is computed per photo, so safety is
+    // unaffected.
     let per_photo =
         raw::sensor_size(&tasks[0].input).map_or(24_000_000 * BYTES_PER_PIXEL, |size| {
             memory_needed(
@@ -734,7 +749,7 @@ pub fn run(
             ))
         },
         available: &|| {
-            let mut system = sysinfo::System::new().expect("시스템 정보를 읽을 수 없습니다");
+            let mut system = sysinfo::System::new().expect("cannot read system information");
             system.refresh_memory();
             system.available_memory()
         },
@@ -785,16 +800,17 @@ mod tests {
     use crate::sample_arw;
     use libheif_rs::HeifContext;
 
-    /// LUT도 마스크도 프레임도 없이 보정 값만.
+    /// Adjustment values only, with no LUT, masks or frame.
     fn bare(params: &Params) -> Look<'_> {
         Look::new(params)
     }
 
-    /// 초록 평면의 라플라시안 절댓값 평균을, 64×64 구역 가운데 대비가 큰 15%(세부)와 작은 25%(평평한 곳)에서 구한다.
+    /// Mean absolute Laplacian of the green plane, over the 64×64 tiles with the highest 15%
+    /// contrast (detail) and the lowest 25% (flat areas).
     fn detail_and_flat(image: &crate::Image) -> (f64, f64) {
         let (w, h) = (image.width, image.height);
         let g = &image.planes[1];
-        let mut tiles: Vec<(f64, f64)> = Vec::new(); // (대비, 라플라시안 평균)
+        let mut tiles: Vec<(f64, f64)> = Vec::new(); // (contrast, mean Laplacian)
         for ty in (64..h - 128).step_by(64) {
             for tx in (64..w - 128).step_by(64) {
                 let (mut lap, mut grad) = (0f64, 0f64);
@@ -819,13 +835,14 @@ mod tests {
         (mean(&tiles[n - n * 15 / 100..]), mean(&tiles[..n / 4]))
     }
 
-    /// 디모자익 비교용 그림을 만든다 (`scripts/sharpness/demosaic.py`가 읽는다).
+    /// Renders images for demosaic comparison (read by `scripts/sharpness/demosaic.py`).
     /// `cargo test --release -- --ignored render_for_demosaic_comparison`
     ///
-    /// 샘플마다 RCD(지금 쓰는 것), rawler의 PPG(예전에 쓰던 것), AI 노이즈 제거 모델(레벨 1, 모델이 있을 때)로
-    /// 색을 복원해, 캡처 샤픈 없이 보정 없이 현상한 2048×2048 영역을 `demosaic/`에 쓴다.
+    /// For each sample, reconstructs color with RCD (current), rawler's PPG (former) and the AI
+    /// denoise model (level 1, when present), and writes a 2048×2048 crop developed without capture
+    /// sharpening or adjustments to `demosaic/`.
     #[test]
-    #[ignore = "샘플 사진이 필요하다"]
+    #[ignore = "needs sample photos"]
     fn render_for_demosaic_comparison() {
         use crate::raw16::{PHOTOS, SIDE};
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -860,13 +877,14 @@ mod tests {
         }
     }
 
-    /// 선예도 측정용 그림을 만든다 (`scripts/sharpness/measure.py`가 읽는다).
+    /// Renders images for sharpness measurement (read by `scripts/sharpness/measure.py`).
     /// `cargo test --release -- --ignored render_for_sharpness_measurement`
     ///
-    /// 샘플 6장을 캡처 샤픈 조건마다 보정 없이 현상해, 세부가 많은 2048×2048 영역을 16비트로 쓴다
-    /// (압축 전 `-pre`, 품질 55로 압축했다 푼 `-post`). 장마다 압축한 크기와 걸린 시간은 `results.tsv`.
+    /// Develops 6 samples without adjustments for each capture sharpening condition and writes a
+    /// detailed 2048×2048 crop as 16-bit (`-pre` before compression, `-post` after compressing at
+    /// quality 55 and decoding). Compressed size and time per photo go to `results.tsv`.
     #[test]
-    #[ignore = "샘플 사진이 필요하고 몇 분 걸린다"]
+    #[ignore = "needs sample photos and takes a few minutes"]
     fn render_for_sharpness_measurement() {
         use crate::raw16::{PHOTOS, SIDE};
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -876,7 +894,7 @@ mod tests {
             threshold: Some(threshold),
             ..base
         };
-        // (이름, 캡처 샤픈, 그 위에 더하는 창작 샤픈)
+        // (name, capture sharpening, creative sharpening added on top)
         let conditions = [
             ("off", Capture::off(), 0.0),
             (
@@ -975,13 +993,13 @@ mod tests {
             develop(Some(CaptureView::Map)),
         );
         assert_eq!((map.width, map.height), (plain.width, plain.height));
-        // 흑백 지도는 회색이다.
+        // A monochrome map is gray.
         let brightest = (0..map.planes[0].len())
             .max_by(|&a, &b| map.planes[0][a].total_cmp(&map.planes[0][b]))
             .unwrap();
         assert!(map.planes[0][brightest] > 0.5);
         assert_eq!(map.planes[0][brightest], map.planes[2][brightest]);
-        // 흰 곳은 빨간 표시에서 붉어지고, 검은 곳은 그대로다.
+        // White areas turn red in the red overlay; black areas stay as they are.
         let redness = |image: &crate::Image, i: usize| image.planes[0][i] - image.planes[2][i];
         assert!(redness(&red, brightest) > redness(&plain, brightest) + 0.05);
         let darkest = (0..map.planes[0].len())
@@ -989,7 +1007,7 @@ mod tests {
             .unwrap();
         assert!(map.planes[0][darkest] < 0.01);
         assert!((red.planes[0][darkest] - plain.planes[0][darkest]).abs() < 0.01);
-        // 작은 그림으로 현상해도 같은 모양으로 맞춰진다.
+        // Developing at a small size still fits the same shape.
         let small = crate::preview::downscale(&loaded.cam, 1200).unwrap();
         let look = Look {
             capture_view: Some(CaptureView::Map),
@@ -1007,32 +1025,31 @@ mod tests {
         let on = read.sharpened(&Capture::default());
         let (detail_off, flat_off) = detail_and_flat(&off.cam);
         let (detail_on, flat_on) = detail_and_flat(&on.cam);
-        eprintln!("세부 {detail_off:.5} → {detail_on:.5}, 평평한 곳 {flat_off:.5} → {flat_on:.5}");
-        // 기본값(문턱 0.4)은 뚜렷한 경계만 샤픈한다. 이 사진(f/2.8, 대부분 초점 밖)에서는 세부가 조금 는다.
+        eprintln!("detail {detail_off:.5} → {detail_on:.5}, flat {flat_off:.5} → {flat_on:.5}");
+        // The default (threshold 0.4) sharpens only clear edges. On this photo (f/2.8, mostly out
+        // of focus), detail rises a little.
         assert!(
             detail_on > detail_off * 1.03,
-            "세부 {detail_on} {detail_off}"
+            "detail {detail_on} {detail_off}"
         );
-        assert!(flat_on < flat_off * 1.02, "평평한 곳 {flat_on} {flat_off}");
-        // 문턱을 사진에서 구하면(RawTherapee의 자동) 더 넓게, 더 세게 샤픈한다.
+        assert!(flat_on < flat_off * 1.02, "flat {flat_on} {flat_off}");
+        // With the threshold derived from the photo (RawTherapee's auto), it sharpens wider and
+        // harder.
         let auto = read.sharpened(&Capture {
             threshold: None,
             ..Capture::default()
         });
         let (detail_auto, flat_auto) = detail_and_flat(&auto.cam);
-        eprintln!("자동 문턱: 세부 {detail_auto:.5}, 평평한 곳 {flat_auto:.5}");
+        eprintln!("auto threshold: detail {detail_auto:.5}, flat {flat_auto:.5}");
         assert!(
             detail_auto > detail_on * 1.2,
-            "자동 {detail_auto} 기본 {detail_on}"
+            "auto {detail_auto} default {detail_on}"
         );
-        assert!(
-            flat_auto < flat_off * 1.05,
-            "평평한 곳 {flat_auto} {flat_off}"
-        );
+        assert!(flat_auto < flat_off * 1.05, "flat {flat_auto} {flat_off}");
         let (radius, threshold) = read.auto();
-        eprintln!("자동 반경 {radius}, 자동 문턱 {threshold}");
+        eprintln!("auto radius {radius}, auto threshold {threshold}");
         assert!((0.4..=2.0).contains(&radius) && threshold >= 0.0);
-        // 마스크는 샤픈할 때만 있고, load는 비워 둔다.
+        // The mask exists only when sharpening; load leaves it empty.
         assert_eq!(on.capture_mask.len(), on.cam.width * on.cam.height);
         assert!(
             load(&path, None, &Capture::default(), &|_| {})
@@ -1062,16 +1079,16 @@ mod tests {
 
         let ctx = HeifContext::read_from_file(output.to_str().unwrap()).unwrap();
         let handle = ctx.primary_image_handle().unwrap();
-        // 6048×4032로 찍힌 세로 사진이 바로 서서 나온다.
+        // A portrait photo shot as 6048×4032 comes out upright.
         assert_eq!((handle.width(), handle.height()), (4032, 6048));
         assert_eq!(handle.luma_bits_per_pixel(), 10);
         assert_eq!(handle.number_of_metadata_blocks(b"Exif"), 1);
-        // 임시 파일이 남지 않는다.
+        // No temp file is left behind.
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// 출력 파일을 읽어 채널별 평균(0..255)과 크기를 돌려준다.
+    /// Reads the output file and returns its per-channel means (0..255) and size.
     fn stats(path: &Path) -> ((u32, u32), [f64; 3]) {
         use libheif_rs::{ColorSpace, LibHeif, RgbChroma};
         let ctx = HeifContext::read_from_file(path.to_str().unwrap()).unwrap();
@@ -1128,10 +1145,10 @@ mod tests {
         for c in 0..3 {
             assert!(
                 (mean_a[c] - mean_b[c]).abs() < 0.02 * mean_a[c],
-                "채널 {c}: {mean_a:?} 대 {mean_b:?}"
+                "channel {c}: {mean_a:?} vs {mean_b:?}"
             );
         }
-        // 실제로 모델을 거쳤다면 결과가 완전히 같을 수는 없다.
+        // If it really went through the model, the result can't be exactly the same.
         assert_ne!(
             std::fs::read(&plain).unwrap(),
             std::fs::read(&denoised).unwrap()
@@ -1146,31 +1163,31 @@ mod tests {
         assert_eq!(
             plan(32, None, 40 * GIB, photo, 309),
             (32, 1),
-            "메모리가 넉넉하면 코어 수만큼"
+            "with plenty of memory, as many as cores"
         );
         assert_eq!(
             plan(32, None, 4 * GIB, photo, 309),
             (3, 10),
-            "메모리가 3장분이면 3장, 인코더는 10스레드씩"
+            "memory for 3 photos means 3, with 10 encoder threads each"
         );
         assert_eq!(
             plan(32, Some(4), 40 * GIB, photo, 309),
             (4, 8),
-            "--jobs로 줄인 경우"
+            "reduced with --jobs"
         );
         assert_eq!(
             plan(8, None, GIB, photo, 309),
             (1, 8),
-            "한 장분도 안 되면 한 장씩"
+            "one at a time if memory is short of even one photo"
         );
         assert_eq!(
             plan(32, None, 40 * GIB, photo, 2),
             (2, 16),
-            "사진이 두 장뿐이면 코어를 둘이 나눠 쓴다"
+            "with only two photos, they split the cores"
         );
     }
 
-    /// 출력 이미지의 채널별 평균.
+    /// Per-channel means of the output image.
     fn means(image: &crate::Image) -> [f32; 3] {
         [0, 1, 2].map(|c| image.planes[c].iter().sum::<f32>() / image.planes[c].len() as f32)
     }
@@ -1182,7 +1199,7 @@ mod tests {
             "LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n",
         )
         .unwrap();
-        // 빨강을 없애는 LUT
+        // LUT that removes red
         let no_red = crate::lut::Lut::parse(
             "LUT_3D_SIZE 2\n0 0 0\n0 0 0\n0 1 0\n0 1 0\n0 0 1\n0 0 1\n0 1 1\n0 1 1\n",
         )
@@ -1201,7 +1218,7 @@ mod tests {
         ));
         assert!(
             (0..3).all(|c| (same[c] - plain[c]).abs() < 1e-3),
-            "{same:?} 대 {plain:?}"
+            "{same:?} vs {plain:?}"
         );
 
         let full = means(&loaded.develop(
@@ -1297,7 +1314,7 @@ mod tests {
             },
             &Areas::default(),
         );
-        // 세로로 찍은 사진이다. 바로 세운 다음 그 아래에 띠가 붙어야 한다.
+        // A portrait photo. The strip must be attached below after making it upright.
         assert!(plain.height > plain.width);
         assert_eq!(
             (framed.width, framed.height),
@@ -1308,11 +1325,15 @@ mod tests {
             framed.planes[0][..plain.width],
             plain.planes[0][..plain.width]
         );
-        assert_eq!(framed.planes[0].last(), Some(&1.0), "맨 아래는 흰 띠");
+        assert_eq!(
+            framed.planes[0].last(),
+            Some(&1.0),
+            "the bottom is the white strip"
+        );
         let band = &framed.planes[0][plain.width * plain.height..];
         assert!(
             band.iter().any(|&v| v < 0.5),
-            "띠에 촬영 정보가 적혀 있어야 한다"
+            "the strip should carry the shooting info"
         );
     }
 
@@ -1337,7 +1358,7 @@ mod tests {
         convert(&input, &output, 55, 8, None, look, &|_| {}).unwrap();
         let ((width, height), _) = stats(&output);
         std::fs::remove_dir_all(&dir).unwrap();
-        // 4032×6048 사진 아래에 짧은 변의 10%(404)짜리 띠
+        // A strip 10% of the short side (404) below a 4032×6048 photo
         assert_eq!((width, height), (4032, 6048 + 404));
     }
 
@@ -1352,8 +1373,8 @@ mod tests {
         };
         let band = memory_needed((6080, 4048), Some(&frame(Layout::Band)), false);
         assert!((band as f64 / plain as f64 - 1.1).abs() < 0.01, "{band}");
-        // 가로 사진을 세로 9:16에 넣으면 세 배 가까이 커진다. 사진이 어느 쪽으로 서 있는지는
-        // 헤더만으로 알 수 없으므로 더 커지는 쪽으로 잡는다.
+        // Putting a landscape photo in a portrait 9:16 frame nearly triples its size. Orientation
+        // can't be told from the header alone, so the larger case is reserved.
         let tall = memory_needed((6080, 4048), Some(&frame(Layout::Ratio(9, 16))), false);
         assert!(tall as f64 / plain as f64 > 2.9, "{tall}");
         assert_eq!(
@@ -1362,7 +1383,7 @@ mod tests {
         );
     }
 
-    /// 왼쪽 절반을 고른 저해상도 마스크.
+    /// Low-resolution mask selecting the left half.
     fn left_half() -> crate::mask::Low {
         crate::mask::Low {
             width: 4,
@@ -1371,7 +1392,7 @@ mod tests {
         }
     }
 
-    /// 그림의 가로 `from..to`(0~1) 구간의 채널별 평균.
+    /// Per-channel means over the horizontal span `from..to` (0..1) of the image.
     fn strip_means(image: &crate::Image, from: f32, to: f32) -> [f32; 3] {
         let (x0, x1) = (
             (from * image.width as f32) as usize,
@@ -1394,7 +1415,8 @@ mod tests {
         let small = crate::preview::downscale(&loaded.cam, 400).unwrap();
         let params = Params::default();
         let plain = loaded.develop(&small, bare(&params), &Areas::default());
-        // 어둡게 하는 보정으로 본다. 밝게 하면 이미 밝은 하늘은 더 밝아질 여유가 없다.
+        // Test with a darkening adjustment. When brightening, an already bright sky has no room to
+        // get brighter.
         let darker = Mask {
             adjust: Params {
                 exposure: -1.0,
@@ -1422,16 +1444,16 @@ mod tests {
         };
         assert!(
             change(&left, &masked) < 0.8,
-            "고른 쪽은 어두워진다: {}",
+            "the selected side gets darker: {}",
             change(&left, &masked)
         );
         assert!(
             (change(&right, &masked) - 1.0).abs() < 0.01,
-            "나머지는 그대로: {}",
+            "the rest is unchanged: {}",
             change(&right, &masked)
         );
 
-        // 뒤집으면 반대쪽이 어두워진다.
+        // Inverted, the other side gets darker.
         let masks = [Mask {
             invert: true,
             ..darker
@@ -1482,7 +1504,7 @@ mod tests {
         let (before, after) = (strip_means(&plain, 0.7, 1.0), strip_means(&shown, 0.7, 1.0));
         assert!(
             (0..3).all(|c| (before[c] - after[c]).abs() < 1e-3),
-            "고르지 않은 쪽은 그대로: {before:?} → {after:?}"
+            "the unselected side is unchanged: {before:?} → {after:?}"
         );
     }
 
@@ -1540,18 +1562,18 @@ mod tests {
     #[test]
     fn masks_raise_the_memory_estimate() {
         let plain = memory_needed((6080, 4048), None, false);
-        // 마스크 영역과, 보정을 달리한 그림 한 장이 더 필요하다.
+        // Needs a mask area plus one more image with different adjustments.
         assert_eq!(memory_needed((6080, 4048), None, true), plain / 4 * 5);
     }
 
     #[test]
     fn a_real_click_brightens_the_building_and_leaves_the_sky() {
         use crate::mask::{Mask, Point};
-        // 마스크 모델과 샘플 사진이 있을 때만 돈다.
+        // Runs only when the mask model and sample photo are present.
         let photo =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("DCIM/10361110/DSC04551.ARW");
         let Ok(segmenter) = crate::mask::load_segmenter() else {
-            eprintln!("마스크 모델이 없어 건너뜀");
+            eprintln!("skipped: no mask model");
             return;
         };
         if !photo.exists() {
@@ -1586,14 +1608,14 @@ mod tests {
             loaded.develop(&small, bare(&params), &Areas::default()),
             loaded.develop(&small, look, &areas),
         );
-        // 원본 크기에서 마스크가 얼마나 더 걸리는지 (성능을 가늠하는 용도)
+        // How much longer a mask takes at full size (to gauge performance)
         let started = Instant::now();
         loaded.develop(&loaded.cam, bare(&params), &Areas::default());
         let without = started.elapsed();
         let started = Instant::now();
         loaded.develop(&loaded.cam, look, &areas);
         eprintln!(
-            "영역 구하기 {selected:.2?}, 원본 크기 현상: 마스크 없이 {without:.2?}, 마스크 하나 {:.2?}",
+            "areas {selected:.2?}, full-size develop: no mask {without:.2?}, one mask {:.2?}",
             started.elapsed()
         );
         let at = |image: &crate::Image, x: f32, y: f32| {
@@ -1602,11 +1624,11 @@ mod tests {
         };
         assert!(
             at(&masked, 0.48, 0.35) > at(&plain, 0.48, 0.35) * 1.2,
-            "건물은 밝아진다"
+            "the building gets brighter"
         );
         assert!(
             (at(&masked, 0.1, 0.1) - at(&plain, 0.1, 0.1)).abs() < 0.01,
-            "하늘은 그대로"
+            "the sky is unchanged"
         );
     }
 
@@ -1626,7 +1648,7 @@ mod tests {
             skin: Some(left_half()),
         };
         let retouched = loaded.develop(&small, look, &areas);
-        // 그림의 가로 구간에서 화소마다 얼마나 달라졌는지의 평균
+        // Mean per-pixel change over a horizontal span of the image
         let moved = |from: f32, to: f32| {
             let (x0, x1) = (
                 (from * plain.width as f32) as usize,
@@ -1643,25 +1665,25 @@ mod tests {
         };
         assert!(
             moved(0.0, 0.3) > 1e-4,
-            "피부 쪽은 달라진다: {}",
+            "the skin side changes: {}",
             moved(0.0, 0.3)
         );
         assert!(
             moved(0.7, 1.0) < 1e-6,
-            "나머지는 그대로: {}",
+            "the rest is unchanged: {}",
             moved(0.7, 1.0)
         );
-        // 세기가 0이면 영역이 있어도 쓰지 않는다.
+        // At strength 0, the area is unused even if present.
         let untouched = loaded.develop(&small, bare(&params), &areas);
         assert_eq!(untouched.planes, plain.planes);
     }
 
     #[test]
     fn skin_is_looked_for_only_when_the_retouch_is_on() {
-        // 피부를 찾는 모델과 샘플 사진이 있을 때만 돈다.
+        // Runs only when the skin model and sample photo are present.
         let Some(input) = sample_arw() else { return };
         let Ok(finder) = crate::skin::load_finder() else {
-            eprintln!("피부를 찾는 모델이 없어 건너뜀");
+            eprintln!("skipped: no skin model");
             return;
         };
         let finder = Mutex::new(finder);
@@ -1674,7 +1696,7 @@ mod tests {
         assert!(loaded.areas(off).unwrap().skin.is_none());
         let on = Look { skin: 0.5, ..off };
         assert!(loaded.areas(on).unwrap().skin.is_some());
-        // 모델 없이 켜면 그 이유를 알린다.
+        // Turned on without the model, it reports why.
         let missing = Look {
             skin: 0.5,
             ..bare(&params)

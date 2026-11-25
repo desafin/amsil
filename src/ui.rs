@@ -1,4 +1,5 @@
-//! 화면 그리기. 상태(`App`)를 읽어 그리고, 사용자가 한 일을 `Action`으로 돌려준다. 로직은 여기에 두지 않는다.
+//! Drawing the screen. Reads the state (`App`), draws it, and returns what the user did as an
+//! `Action`. No logic lives here.
 
 use crate::app::{Action, App, Backend, ExportState, Open, ReportView};
 use crate::capture::CaptureView;
@@ -13,53 +14,55 @@ use eframe::egui::{self, Align, Key, Layout, Panel, RichText, TextureHandle, Tex
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-/// 화면이 바깥 세계에 부탁하는 일. 테스트에서는 가짜로 바꿔 끼운다.
+/// Things the screen asks of the outside world. Swapped for a fake in tests.
 pub trait Env {
-    /// 새 프로젝트 파일을 저장할 위치를 묻는다.
+    /// Asks where to save a new project file.
     fn new_project_path(&mut self) -> Option<PathBuf>;
-    /// 열 프로젝트 파일을 묻는다.
+    /// Asks for a project file to open.
     fn open_project_path(&mut self) -> Option<PathBuf>;
-    /// 폴더를 묻는다.
+    /// Asks for a folder.
     fn pick_folder(&mut self) -> Option<PathBuf>;
-    /// LUT(.cube) 파일을 묻는다.
+    /// Asks for a LUT (.cube) file.
     fn pick_lut(&mut self) -> Option<PathBuf>;
-    /// 지금 창을 갈무리한다. 결과는 나중에 `Action::SaveScreenshot`으로 도착한다.
+    /// Captures the current window. The result arrives later as `Action::SaveScreenshot`.
     fn screenshot(&mut self, ctx: &egui::Context);
-    /// 로그 파일을 연다. 화면에 알릴 말(파일의 위치, 또는 열지 못한 까닭)을 돌려준다.
+    /// Opens the log file. Returns a message for the screen (the file's location, or why it could
+    /// not be opened).
     fn open_log(&mut self) -> String;
 }
 
-/// 화면 쪽에서만 쓰는 상태: GPU에 올린 그림과 창의 열림 여부.
+/// State used only by the screen: images uploaded to the GPU and which windows are open.
 #[derive(Default)]
 pub struct View {
-    /// 텍스처가 어느 프로젝트의 것인지. 프로젝트가 바뀌면 버린다.
+    /// Which project the textures belong to. Dropped when the project changes.
     project: Option<PathBuf>,
     thumbnails: HashMap<usize, TextureHandle>,
-    /// (요청 번호, 텍스처)
+    /// (request number, texture)
     preview: Option<(u64, TextureHandle)>,
-    /// 전후 비교의 보정 전 그림. (번호, 텍스처)
+    /// The unedited image for the before/after comparison. (number, texture)
     original: Option<(u64, TextureHandle)>,
     show_backend_help: bool,
-    /// "AI 기능과 출처" 창이 열려 있는가.
+    /// Whether the "AI features and sources" window is open.
     show_ai_info: bool,
-    /// 끌고 있는 동안의 품질 슬라이더 값.
+    /// The quality slider value while it is being dragged.
     quality: Option<u8>,
-    /// 마지막으로 설정한 창 제목.
+    /// The window title set last.
     title: String,
-    /// 미리보기의 확대 상태와, 그것이 어느 사진의 것인지.
+    /// The preview's zoom state, and which photo it belongs to.
     zoom: Zoom,
     zoomed_photo: Option<usize>,
 }
 
-/// 전후 비교에서 두 칸 사이의 틈 (화면 단위).
+/// Gap between the two panes in the before/after comparison (screen units).
 const PANE_GAP: f32 = 4.0;
-/// 원본 화소 하나를 화면 몇 점까지 키울 수 있는지 (4 = 400%).
+/// How many screen points one source pixel may be enlarged to (4 = 400%).
 const MAX_ZOOM: f32 = 4.0;
-/// 휠 한 칸에 얼마나 확대할지 정하는 값.
+/// How much one wheel notch zooms.
 const WHEEL_ZOOM: f32 = 0.005;
 
-/// 한글 글꼴(나눔고딕)을 등록한다. egui 내장 글꼴에는 한글이 없어서, 시스템에 한글 글꼴이 없는
-/// 컴퓨터에서는 글자가 네모로 나온다. 글꼴을 프로그램에 넣어 어디서나 같은 화면이 나오게 한다.
+/// Registers a Korean font (NanumGothic). egui's built-in fonts have no Hangul, so on a computer
+/// without a Korean system font the text shows up as boxes. Bundling the font makes the screen look
+/// the same everywhere.
 pub fn install_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
@@ -76,7 +79,7 @@ pub fn install_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-/// 한 프레임을 그리고, 이번 프레임에 사용자가 한 일을 돌려준다.
+/// Draws one frame and returns what the user did during it.
 pub fn draw(ui: &mut egui::Ui, app: &App, view: &mut View, env: &mut dyn Env) -> Vec<Action> {
     apply_theme(ui.ctx(), app.config.theme);
     let mut actions = Vec::new();
@@ -85,7 +88,8 @@ pub fn draw(ui: &mut egui::Ui, app: &App, view: &mut View, env: &mut dyn Env) ->
     }
     match &app.open {
         None => {
-            // 프로젝트에 딸린 것(텍스처, 확대 상태)은 버리고, 열어 둔 창은 그대로 둔다.
+            // Drop what belongs to the project (textures, zoom state), but keep open windows as
+            // they are.
             *view = View {
                 show_ai_info: view.show_ai_info,
                 ..View::default()
@@ -109,12 +113,13 @@ pub fn draw(ui: &mut egui::Ui, app: &App, view: &mut View, env: &mut dyn Env) ->
     actions
 }
 
-/// 프로그램 이름.
+/// Program name.
 fn app_name() -> &'static str {
     t("암실", "Amsil")
 }
 
-/// 놓는 차례를 화면에 보일 차례로 맞춘다. 오른쪽부터 채우는 자리에서는 뒤의 것이 왼쪽에 오므로 뒤집는다.
+/// Matches placement order to on-screen order. Where a layout fills from the right, later items end
+/// up on the left, so reverse them.
 fn in_reading_order<T, const N: usize>(ui: &egui::Ui, mut items: [T; N]) -> [T; N] {
     if ui.layout().main_dir() == egui::Direction::RightToLeft {
         items.reverse();
@@ -122,7 +127,8 @@ fn in_reading_order<T, const N: usize>(ui: &egui::Ui, mut items: [T; N]) -> [T; 
     items
 }
 
-/// 언어를 고르는 단추. 지금 언어를 못 읽는 사람도 찾을 수 있게, 각 언어의 이름은 그 언어로 적는다.
+/// Buttons for choosing the language. Each language's name is written in that language, so people
+/// who cannot read the current one can still find theirs.
 fn language_buttons(ui: &mut egui::Ui, actions: &mut Vec<Action>) {
     for (choice, name) in in_reading_order(ui, [(Lang::Ko, "한국어"), (Lang::En, "English")]) {
         let chosen = lang::current() == choice;
@@ -132,7 +138,8 @@ fn language_buttons(ui: &mut egui::Ui, actions: &mut Vec<Action>) {
     }
 }
 
-/// 고른 밝기 모드를 화면에 적용한다. 고른 적이 없으면 시스템의 설정을 따른다.
+/// Applies the chosen brightness mode to the screen. If none was chosen, follows the system
+/// setting.
 fn apply_theme(ctx: &egui::Context, theme: Option<Theme>) {
     let wanted = match theme {
         Some(Theme::Light) => egui::ThemePreference::Light,
@@ -144,7 +151,7 @@ fn apply_theme(ctx: &egui::Context, theme: Option<Theme>) {
     }
 }
 
-/// 라이트 모드와 다크 모드를 고르는 단추. 지금 화면에 적용된 쪽이 눌려 보인다.
+/// Buttons for choosing light or dark mode. The one currently applied looks pressed.
 fn theme_buttons(ui: &mut egui::Ui, actions: &mut Vec<Action>) {
     let choices = [
         (Theme::Light, egui::Theme::Light, t("라이트", "Light")),
@@ -158,7 +165,7 @@ fn theme_buttons(ui: &mut egui::Ui, actions: &mut Vec<Action>) {
     }
 }
 
-/// AI 기능이 쓰는 모델의 출처를 보여 주는 창을 여는 단추.
+/// Button that opens the window showing where the AI features' models come from.
 fn ai_info_button(ui: &mut egui::Ui, view: &mut View) {
     if ui
         .button(t("AI 정보", "AI info"))
@@ -172,7 +179,7 @@ fn ai_info_button(ui: &mut egui::Ui, view: &mut View) {
     }
 }
 
-/// 기능이 쓰는 모델을 한 줄로 적는다. 자세한 것은 "AI 정보" 창에 있다.
+/// Lists a feature's model on one line. Details are in the "AI info" window.
 fn credit_line(ui: &mut egui::Ui, prefix: &str, credit: &Credit) {
     ui.add(egui::Label::new(
         RichText::new(format!("{prefix}: {} · {}", credit.model, credit.by))
@@ -191,7 +198,7 @@ fn credit_line(ui: &mut egui::Ui, prefix: &str, credit: &Credit) {
     ));
 }
 
-/// 그 기능의 모델이 준비되어 있는지.
+/// Whether that feature's model is ready.
 fn model_status(app: &App, feature: Feature) -> &'static str {
     let ready = t("준비됨", "Ready");
     let missing = t("모델 없음", "No model");
@@ -209,13 +216,14 @@ fn model_status(app: &App, feature: Feature) -> &'static str {
     }
 }
 
-/// AI 기능이 쓰는 모델과 그 출처를 모아 보여 주는 창.
+/// Window that gathers the models used by AI features and their sources.
 fn ai_info(ctx: &egui::Context, app: &App, view: &mut View) {
     let mut open = true;
     egui::Window::new(t("AI 기능과 출처", "AI features and sources"))
         .open(&mut open)
         .collapsible(false)
-        // 창 한가운데에, 창 높이의 대부분을 쓰는 크기로 연다 (끌어서 옮기거나 키울 수 있다).
+        // Open in the middle of the window, using most of its height (it can be dragged or
+        // resized).
         .pivot(egui::Align2::CENTER_CENTER)
         .default_pos(ctx.content_rect().center())
         .default_width(540.0)
@@ -263,7 +271,7 @@ fn ai_info(ctx: &egui::Context, app: &App, view: &mut View) {
     view.show_ai_info = open;
 }
 
-/// 문제가 생겼을 때 볼 로그 파일을 여는 단추.
+/// Button that opens the log file to look at when something goes wrong.
 fn log_button(ui: &mut egui::Ui, env: &mut dyn Env, actions: &mut Vec<Action>) {
     if ui
         .button(t("로그 열기", "Open log"))
@@ -344,7 +352,7 @@ fn workspace(
     actions: &mut Vec<Action>,
 ) {
     let exporting = matches!(open.export, ExportState::Running { .. });
-    // 내보내는 동안에는 창 제목에도 진행률을 보여 준다 (최소화해도 보인다).
+    // While exporting, show progress in the window title too (visible even when minimized).
     let title = match &open.export {
         ExportState::Running {
             total,
@@ -359,7 +367,7 @@ fn workspace(
         }
         _ => format!("{} · {}", open.project.name, app_name()),
     };
-    // 제목이 바뀔 때만 보낸다. 매번 보내면 화면이 쉬지 않고 다시 그려진다.
+    // Send only when the title changes. Sending every time keeps the screen redrawing nonstop.
     if view.title != title {
         ui.ctx()
             .send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
@@ -367,7 +375,8 @@ fn workspace(
     }
 
     Panel::top("top").show(ui, |ui| {
-        // 창이 좁으면 다음 줄로 넘어가게 한다 (한 줄에 억지로 넣으면 단추가 서로 겹친다).
+        // Wrap to the next line when the window is narrow (forcing one line makes the buttons
+        // overlap).
         ui.horizontal_wrapped(|ui| {
             ui.strong(&open.project.name);
             ui.separator();
@@ -410,7 +419,7 @@ fn workspace(
     Panel::bottom("status").show(ui, |ui| status_bar(ui, app, open));
     Panel::bottom("export").show(ui, |ui| export_bar(ui, open, view, env, actions));
 
-    // 창이 세로로 길면 편집 패널을 아래로 내린다.
+    // Move the edit panel to the bottom when the window is tall.
     let portrait = ui.available_width() < ui.available_height();
     if portrait {
         Panel::bottom("edit")
@@ -540,7 +549,7 @@ fn resources(report: &ReportView) -> String {
     )
 }
 
-/// 고른 품질이 무엇을 뜻하는지 한마디로. 기준은 2,400만 화소 사진으로 잰 용량이다.
+/// What the chosen quality means, in a word. Based on file sizes measured on a 24-megapixel photo.
 fn quality_hint(quality: u8) -> &'static str {
     match quality {
         ..=60 => t("권장 범위", "Recommended"),
@@ -560,7 +569,7 @@ fn export_bar(
     actions: &mut Vec<Action>,
 ) {
     let exporting = matches!(open.export, ExportState::Running { .. });
-    // 창이 좁으면 다음 줄로 넘어가게 한다.
+    // Wrap to the next line when the window is narrow.
     ui.horizontal_wrapped(|ui| {
         if ui
             .add_enabled(
@@ -578,7 +587,7 @@ fn export_bar(
         };
         ui.separator();
         let mut quality = view.quality.unwrap_or(open.project.export.quality);
-        // 품질은 끝까지 올릴 수 있게 두고, 값마다 무엇을 치르는지 옆에 알려 준다.
+        // Let quality go all the way up, and say next to it what each value costs.
         let guide = t(
             "55를 권장합니다 (JPEG 90 수준의 화질).\n\
              75면 용량이 55의 2~3배가 되어 카메라 JPEG보다 커집니다.\n\
@@ -591,7 +600,7 @@ fn export_bar(
              lowered automatically. Each step down is another encode, so it takes longer.\n\
              95 and above give the same result.",
         );
-        // 슬라이더에 이름을 붙여 둔다 (화면 낭독기와 테스트가 이 이름으로 찾는다).
+        // Name the slider (screen readers and tests find it by this name).
         let slider = ui
             .add_enabled(
                 !exporting,
@@ -599,13 +608,14 @@ fn export_bar(
                     .text(t("품질", "Quality")),
             )
             .on_hover_text(guide);
-        // 짧은 안내가 두 줄로 쪼개지지 않게 한다 (자리가 모자라면 통째로 다음 줄로 간다).
+        // Keep the short hint from splitting over two lines (if space runs out, it moves whole to
+        // the next line).
         ui.add(
             egui::Label::new(RichText::new(quality_hint(quality)).weak())
                 .wrap_mode(egui::TextWrapMode::Extend),
         )
         .on_hover_text(guide);
-        // 끄는 동안에는 화면에서만 바꾸고, 놓을 때 한 번 저장한다.
+        // While dragging, change it only on screen; save once on release.
         if slider.dragged() {
             view.quality = Some(quality);
         } else if slider.drag_stopped() || slider.changed() {
@@ -662,7 +672,8 @@ fn edit_panel(
         });
 }
 
-/// 슬라이더 하나. 값이 바뀌면 `Some(놓았는가)`를 돌려준다. 끄는 동안에는 거짓, 놓을 때 참이다.
+/// One slider. Returns `Some(released)` when the value changes: false while dragging, true on
+/// release.
 fn slider(
     ui: &mut egui::Ui,
     label: &str,
@@ -677,19 +688,19 @@ fn slider(
     commit_of(&response)
 }
 
-/// 슬라이더가 바뀌었으면 `Some(놓았는가)`. 끄는 동안에는 거짓, 놓을 때 참이다.
+/// `Some(released)` if the slider changed: false while dragging, true on release.
 fn commit_of(response: &egui::Response) -> Option<bool> {
     if response.drag_stopped() {
         Some(true)
     } else if response.changed() {
-        // 끌지 않고 바뀐 경우(숫자를 직접 입력, 키보드)는 바로 확정한다.
+        // Changes made without dragging (typing a number, keyboard) are committed right away.
         Some(!response.dragged())
     } else {
         None
     }
 }
 
-/// 캡처 샤픈: RAW의 흐림을 되돌린다. 선택한 사진 전체에 적용된다.
+/// Capture sharpening: undoes the blur in the RAW. Applies to all selected photos.
 fn capture_panel(ui: &mut egui::Ui, open: &Open, actions: &mut Vec<Action>) {
     ui.heading(t("캡처 샤픈", "Capture sharpening"));
     ui.weak(t(
@@ -703,7 +714,7 @@ fn capture_panel(ui: &mut egui::Ui, open: &Open, actions: &mut Vec<Action>) {
     let before = open.edit(current).capture;
     let mut capture = before;
     let mut commit = true;
-    // 지금 사진에서 구한 반경과 문턱 (워커가 알려 준 것)
+    // Radius and threshold found for the current photo (reported by the worker)
     let auto = open
         .capture_auto
         .filter(|(index, _, _)| *index == current)
@@ -735,7 +746,8 @@ fn capture_panel(ui: &mut egui::Ui, open: &Open, actions: &mut Vec<Action>) {
             ),
         });
         ui.collapsing(t("세부 설정", "More settings"), |ui| {
-            // 반경: 자동이면 사진에서 구한 값을 보여 준다. 자동을 끄면 RawTherapee의 기본 0.75에서 시작한다.
+            // Radius: when automatic, show the value found from the photo. Turning auto off starts
+            // from RawTherapee's default of 0.75.
             let mut auto_radius = capture.radius.is_none();
             if ui
                 .checkbox(&mut auto_radius, t("반경 자동", "Auto radius"))
@@ -761,7 +773,8 @@ fn capture_panel(ui: &mut egui::Ui, open: &Open, actions: &mut Vec<Action>) {
                 }
             }
 
-            // 대비 문턱: 기본은 0.4로 정해 두었다. 자동이면 RawTherapee처럼 사진에서 구한다.
+            // Contrast threshold: the default is fixed at 0.4. When automatic, it is found from the
+            // photo like RawTherapee does.
             let mut auto_threshold = capture.threshold.is_none();
             if ui
                 .checkbox(&mut auto_threshold, t("문턱 자동", "Auto threshold"))
@@ -836,7 +849,7 @@ fn capture_panel(ui: &mut egui::Ui, open: &Open, actions: &mut Vec<Action>) {
     }
 }
 
-/// 프리셋, 강도, 세부 조정, LUT.
+/// Presets, strength, fine adjustments, LUT.
 fn look_panel(
     ui: &mut egui::Ui,
     app: &App,
@@ -860,7 +873,7 @@ fn look_panel(
         {
             actions.push(Action::SetPreset(None));
         }
-        // 지금 사진의 내용에 맞는 프리셋에는 별표를 붙인다.
+        // Star the presets that fit the current photo's content.
         let recommended = open.photos[current]
             .guess
             .and_then(|guess| recommend::preset_for(&app.presets, &guess));
@@ -1014,7 +1027,7 @@ fn look_panel(
     }
 }
 
-/// 색상대의 화면 이름. `edit::Hsl`의 항목과 같은 순서.
+/// Display names of the hue bands. Same order as the entries of `edit::Hsl`.
 fn hue_names() -> [&'static str; 8] {
     t(
         [
@@ -1026,7 +1039,7 @@ fn hue_names() -> [&'static str; 8] {
     )
 }
 
-/// 피부 보정 (실험 기능): 인물의 피부만 찾아 얼룩을 누그러뜨린다.
+/// Skin retouching (experimental): finds only the subject's skin and softens blemishes.
 fn skin_panel(ui: &mut egui::Ui, app: &App, open: &Open, actions: &mut Vec<Action>) {
     ui.heading(t("피부 보정 (실험)", "Skin retouch (experimental)"));
     credit_line(ui, t("피부 찾기", "Skin finder"), &credits::SKIN);
@@ -1060,7 +1073,7 @@ fn skin_panel(ui: &mut egui::Ui, app: &App, open: &Open, actions: &mut Vec<Actio
     ));
 }
 
-/// 마스크: 사진의 일부분을 골라 그곳에만 보정을 더한다.
+/// Masks: pick part of the photo and add adjustments only there.
 fn mask_panel(ui: &mut egui::Ui, app: &App, open: &Open, actions: &mut Vec<Action>) {
     ui.heading(t("마스크", "Masks"));
     credit_line(ui, t("모델", "Model"), &credits::MASK);
@@ -1083,7 +1096,7 @@ fn mask_panel(ui: &mut egui::Ui, app: &App, open: &Open, actions: &mut Vec<Actio
             let name = t(format!("마스크 {number}"), format!("Mask {number}"));
             let active = open.mask == Some(index);
             if ui.selectable_label(active, name).clicked() {
-                // 고쳐 쓰는 마스크를 다시 누르면 고쳐 쓰기를 마친다.
+                // Clicking the mask being edited again finishes editing it.
                 actions.push(Action::SelectMask((!active).then_some(index)));
             }
         }
@@ -1135,7 +1148,7 @@ fn mask_panel(ui: &mut egui::Ui, app: &App, open: &Open, actions: &mut Vec<Actio
             actions.push(Action::SetMaskInvert(invert));
         }
     });
-    // 고른 곳에만 더할 보정
+    // Adjustments added only to the picked area
     let mut adjust = mask.adjust;
     let mut changed = None;
     let rows = [
@@ -1158,8 +1171,9 @@ fn mask_panel(ui: &mut egui::Ui, app: &App, open: &Open, actions: &mut Vec<Actio
     }
 }
 
-/// 미리보기에서 누른 곳이 사진의 어디인지. 사진의 왼쪽 위가 (0, 0), 오른쪽 아래가 (1, 1)이다.
-/// `rect`는 화면에서 사진이 그려진 자리다. 사진 밖을 눌렀으면 None.
+/// Where in the photo a click on the preview landed. The photo's top left is (0, 0), bottom right
+/// (1, 1).
+/// `rect` is where the photo is drawn on screen. None if the click was outside the photo.
 fn photo_point(rect: egui::Rect, pos: egui::Pos2) -> Option<(f32, f32)> {
     rect.contains(pos).then(|| {
         (
@@ -1169,7 +1183,7 @@ fn photo_point(rect: egui::Rect, pos: egui::Pos2) -> Option<(f32, f32)> {
     })
 }
 
-/// 프레임의 모양과 색.
+/// Frame layout and colour.
 fn frame_panel(ui: &mut egui::Ui, open: &Open, actions: &mut Vec<Action>) {
     ui.heading(t("프레임", "Frame"));
     let Some(current) = open.current else {
@@ -1259,7 +1273,7 @@ fn denoise_panel(ui: &mut egui::Ui, app: &App, open: &Open, actions: &mut Vec<Ac
     }
 }
 
-/// 사진 목록의 한 줄 높이.
+/// Row height of the photo list.
 const ROW: f32 = 56.0;
 
 fn photo_list(ui: &mut egui::Ui, open: &Open, view: &mut View, actions: &mut Vec<Action>) {
@@ -1270,7 +1284,7 @@ fn photo_list(ui: &mut egui::Ui, open: &Open, view: &mut View, actions: &mut Vec
         ));
         return;
     }
-    // 위아래 화살표로 앞뒤 사진으로 간다.
+    // Up and down arrows go to the previous and next photo.
     let step = ui.input(|input| {
         input.key_pressed(Key::ArrowDown) as isize - input.key_pressed(Key::ArrowUp) as isize
     });
@@ -1307,7 +1321,7 @@ fn photo_list(ui: &mut egui::Ui, open: &Open, view: &mut View, actions: &mut Vec
                                 .paint_at(ui, egui::Rect::from_center_size(rect.center(), size));
                         }
                         let name = photo.relative.rsplit('/').next().unwrap_or(&photo.relative);
-                        // 무엇을 찍은 사진으로 보이는지 이름 옆에 적는다 (확실할 때만).
+                        // Note next to the name what the photo appears to show (only when sure).
                         let name = match photo.guess.filter(|guess| guess.is_confident()) {
                             Some(guess) => format!("{name} · {}", guess.category.label()),
                             None => name.to_owned(),
@@ -1342,12 +1356,12 @@ fn thumbnail(
     Some(texture)
 }
 
-/// 미리보기의 확대 상태.
+/// Zoom state of the preview.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Zoom {
-    /// 1이면 창에 맞춘 크기, 2면 그 두 배.
+    /// 1 is the fit-to-window size, 2 is twice that.
     pub scale: f32,
-    /// 이미지 중심이 미리보기 영역의 중심에서 벗어난 거리 (화면 단위).
+    /// How far the image centre is from the centre of the preview area (screen units).
     pub offset: egui::Vec2,
 }
 
@@ -1361,8 +1375,9 @@ impl Default for Zoom {
 }
 
 impl Zoom {
-    /// `factor`배로 확대하되, `pointer`(영역 중심 기준 위치) 아래의 이미지 지점이 제자리에 있게 한다.
-    /// `max`는 최대 배율.
+    /// Zooms by `factor`, keeping the image point under `pointer` (position relative to the area
+    /// centre) in place.
+    /// `max` is the maximum zoom.
     pub fn zoom_at(&mut self, factor: f32, pointer: egui::Vec2, max: f32) {
         let scale = (self.scale * factor).clamp(1.0, max.max(1.0));
         let applied = scale / self.scale;
@@ -1370,15 +1385,17 @@ impl Zoom {
         self.scale = scale;
     }
 
-    /// 이미지가 영역보다 크면 가장자리가 영역 안으로 들어오지 않게, 작으면 가운데에 오게 한다.
-    /// `fit`은 창에 맞춘 이미지 크기, `area`는 미리보기 영역의 크기.
+    /// If the image is larger than the area, keeps its edges from coming inside the area; if
+    /// smaller, centres it.
+    /// `fit` is the fit-to-window image size, `area` the size of the preview area.
     pub fn clamp(&mut self, fit: egui::Vec2, area: egui::Vec2) {
         let limit = ((fit * self.scale - area) / 2.0).max(egui::Vec2::ZERO);
         self.offset = self.offset.clamp(-limit, limit);
     }
 }
 
-/// 미리보기 위의 전후 비교 단추. 비교를 켜면 나누는 방향도 고를 수 있다.
+/// Before/after comparison buttons over the preview. With comparison on, the split direction can be
+/// chosen too.
 fn compare_bar(ui: &mut egui::Ui, app: &App, open: &Open, actions: &mut Vec<Action>) {
     ui.horizontal_wrapped(|ui| {
         if ui
@@ -1405,7 +1422,8 @@ fn compare_bar(ui: &mut egui::Ui, app: &App, open: &Open, actions: &mut Vec<Acti
                 }
             }
             ui.separator();
-            // 보정 전 칸에 보여 줄 것. 지금 사진에 같은 이름의 JPEG가 없으면 고를 수 없다.
+            // What to show in the before pane. Not selectable if the current photo has no JPEG with
+            // the same name.
             let has_jpeg = open
                 .sidecar
                 .as_ref()
@@ -1438,16 +1456,17 @@ fn compare_bar(ui: &mut egui::Ui, app: &App, open: &Open, actions: &mut Vec<Acti
     });
 }
 
-/// 미리보기 그림을 GPU에 올린다.
+/// Uploads the preview image to the GPU.
 fn upload(ctx: &egui::Context, name: &str, pixels: &Pixels) -> TextureHandle {
-    // 줄여서 볼 때는 부드럽게(밉맵), 100%를 넘겨 볼 때는 화소가 그대로 보이게 한다.
+    // Smooth (mipmaps) when viewed scaled down; show pixels as they are when viewed above 100%.
     let options = TextureOptions {
         magnification: egui::TextureFilter::Nearest,
         minification: egui::TextureFilter::Linear,
         mipmap_mode: Some(egui::TextureFilter::Linear),
         ..TextureOptions::LINEAR
     };
-    // GPU가 받을 수 있는 크기를 넘으면 줄여서 올린다 (넘는 텍스처를 올리면 프로그램이 멈춘다).
+    // Scale down before uploading if it exceeds what the GPU accepts (uploading an oversized
+    // texture crashes the program).
     let limit = ctx.input(|input| input.max_texture_side);
     let image = match pixels.fit_within(limit) {
         Some(smaller) => color_image(&smaller),
@@ -1456,8 +1475,10 @@ fn upload(ctx: &egui::Context, name: &str, pixels: &Pixels) -> TextureHandle {
     ctx.load_texture(name, image, options)
 }
 
-/// 전후 비교를 위해 `area`를 같은 크기의 두 칸(보정 전, 보정 후)으로 나눈다. `image`는 사진의 크기.
-/// 자동이면 좌우와 위아래 가운데 사진이 더 크게 들어가는 쪽을 고른다. 같으면 좌우.
+/// Splits `area` into two equal panes (before, after) for the before/after comparison. `image` is
+/// the photo's size.
+/// When automatic, picks whichever of side by side or top and bottom shows the photo larger. Side
+/// by side on a tie.
 fn compare_panes(split: Split, image: egui::Vec2, area: egui::Rect) -> [egui::Rect; 2] {
     let width = ((area.width() - PANE_GAP) / 2.0).max(0.0);
     let side = [
@@ -1497,7 +1518,8 @@ fn preview(ui: &mut egui::Ui, app: &App, open: &Open, view: &mut View, actions: 
     {
         view.preview = Some((preview.serial, upload(ui.ctx(), "preview", &preview.pixels)));
     }
-    // 보정 전 그림은 비교 중이고 지금 사진의 것일 때만 쓴다. 비교를 끄면 텍스처도 내려놓는다.
+    // Use the before image only while comparing and only if it belongs to the current photo.
+    // Turning comparison off also releases the texture.
     let original = open
         .original
         .as_ref()
@@ -1518,24 +1540,25 @@ fn preview(ui: &mut egui::Ui, app: &App, open: &Open, view: &mut View, actions: 
         ui.centered_and_justified(|ui| ui.spinner());
         return;
     };
-    // 다른 사진으로 넘어가면 창에 맞춘 상태로 돌아간다. 같은 사진을 다시 그린 경우(노이즈 제거 적용 등)에는
-    // 보던 자리를 유지한다.
+    // Moving to another photo goes back to fit-to-window. When the same photo is redrawn (e.g.
+    // after applying noise reduction), keep the view where it was.
     if view.zoomed_photo != Some(current) {
         view.zoomed_photo = Some(current);
         view.zoom = Zoom::default();
     }
     let area = ui.available_rect_before_wrap();
     let image = texture.size_vec2();
-    // 비교할 때는 보정 전, 보정 후 두 칸. 마지막 칸이 보정 후다.
+    // When comparing, two panes: before and after. The last pane is the after one.
     let panes = if open.compare {
         compare_panes(app.config.compare_split, image, area).to_vec()
     } else {
         vec![area]
     };
-    // 칸들은 크기가 같아서 확대 상태 하나를 같이 쓴다. 어느 칸에서 확대하거나 끌어도 모든 칸이 같이 움직인다.
+    // The panes are the same size, so they share one zoom state. Zooming or dragging in any pane
+    // moves all of them together.
     let pane_size = panes[0].size();
     let fit_size = fit(image, pane_size);
-    // 창에 맞춘 크기를 1로 볼 때 원본 크기(100%)에 해당하는 배율
+    // Zoom that equals the original size (100%) when the fit-to-window size counts as 1
     let actual = image.x / fit_size.x;
     let max = (MAX_ZOOM * actual).max(1.0);
     let responses: Vec<egui::Response> = panes
@@ -1555,9 +1578,9 @@ fn preview(ui: &mut egui::Ui, app: &App, open: &Open, view: &mut View, actions: 
         if response.dragged() {
             view.zoom.offset += response.drag_delta();
         }
-        // 마스크를 고쳐 쓰는 동안에는 누르는 것이 자리를 찍는 일이라, 두 번 눌러 확대하는 것은 쉰다.
+        // While editing a mask, clicks mark points, so double-click zoom is paused.
         if response.double_clicked() && open.mask.is_none() {
-            // 창에 맞춤 ↔ 100%
+            // Fit to window ↔ 100%
             if view.zoom.scale == 1.0 {
                 view.zoom.zoom_at(actual, pointer.unwrap_or_default(), max);
             } else {
@@ -1580,7 +1603,8 @@ fn preview(ui: &mut egui::Ui, app: &App, open: &Open, view: &mut View, actions: 
         } else {
             match (original.map(|original| &original.pixels), &view.original) {
                 (Some(Ok(_)), Some((_, before))) => {
-                    // 보정 후 그림이 잠깐 프레임을 두른 것이거나 작은 사본이어도 일그러지지 않게, 비율을 지켜 같은 자리에 넣는다.
+                    // Keep the aspect ratio and place it in the same spot, so the after image
+                    // doesn't distort even if it briefly has a frame or is a small copy.
                     let size = before.size_vec2();
                     let scale = (rect.width() / size.x).min(rect.height() / size.y);
                     egui::Image::new(before).paint_at(
@@ -1610,7 +1634,8 @@ fn preview(ui: &mut egui::Ui, app: &App, open: &Open, view: &mut View, actions: 
             }
         }
         if let Some(active) = open.mask {
-            // 사진을 누른 자리가 마스크에 더해진다. 오른쪽 단추로 누르면 빼는 자리다. 어느 칸을 눌러도 같은 자리다.
+            // Clicking the photo adds that spot to the mask. A right click marks a spot to
+            // subtract. Every pane maps to the same spot.
             let presses = [
                 (response.clicked(), true),
                 (response.secondary_clicked(), false),
@@ -1624,7 +1649,8 @@ fn preview(ui: &mut egui::Ui, app: &App, open: &Open, view: &mut View, actions: 
                     actions.push(Action::AddMaskPoint { x, y, include });
                 }
             }
-            // 지금까지 누른 자리를 사진 위에 점으로 보여 준다 (고르는 자리는 초록, 빼는 자리는 빨강).
+            // Show the points clicked so far as dots on the photo (green to include, red to
+            // exclude).
             if let Some(mask) = open.edit(current).masks.get(active) {
                 for point in &mask.points {
                     let colour = if point.include {
@@ -1661,13 +1687,14 @@ fn preview(ui: &mut egui::Ui, app: &App, open: &Open, view: &mut View, actions: 
             );
         }
         if after {
-            // 지금 배율 (원본 화소 대비)
+            // Current zoom (relative to source pixels)
             let percent = view.zoom.scale / actual * 100.0;
             let corner = egui::Rect::from_min_max(
                 pane.right_bottom() - egui::vec2(90.0, 24.0),
                 pane.right_bottom(),
             );
-            // 사용법은 배율 표시에 마우스를 올렸을 때만 보여 준다. 사진 위에 계속 뜨면 거슬린다.
+            // Show the usage hint only when hovering the zoom readout. Staying over the photo would
+            // be distracting.
             canvas
                 .put(
                     corner,
@@ -1688,7 +1715,7 @@ fn preview(ui: &mut egui::Ui, app: &App, open: &Open, view: &mut View, actions: 
     }
 }
 
-/// 비율을 유지하며 `area` 안에 들어가는 크기. 원본보다 키우지는 않는다.
+/// The size that fits inside `area` keeping the aspect ratio. Never larger than the original.
 fn fit(image: egui::Vec2, area: egui::Vec2) -> egui::Vec2 {
     let scale = (area.x / image.x).min(area.y / image.y).min(1.0);
     image * scale
@@ -1790,7 +1817,7 @@ mod tests {
 
     use egui::vec2;
 
-    /// 포인터 아래에 있는 이미지 지점 (이미지 중심 기준, 창에 맞춘 크기 단위).
+    /// The image point under the pointer (relative to the image centre, in fit-to-window units).
     fn image_point(zoom: &Zoom, pointer: egui::Vec2) -> egui::Vec2 {
         (pointer - zoom.offset) / zoom.scale
     }
@@ -1805,7 +1832,7 @@ mod tests {
         let after = image_point(&zoom, pointer);
         assert!((before - after).length() < 1e-3, "{before:?} → {after:?}");
 
-        // 이미 확대하고 옮긴 상태에서 한 번 더
+        // Once more, after already zooming and panning
         zoom.zoom_at(1.5, vec2(-40.0, 30.0), 8.0);
         let moved = image_point(&zoom, vec2(-40.0, 30.0));
         zoom.zoom_at(0.8, vec2(-40.0, 30.0), 8.0);
@@ -1829,14 +1856,15 @@ mod tests {
     fn zoom_stays_between_fit_and_the_maximum() {
         let mut zoom = Zoom::default();
         zoom.zoom_at(0.5, vec2(50.0, 50.0), 8.0);
-        assert_eq!(zoom, Zoom::default(), "창에 맞춘 크기보다 작아지지 않는다");
+        assert_eq!(zoom, Zoom::default(), "never below fit-to-window");
         zoom.zoom_at(100.0, vec2(0.0, 0.0), 8.0);
         assert_eq!(zoom.scale, 8.0);
     }
 
     #[test]
     fn panning_stops_at_the_image_edges() {
-        // 400×300 영역에 꽉 맞는 이미지를 2배로: 800×600. 좌우 200, 상하 150까지만 움직일 수 있다.
+        // Image that exactly fills a 400×300 area, zoomed 2×: 800×600. It can move only 200
+        // sideways and 150 up and down.
         let (fit, area) = (vec2(400.0, 300.0), vec2(400.0, 300.0));
         let mut zoom = Zoom {
             scale: 2.0,
@@ -1851,7 +1879,8 @@ mod tests {
 
     #[test]
     fn an_image_smaller_than_the_area_stays_centred() {
-        // 세로 사진: 영역 400×300 안에 200×300으로 맞춰짐. 1.5배면 300×450 → 좌우는 아직 영역보다 좁다.
+        // Portrait photo: fits a 400×300 area as 200×300. At 1.5× it is 300×450 → still narrower
+        // than the area horizontally.
         let mut zoom = Zoom {
             scale: 1.5,
             offset: vec2(80.0, 500.0),
@@ -1866,31 +1895,31 @@ mod tests {
         let landscape = vec2(6000.0, 4000.0);
         let portrait = vec2(4000.0, 6000.0);
         let [before, after] = compare_panes(Split::Auto, landscape, area);
-        assert_eq!(before.width(), 1000.0, "가로 사진은 위아래로: {before:?}");
-        assert!(before.max.y < after.min.y, "보정 전이 위");
+        assert_eq!(before.width(), 1000.0, "landscape: top/bottom: {before:?}");
+        assert!(before.max.y < after.min.y, "before is on top");
         let [before, after] = compare_panes(Split::Auto, portrait, area);
-        assert_eq!(before.height(), 700.0, "세로 사진은 좌우로: {before:?}");
-        assert!(before.max.x < after.min.x, "보정 전이 왼쪽");
+        assert_eq!(before.height(), 700.0, "portrait: side by side: {before:?}");
+        assert!(before.max.x < after.min.x, "before is on the left");
 
-        // 고른 방향은 사진과 상관없이 따른다.
+        // A chosen direction is followed regardless of the photo.
         let [before, after] = compare_panes(Split::Side, landscape, area);
         assert!(before.max.x < after.min.x);
         let [before, after] = compare_panes(Split::Stacked, portrait, area);
         assert!(before.max.y < after.min.y);
 
-        // 두 칸은 크기가 같고, 영역 안에 있고, 겹치지 않는다.
+        // The two panes are the same size, inside the area, and do not overlap.
         for split in [Split::Side, Split::Stacked] {
             let [before, after] = compare_panes(split, landscape, area);
             assert_eq!(before.size(), after.size());
             assert!(area.contains_rect(before) && area.contains_rect(after));
             assert!(!before.intersects(after));
         }
-        // 작은 사진은 어느 쪽으로 나눠도 원래 크기로 들어가니 좌우.
+        // A small photo fits at its original size either way, so side by side.
         let [before, after] = compare_panes(Split::Auto, vec2(300.0, 200.0), area);
         assert!(before.max.x < after.min.x);
     }
 
-    /// 대화 상자 대신 정해 둔 경로를 돌려주는 가짜 환경.
+    /// Fake environment that returns preset paths instead of showing dialogs.
     #[derive(Default)]
     struct Fake {
         path: Option<PathBuf>,
@@ -1924,7 +1953,7 @@ mod tests {
         }
     }
 
-    /// 화면을 띄우고, 그 화면에서 나온 동작을 앱에 전달하는 시험대.
+    /// Test bench that shows the screen and passes the actions it produces to the app.
     struct Screen {
         dir: PathBuf,
         app: RefCell<App>,
@@ -1949,7 +1978,7 @@ mod tests {
             }
         }
 
-        /// 프로젝트를 만들고 사진 두 장을 가져온 상태.
+        /// A project created with two photos imported.
         fn with_photos(name: &str) -> Self {
             let screen = Self::new(name);
             screen
@@ -1971,12 +2000,13 @@ mod tests {
             self.harness_sized(egui::vec2(1100.0, 700.0))
         }
 
-        /// 창 크기를 정해서 띄운다.
+        /// Shows the screen at a given window size.
         fn harness_sized(&self, size: egui::Vec2) -> Harness<'_> {
             self.harness_scaled(size, 1.0)
         }
 
-        /// 창 크기와, 화면의 한 점을 몇 화소로 그릴지를 정해서 띄운다 (그림을 또렷하게 남길 때 쓴다).
+        /// Shows the screen at a given window size and pixels per point (used to save crisp
+        /// images).
         fn harness_scaled(&self, size: egui::Vec2, pixels_per_point: f32) -> Harness<'_> {
             let mut view = View::default();
             let mut fonts_installed = false;
@@ -1984,7 +2014,7 @@ mod tests {
                 .with_size(size)
                 .with_pixels_per_point(pixels_per_point)
                 .build_ui(move |ui| {
-                    // 글꼴은 다음 프레임부터 적용된다. 첫 프레임에는 아무것도 그리지 않는다.
+                    // Fonts take effect from the next frame. Nothing is drawn on the first frame.
                     if !fonts_installed {
                         install_fonts(ui.ctx());
                         fonts_installed = true;
@@ -2024,7 +2054,7 @@ mod tests {
             Action::ConfirmExport { overwrite } => format!("ConfirmExport {overwrite}"),
             Action::CancelExport => "CancelExport".into(),
             Action::DismissExport => "DismissExport".into(),
-            _ => "기타".into(),
+            _ => "Other".into(),
         }
     }
 
@@ -2046,7 +2076,7 @@ mod tests {
         harness.get_by_label("프로젝트 닫기").click();
         harness.run();
         assert!(screen.app.borrow().open.is_none());
-        // 시작 화면의 최근 프로젝트에서 다시 연다.
+        // Reopen it from the recent projects on the start screen.
         harness.get_by_label("가을 여행").click();
         harness.run();
         assert!(screen.app.borrow().open.is_some());
@@ -2081,20 +2111,20 @@ mod tests {
         harness.run();
         harness.get_by_label("a.ARW");
         harness.get_by_label("b.ARW").click();
-        // 미리보기를 기다리는 동안에는 회전 표시가 계속 돌아서 화면이 멈추지 않는다.
+        // While waiting for the preview the spinner keeps turning, so the screen never settles.
         harness.run_steps(3);
         assert_eq!(screen.app.borrow().open.as_ref().unwrap().current, Some(1));
         assert_eq!(*screen.seen.borrow(), ["ImportFolder", "Select 1 false"]);
     }
 
-    /// 미리보기 구석에 표시된 배율(%)을 읽는다.
+    /// Reads the zoom (%) shown in the corner of the preview.
     fn shown_zoom(harness: &Harness<'_>) -> f32 {
         use egui_kittest::kittest::NodeT;
         let node = harness.get_by_label_contains("배율 ").accesskit_node();
         let text = node
             .label()
             .or_else(|| node.value())
-            .expect("배율 표시에 글자가 없다");
+            .expect("the zoom readout has no text");
         text.trim_start_matches("배율 ")
             .trim_end_matches('%')
             .parse()
@@ -2130,10 +2160,10 @@ mod tests {
         let fit = shown_zoom(&harness);
         assert!(
             fit > 10.0 && fit < 60.0,
-            "2000화소 폭의 사진이 창에 맞게 줄어 있어야 한다: {fit}%"
+            "a 2000-pixel-wide photo should be scaled down to fit the window: {fit}%"
         );
 
-        // 미리보기 위에서 휠을 올린다
+        // Scroll the wheel up over the preview
         let wheel = |amount: f32| egui::Event::MouseWheel {
             unit: egui::MouseWheelUnit::Point,
             delta: vec2(0.0, amount),
@@ -2147,14 +2177,14 @@ mod tests {
         let zoomed = shown_zoom(&harness);
         assert!(zoomed > fit * 1.2, "{fit}% → {zoomed}%");
 
-        // 아무리 올려도 400%를 넘지 않는다
+        // No matter how far up, it never exceeds 400%
         for _ in 0..40 {
             harness.event(wheel(400.0));
             harness.run();
         }
         assert_eq!(shown_zoom(&harness), 400.0);
 
-        // 아무리 내려도 창에 맞춘 크기보다 작아지지 않는다
+        // No matter how far down, it never gets smaller than the fit-to-window size
         for _ in 0..40 {
             harness.event(wheel(-400.0));
             harness.run();
@@ -2176,7 +2206,7 @@ mod tests {
             .as_ref()
             .unwrap()
             .preview_generation();
-        // 시험 환경의 텍스처 한도(2048)보다 큰 미리보기
+        // A preview larger than the test environment's texture limit (2048)
         let pixels = Pixels {
             width: 3000,
             height: 100,
@@ -2221,10 +2251,10 @@ mod tests {
         });
         let mut harness = screen.harness();
         harness.run();
-        assert_eq!(shown(&harness, "보정 전"), 0, "비교를 켜기 전에는 한 칸");
+        assert_eq!(shown(&harness, "보정 전"), 0, "one pane before comparing");
 
         harness.get_by_label("비교").click();
-        // 보정 전 그림을 기다리는 동안에는 회전 표시가 돌아서 화면이 멈추지 않는다.
+        // While waiting for the before image the spinner turns, so the screen never settles.
         harness.run_steps(3);
         assert!(screen.app.borrow().open.as_ref().unwrap().compare);
         let (generation, original) = {
@@ -2246,7 +2276,7 @@ mod tests {
         harness.get_by_label("보정 후");
         let fit = shown_zoom(&harness);
 
-        // 보정 전 칸에서 휠을 올리면, 보정 후 칸에 표시된 배율도 같이 오른다.
+        // Scrolling up in the before pane also raises the zoom shown in the after pane.
         let before = harness.get_by_label("보정 전").rect();
         harness.hover_at(before.right_bottom() + vec2(60.0, 60.0));
         harness.event(egui::Event::MouseWheel {
@@ -2260,7 +2290,7 @@ mod tests {
         let zoomed = shown_zoom(&harness);
         assert!(zoomed > fit * 1.2, "{fit}% → {zoomed}%");
 
-        // 방향 단추는 설정에 저장된다.
+        // The direction button is saved to the settings.
         harness.get_by_label("좌우").click();
         harness.run();
         assert_eq!(screen.app.borrow().config.compare_split, Split::Side);
@@ -2362,7 +2392,7 @@ mod tests {
             extend: false,
         });
         screen.app.borrow_mut().handle(Action::SetDenoiseLevel(0.7));
-        // 미리보기가 도착한 상태로 만든다 (도착 전에는 회전 표시가 계속 돈다).
+        // Make the preview arrive (until it does, the spinner keeps turning).
         let preview_arrives = || {
             let generation = screen
                 .app
@@ -2383,7 +2413,8 @@ mod tests {
             });
         };
         preview_arrives();
-        // 오른쪽 패널이 길어 아래쪽 묶음이 1100×700 창에서는 잘린다 (실제 화면에서는 스크롤된다).
+        // The right panel is long, so the bottom group is cut off in a 1100×700 window (on a real
+        // screen it scrolls).
         let mut harness = screen.harness_sized(egui::vec2(1100.0, 1000.0));
         harness.run();
         harness.get_by_label("선택한 1장에 적용됩니다");
@@ -2501,9 +2532,9 @@ mod tests {
         harness.get_by_label("Vulkan 드라이버를 설치하세요");
     }
 
-    /// 눈으로 확인하기 위한 화면 그림을 `target/ui/`에 남긴다. `cargo test -- --ignored render`
+    /// Saves screen images to `target/ui/` for checking by eye. `cargo test -- --ignored render`
     #[test]
-    #[ignore = "GPU와 샘플 사진이 필요하고, 그림 파일을 남기는 용도"]
+    #[ignore = "needs a GPU and sample photos, and is for saving image files"]
     fn render_screens() {
         let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/ui");
         std::fs::create_dir_all(&out).unwrap();
@@ -2521,7 +2552,7 @@ mod tests {
         };
         shot(&mut harness, "1-start.png");
 
-        // 실제 사진 폴더를 가져오고, 썸네일과 미리보기를 직접 만들어 넣는다.
+        // Import a real photo folder, and make and insert the thumbnails and previews directly.
         handle(Action::OpenProject(screen.dir.join("가을 여행.amsil")));
         handle(Action::ImportFolder(photos.clone()));
         handle(Action::Backend(Backend::Gpu));
@@ -2585,7 +2616,7 @@ mod tests {
         ));
         shot(&mut harness, "2-workspace.png");
 
-        // 휠로 확대한 모습
+        // Zoomed in with the wheel
         harness.hover_at(egui::pos2(560.0, 300.0));
         for _ in 0..6 {
             harness.event(egui::Event::MouseWheel {
@@ -2600,7 +2631,7 @@ mod tests {
         shot(&mut harness, "2b-zoomed.png");
         harness.remove_cursor();
 
-        // 프리셋을 적용한 모습 ("풍경", 강도 120%)
+        // With a preset applied ("풍경" (landscape), strength 120%)
         handle(Action::SetPreset(Some("landscape".into())));
         handle(Action::SetStrength {
             value: 1.2,
@@ -2641,7 +2672,7 @@ mod tests {
             result: Ok(crate::preview::shrink(&looked.image, 8192)),
         });
         shot(&mut harness, "2c-preset.png");
-        // 전후 비교: 보정 전(보정 없음)과 보정 후(풍경 120%)
+        // Before/after comparison: before (no edits) and after (landscape 120%)
         handle(Action::SetCompare(true));
         let (generation, original) = {
             let app = screen.app.borrow();
@@ -2676,7 +2707,7 @@ mod tests {
         handle(Action::SetCompare(false));
         handle(Action::ResetLook);
 
-        // LUT을 입힌 모습 (따뜻하고 채도가 낮은 시험용 LUT, 강도 80%)
+        // With a LUT applied (a warm, low-saturation test LUT, strength 80%)
         let cube = screen.dir.join("따뜻한 필름.cube");
         let mut text = String::from("LUT_3D_SIZE 17\n");
         for index in 0..17usize.pow(3) {
@@ -2731,7 +2762,7 @@ mod tests {
         shot(&mut harness, "2d-lut.png");
         handle(Action::ResetLook);
 
-        // 마스크: 가운데 건물을 눌러 고른 모습 (모델이 있을 때)
+        // Mask: the middle building picked by clicking (when the model is present)
         if let Ok(segmenter) = crate::mask::load_segmenter() {
             let segmenter = std::sync::Mutex::new(segmenter);
             handle(Action::AddMask);
@@ -2768,7 +2799,7 @@ mod tests {
             handle(Action::RemoveMask);
         }
 
-        // 내보내는 중
+        // Exporting
         handle(Action::Export {
             only_selected: false,
         });
@@ -2789,7 +2820,7 @@ mod tests {
         }));
         shot(&mut harness, "3-exporting.png");
 
-        // 결과
+        // Result
         let outcome = Outcome {
             done: count - 1,
             skipped: 0,
@@ -2802,7 +2833,8 @@ mod tests {
         handle(Action::ExportFinished(Ok((outcome, vec![]))));
         shot(&mut harness, "4-finished.png");
 
-        // 영어 화면: 작업 화면(프리셋·LUT·세부 조정을 펼친 모습)과 시작 화면
+        // English screens: the workspace (with presets, LUT and fine adjustments expanded) and the
+        // start screen
         handle(Action::DismissExport);
         handle(Action::SetLanguage(crate::lang::Lang::En));
         handle(Action::SetPreset(Some("landscape".into())));
@@ -2825,17 +2857,17 @@ mod tests {
         harness.get_by_label("By colour").click();
         shot(&mut harness, "5-english.png");
 
-        // 라이트 모드 (한국어로 돌아와서)
+        // Light mode (back in Korean)
         handle(Action::SetLanguage(crate::lang::Lang::Ko));
         handle(Action::SetTheme(Theme::Light));
         shot(&mut harness, "6-light.png");
 
-        // AI 기능과 출처 창
+        // AI features and sources window
         harness.get_by_label("AI 정보").click();
         shot(&mut harness, "8-ai-info.png");
         harness.key_press(Key::Escape);
 
-        // 좁고 긴 창 (가장 작은 크기에 가까운 640×800)
+        // Narrow, tall window (640×800, close to the smallest size)
         let mut narrow = screen.harness_sized(egui::vec2(640.0, 800.0));
         narrow.run_steps(6);
         narrow
@@ -2850,7 +2882,7 @@ mod tests {
         handle(Action::SetTheme(Theme::Dark));
     }
 
-    /// 화면에 나온 글자 가운데 한글이 든 것. 언어 단추의 "한국어"는 뺀다.
+    /// On-screen texts that contain Hangul. Leaves out "한국어" on the language button.
     fn korean_texts(harness: &Harness<'_>) -> Vec<String> {
         use egui_kittest::kittest::NodeT;
         harness
@@ -2899,7 +2931,7 @@ mod tests {
         harness.run_steps(4);
         assert!(
             korean_texts(&harness).len() > 3,
-            "한국어 화면에서는 한글이 보여야 한다 (검사가 글자를 제대로 읽는지 확인)"
+            "the Korean screen should show Hangul (checks that the test reads text correctly)"
         );
         handle(Action::SetLanguage(Lang::En));
         let check = |harness: &mut Harness<'_>, what: &str| {
@@ -2907,13 +2939,13 @@ mod tests {
             let left = korean_texts(harness);
             assert!(left.is_empty(), "{what}: {left:?}");
         };
-        check(&mut harness, "시작 화면");
+        check(&mut harness, "start screen");
 
         handle(Action::OpenProject(screen.dir.join("trip.amsil")));
-        check(&mut harness, "빈 작업 화면");
+        check(&mut harness, "empty workspace");
         handle(Action::ImportFolder(screen.dir.join("사진")));
         handle(Action::Backend(Backend::Cpu(Text::of("no Vulkan"))));
-        check(&mut harness, "사진을 고르기 전");
+        check(&mut harness, "before picking a photo");
 
         handle(Action::Select {
             index: 0,
@@ -2953,9 +2985,9 @@ mod tests {
         harness.get_by_label("Details").click();
         harness.run_steps(3);
         harness.get_by_label("By colour").click();
-        check(&mut harness, "편집 패널을 다 펼친 모습");
+        check(&mut harness, "edit panel fully expanded");
         handle(Action::SetCompare(true));
-        check(&mut harness, "비교를 켜고 보정 전 그림을 기다리는 중");
+        check(&mut harness, "comparison on, waiting for the before image");
         let original = screen
             .app
             .borrow()
@@ -2968,7 +3000,7 @@ mod tests {
             index: 0,
             result: Err(Text::of("broken")),
         });
-        check(&mut harness, "보정 전 그림을 만들지 못했을 때");
+        check(&mut harness, "when the before image could not be made");
         handle(Action::OriginalReady {
             generation: original,
             index: 0,
@@ -2978,7 +3010,7 @@ mod tests {
                 rgba: vec![128; 64],
             }),
         });
-        check(&mut harness, "전후 비교");
+        check(&mut harness, "before/after comparison");
         handle(Action::SetCompare(false));
         handle(Action::AddMask);
         handle(Action::AddMaskPoint {
@@ -2986,25 +3018,25 @@ mod tests {
             y: 0.5,
             include: true,
         });
-        check(&mut harness, "마스크를 고치는 중");
+        check(&mut harness, "editing a mask");
         handle(Action::SelectMask(None));
         handle(Action::Segmenter(Some(Text::of("no model"))));
         handle(Action::SkinModel(Some(Text::of("no model"))));
-        check(&mut harness, "마스크와 피부 모델이 없을 때");
+        check(&mut harness, "when the mask and skin models are missing");
         handle(Action::Segmenter(None));
         handle(Action::SkinModel(None));
         harness.get_by_label("CPU (slow)").click();
-        check(&mut harness, "CPU 안내");
+        check(&mut harness, "CPU notice");
         handle(Action::Backend(Backend::Unavailable(Text::of("no model"))));
-        check(&mut harness, "모델이 없을 때");
+        check(&mut harness, "when models are missing");
         handle(Action::Backend(Backend::Unknown));
-        check(&mut harness, "AI 준비 중");
+        check(&mut harness, "AI preparing");
         harness.get_by_label("AI info").click();
-        check(&mut harness, "AI 정보 창");
+        check(&mut harness, "AI info window");
         handle(Action::Recommender(Some(Text::of("no model"))));
-        check(&mut harness, "분류 모델이 없을 때");
+        check(&mut harness, "when the classifier model is missing");
 
-        // 내보내기: 확인 창, 진행 중, 결과, 실패
+        // Export: confirmation window, in progress, result, failure
         let out = screen.dir.join("out");
         std::fs::create_dir_all(out.join("사진")).unwrap();
         std::fs::write(out.join("사진/a.heic"), b"old").unwrap();
@@ -3012,9 +3044,9 @@ mod tests {
         handle(Action::Export {
             only_selected: false,
         });
-        check(&mut harness, "이미 있는 파일 확인");
+        check(&mut harness, "existing file confirmation");
         handle(Action::ConfirmExport { overwrite: false });
-        check(&mut harness, "내보내기 준비 중");
+        check(&mut harness, "export preparing");
         let report = |idle| crate::export::Report {
             status: crate::job::Status {
                 total: 2,
@@ -3031,9 +3063,9 @@ mod tests {
             low_memory: true,
         };
         handle(Action::ExportProgress(report(0.1)));
-        check(&mut harness, "내보내는 중");
+        check(&mut harness, "exporting");
         handle(Action::ExportProgress(report(45.0)));
-        check(&mut harness, "진행이 멈춘 듯할 때");
+        check(&mut harness, "when progress seems stalled");
         let outcome = Outcome {
             done: 1,
             skipped: 0,
@@ -3042,9 +3074,9 @@ mod tests {
         };
         let warnings = vec![("a.ARW".into(), Text::of("quality lowered"))];
         handle(Action::ExportFinished(Ok((outcome, warnings))));
-        check(&mut harness, "내보내기 결과");
+        check(&mut harness, "export result");
         handle(Action::ExportFinished(Err(Text::of("boom"))));
-        check(&mut harness, "내보내기 실패");
+        check(&mut harness, "export failure");
     }
 
     #[test]
@@ -3077,7 +3109,7 @@ mod tests {
                 layout: Layout::Ratio(4, 5),
                 dark: true
             }),
-            "모양을 바꿔도 색은 그대로"
+            "changing the layout keeps the colour"
         );
         harness.get_by_label("프레임 없음").click();
         harness.run_steps(3);
@@ -3099,7 +3131,7 @@ mod tests {
         harness.run_steps(3);
         assert!(
             harness.query_by_label("추천 프리셋 적용").is_none(),
-            "분류된 사진이 없으면 단추도 없다"
+            "no button without classified photos"
         );
 
         handle(Action::Thumbnail {
@@ -3111,7 +3143,7 @@ mod tests {
             }),
         });
         harness.run_steps(3);
-        // 목록에는 사진의 종류가, 프리셋 단추에는 추천 표시가 붙는다.
+        // The list shows the photo's category, and the preset button gets a suggestion mark.
         harness.get_by_label("a.ARW · 음식");
         harness.get_by_label("음식 ★");
         harness.get_by_label("추천 프리셋 적용").click();
@@ -3141,7 +3173,7 @@ mod tests {
     #[test]
     fn the_bundled_font_has_the_symbols_the_screen_uses() {
         use ab_glyph::Font;
-        // 글꼴에 없는 글자는 화면에 네모로 나온다.
+        // Characters missing from the font show up as boxes on screen.
         let font = ab_glyph::FontRef::try_from_slice(crate::frame::FONT).unwrap();
         for symbol in ['★', '·', '…', '×', '%', '–', '~'] {
             assert_ne!(font.glyph_id(symbol).0, 0, "{symbol}");
@@ -3160,11 +3192,11 @@ mod tests {
             photo_point(rect, egui::pos2(500.0, 250.0)),
             Some((1.0, 1.0))
         );
-        assert_eq!(photo_point(rect, egui::pos2(99.0, 100.0)), None, "사진 밖");
+        assert_eq!(photo_point(rect, egui::pos2(99.0, 100.0)), None, "outside");
         assert_eq!(photo_point(rect, egui::pos2(300.0, 251.0)), None);
     }
 
-    /// 화면의 한 곳을 마우스 단추로 누른다.
+    /// Clicks a spot on the screen with a mouse button.
     fn press(harness: &mut Harness<'_>, pos: egui::Pos2, button: egui::PointerButton) {
         harness.hover_at(pos);
         for pressed in [true, false] {
@@ -3210,7 +3242,7 @@ mod tests {
         show(&screen);
         let mut harness = screen.harness();
         harness.run_steps(3);
-        // 마스크를 고쳐 쓰는 중이 아니면 눌러도 점이 생기지 않는다.
+        // Unless a mask is being edited, clicking makes no point.
         press(
             &mut harness,
             egui::pos2(560.0, 300.0),
@@ -3287,23 +3319,25 @@ mod tests {
             index: 0,
             extend: false,
         });
-        // 오른쪽 패널이 길어 아래쪽 묶음이 1100×700 창에서는 잘린다 (실제 화면에서는 스크롤된다).
+        // The right panel is long, so the bottom group is cut off in a 1100×700 window (on a real
+        // screen it scrolls).
         let mut harness = screen.harness_sized(egui::vec2(1100.0, 1000.0));
         harness.run_steps(3);
         harness.get_by_label("캡처 샤픈");
         assert!(harness.query_all_by_label("반복 횟수").count() > 0);
-        // 반경과 문턱은 "세부 설정" 안에 있고, 처음에 자동이다.
-        assert!(harness.query_by_label("반경 자동").is_none(), "접혀 있다");
+        // Radius and threshold are inside "세부 설정" (More settings) and start out automatic.
+        assert!(harness.query_by_label("반경 자동").is_none(), "collapsed");
         harness.get_by_label("세부 설정").click();
         harness.run_steps(3);
         harness.get_by_label("반경 자동").click();
-        // 미리보기를 기다리는 동안 스피너가 계속 다시 그리므로 run() 대신 정해진 횟수만 돈다.
+        // While waiting for the preview the spinner keeps redrawing, so run a fixed number of steps
+        // instead of run().
         harness.run_steps(3);
         let capture = screen.app.borrow().open.as_ref().unwrap().edit(0).capture;
         assert_eq!(
             capture.radius,
             Some(0.75),
-            "자동을 끄면 RawTherapee의 기본 반경에서 시작한다"
+            "turning auto off starts from RawTherapee's default radius"
         );
         harness.get_by_label("캡처 샤픈 켜기").click();
         harness.run_steps(3);
@@ -3335,18 +3369,20 @@ mod tests {
             radius: 0.68,
             threshold: 0.12,
         });
-        // 오른쪽 패널이 길어 아래쪽 묶음이 1100×700 창에서는 잘린다 (실제 화면에서는 스크롤된다).
+        // The right panel is long, so the bottom group is cut off in a 1100×700 window (on a real
+        // screen it scrolls).
         let mut harness = screen.harness_sized(egui::vec2(1100.0, 1000.0));
         harness.run_steps(3);
         harness.get_by_label("세부 설정").click();
         harness.run_steps(3);
         assert_eq!(shown(&harness, "자동: 0.68"), 1);
-        // 대비 문턱은 기본이 0.4로 정해져 있어 자동 값을 보여 주지 않는다. 자동을 켜면 보인다.
+        // The contrast threshold defaults to a fixed 0.4, so no automatic value is shown. Turning
+        // auto on shows it.
         assert_eq!(shown(&harness, "자동: 0.12"), 0);
         harness.get_by_label("문턱 자동").click();
         harness.run_steps(3);
         assert_eq!(shown(&harness, "자동: 0.12"), 1);
-        // 다른 사진의 값이면 보여 주지 않는다.
+        // A value belonging to another photo is not shown.
         handle(Action::Select {
             index: 1,
             extend: false,
@@ -3377,7 +3413,7 @@ mod tests {
             screen.app.borrow().open.as_ref().unwrap().capture_view,
             Some(CaptureView::Map)
         );
-        // 캡처 샤픈을 끄면 영역 보기도 꺼지고 단추는 흐려진다.
+        // Turning capture sharpening off also turns off the area view and dims its buttons.
         harness.get_by_label("캡처 샤픈 켜기").click();
         harness.run_steps(3);
         assert_eq!(
@@ -3404,7 +3440,7 @@ mod tests {
         });
         let mut harness = screen.harness();
         harness.run_steps(3);
-        // 슬라이더는 이름표와 조절 막대 두 군데에 같은 이름이 붙는다.
+        // A slider gets the same name in two places: the label and the control bar.
         assert!(harness.query_all_by_label("피부 보정 세기").count() > 0);
         handle(Action::SkinModel(Some(Text::of(
             "피부 보정 모델이 없습니다",
@@ -3418,7 +3454,7 @@ mod tests {
     fn the_quality_slider_goes_to_the_top_and_says_what_each_range_costs() {
         let screen = Screen::with_photos("quality-hint");
         let mut harness = screen.harness();
-        // 기본값(55)은 권장 범위다.
+        // The default (55) is in the recommended range.
         harness.run_steps(3);
         harness.get_by_label("권장 범위");
         for (quality, hint) in [
@@ -3455,7 +3491,7 @@ mod tests {
         harness.get_by_label("로그 열기").click();
         harness.run_steps(3);
         assert_eq!(screen.env.borrow().logs_opened, 1);
-        // 파일이 어디에 있는지 화면에도 알려 준다.
+        // The screen also says where the file is.
         harness.get_by_label("로그 파일: /tmp/amsil/log.txt");
 
         harness.get_by_label("새 프로젝트").click();
@@ -3480,7 +3516,7 @@ mod tests {
         assert_eq!(
             harness.ctx.theme(),
             egui::Theme::Light,
-            "화면이 밝아져야 한다"
+            "the screen should turn light"
         );
 
         harness.get_by_label("새 프로젝트").click();
@@ -3488,7 +3524,7 @@ mod tests {
         assert_eq!(
             harness.ctx.theme(),
             egui::Theme::Light,
-            "작업 화면에서도 그대로"
+            "stays the same in the workspace"
         );
         harness.get_by_label("다크").click();
         harness.run_steps(3);
@@ -3498,7 +3534,8 @@ mod tests {
 
     #[test]
     fn buttons_do_not_overlap_in_a_narrow_window() {
-        // 가장 작은 창 크기(640)에서, 두 언어 모두, 위쪽과 아래쪽 줄의 단추들이 서로 겹치지 않아야 한다.
+        // At the smallest window width (640), in both languages, buttons in the top and bottom rows
+        // must not overlap.
         for (language, labels) in [
             (
                 crate::lang::Lang::Ko,
@@ -3552,19 +3589,19 @@ mod tests {
             for (i, (a, first)) in rects.iter().enumerate() {
                 assert!(
                     first.min.x >= 0.0 && first.max.x <= 640.0,
-                    "{a}: 창 밖으로 나갔다 {first:?}"
+                    "{a}: went outside the window {first:?}"
                 );
                 for (b, second) in &rects[i + 1..] {
                     assert!(
                         !first.shrink(1.0).intersects(second.shrink(1.0)),
-                        "{a}와 {b}가 겹친다: {first:?} {second:?}"
+                        "{a} and {b} overlap: {first:?} {second:?}"
                     );
                 }
             }
         }
     }
 
-    /// 화면에 이 글이 든 것이 몇 군데 있는가.
+    /// How many places on screen contain this text.
     fn shown(harness: &Harness<'_>, text: &str) -> usize {
         harness.query_all_by_label_contains(text).count()
     }
@@ -3576,12 +3613,12 @@ mod tests {
         let handle = |action| {
             screen.app.borrow_mut().handle(action);
         };
-        // 마스크 모델만 없는 상태
+        // Only the mask model is missing
         handle(Action::Backend(Backend::Gpu));
         handle(Action::Segmenter(Some(Text::of("마스크 모델이 없습니다"))));
         let mut harness = screen.harness();
         harness.run_steps(3);
-        // 시작 화면에서도 볼 수 있다.
+        // It is available from the start screen too.
         harness.get_by_label("AI 정보").click();
         harness.run_steps(3);
         harness.get_by_label("AI 기능과 출처");
@@ -3598,9 +3635,9 @@ mod tests {
             "https://github.com/facebookresearch/sam2",
             "https://arxiv.org/abs/2103.00020",
         ] {
-            assert!(shown(&harness, text) > 0, "창에 없다: {text}");
+            assert!(shown(&harness, text) > 0, "not in the window: {text}");
         }
-        // 어떤 모델이 준비됐고 어떤 것이 없는지도 보여 준다.
+        // It also shows which models are ready and which are missing.
         assert_eq!(shown(&harness, "모델 없음"), 1);
         assert!(shown(&harness, "준비됨") >= 3);
     }
@@ -3624,10 +3661,11 @@ mod tests {
         }
     }
 
-    /// 선예도 기능(샤픈 영역 보기 두 가지, 카메라 JPEG 비교)을 실제 사진으로 그려 `target/ui/`에 둔다.
+    /// Draws the sharpness features (two sharpened-area views, camera JPEG comparison) with a real
+    /// photo into `target/ui/`.
     /// `cargo test -- --ignored render_capture_views`
     #[test]
-    #[ignore = "샘플 사진이 필요하다"]
+    #[ignore = "needs sample photos"]
     fn render_capture_views() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let source = root.join("DCIM/10361110/DSC04551.ARW");
@@ -3700,14 +3738,15 @@ mod tests {
         }
     }
 
-    /// README에 넣는 화면 그림을 만든다: 한국어 README의 `assets/screenshots/workspace.jpg`,
-    /// 영어 README의 `workspace.en.jpg`.
+    /// Makes the screen images for the READMEs: `assets/screenshots/workspace.jpg` for the Korean
+    /// README,
+    /// `workspace.en.jpg` for the English one.
     /// `cargo test -- --ignored render_readme_screenshot`
     ///
-    /// 그림은 공개 저장소에 올라간다. 그래서 사람이 나오지 않는 풍경·건축·음식 사진만 골라 쓰고,
-    /// 화면에 나오는 경로도 실제 것이 아닌 것으로 둔다.
+    /// The images go into a public repository. So only landscape, architecture and food photos with
+    /// no people are used, and the paths shown on screen are not real ones.
     #[test]
-    #[ignore = "샘플 사진이 필요하고, 저장소에 든 그림 파일을 고쳐 쓴다"]
+    #[ignore = "needs sample photos, and rewrites image files in the repository"]
     fn render_readme_screenshot() {
         render_readme_screenshot_in(Lang::Ko, "가을 여행", "workspace.jpg");
         render_readme_screenshot_in(Lang::En, "Autumn trip", "workspace.en.jpg");
@@ -3717,22 +3756,22 @@ mod tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let source = root.join("DCIM/10361110");
         let chosen = [
-            "DSC04545.ARW", // 가을 숲길 (미리보기에 띄운다)
-            "DSC04546.ARW", // 언덕
-            "DSC04549.ARW", // 솔가지
-            "DSC04551.ARW", // 건물들
-            "DSC04553.ARW", // 처마와 건물
-            "DSC04554.ARW", // 돌길
-            "DSC04558.ARW", // 감자튀김
-            "DSC04559.ARW", // 햄버거
-            "DSC04560.ARW", // 감자튀김
+            "DSC04545.ARW", // autumn forest path (shown in the preview)
+            "DSC04546.ARW", // hill
+            "DSC04549.ARW", // pine twigs
+            "DSC04551.ARW", // buildings
+            "DSC04553.ARW", // eaves and building
+            "DSC04554.ARW", // stone path
+            "DSC04558.ARW", // french fries
+            "DSC04559.ARW", // hamburger
+            "DSC04560.ARW", // french fries
         ];
         let screen = Screen::new(&format!("readme-{file_name}"));
         let handle = |action| {
             screen.app.borrow_mut().handle(action);
         };
         handle(Action::SetLanguage(lang));
-        // 고른 사진만 든 폴더를 만들어 가져온다.
+        // Make a folder holding only the chosen photos and import it.
         let folder = screen.dir.join(album);
         std::fs::create_dir_all(&folder).unwrap();
         for name in chosen {
@@ -3759,7 +3798,7 @@ mod tests {
                 guess,
             });
         }
-        // 숲길 사진을 고르고 "풍경" 프리셋을 적용한 모습
+        // The forest path photo selected with the "풍경" (landscape) preset applied
         handle(Action::Select {
             index: 0,
             extend: false,
@@ -3798,12 +3837,13 @@ mod tests {
 
         let out = root.join("assets/screenshots");
         std::fs::create_dir_all(&out).unwrap();
-        // 1100×700짜리 창을 1.5배로 그려, 줄여 보여도 글자가 또렷하게 한다.
+        // Draw the 1100×700 window at 1.5×, so the text stays crisp even when shown smaller.
         let scale = 1.5;
         let mut harness = screen.harness_scaled(egui::vec2(1100.0, 700.0), scale);
         harness.run_steps(6);
         let rendered = harness.render().unwrap();
-        // 시험 환경이 둘레에 두는 여백(8점)을 잘라 내고, 용량이 작은 JPEG로 저장한다.
+        // Crop the margin (8 points) the test environment leaves around it, and save as a small
+        // JPEG.
         let margin = (8.0 * scale) as u32;
         let (width, height) = (
             rendered.width() - 2 * margin,

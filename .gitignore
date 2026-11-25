@@ -1,7 +1,7 @@
 DCIM/
 target/
 models/
-# 설계 문서와 작업 메모는 공개 저장소에 올리지 않는다
+# Design docs and working notes are kept out of the public repository
 docs/
 dist/
 __pycache__/

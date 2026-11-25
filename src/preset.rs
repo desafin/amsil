@@ -1,4 +1,4 @@
-//! 프리셋: 이름이 붙은 보정 값 묶음. TOML 파일 하나가 프리셋 하나다.
+//! Presets: named bundles of adjustment values. One TOML file is one preset.
 
 use crate::Result;
 use crate::edit::Params;
@@ -9,15 +9,15 @@ use std::path::Path;
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Preset {
-    /// 프로젝트 파일에 적는 식별자 (파일 이름에서 확장자를 뺀 것).
+    /// Identifier written in the project file (the file name without its extension).
     #[serde(skip)]
     pub id: String,
-    /// 화면에 보이는 이름.
+    /// Name shown on screen.
     pub name: String,
-    /// 영어 화면에 보이는 이름. 없으면 `name`을 쓴다.
+    /// Name shown on the English screen. Falls back to `name` if absent.
     #[serde(default)]
     pub name_en: Option<String>,
-    /// 자동 추천에 쓰는 분류 (food, portrait, landscape, night 등).
+    /// Category used for automatic suggestions (food, portrait, landscape, night, etc.).
     #[serde(default)]
     pub category: Option<String>,
     #[serde(default)]
@@ -25,13 +25,13 @@ pub struct Preset {
 }
 
 impl Preset {
-    /// 지금 언어로 된 이름.
+    /// Name in the current language.
     pub fn label(&self) -> &str {
         t(&self.name, self.name_en.as_ref().unwrap_or(&self.name))
     }
 }
 
-/// 프로그램에 들어 있는 기본 프리셋.
+/// Default presets built into the program.
 pub fn builtin() -> Vec<Preset> {
     const FILES: [(&str, &str); 5] = [
         ("food", include_str!("../presets/food.toml")),
@@ -42,11 +42,12 @@ pub fn builtin() -> Vec<Preset> {
     ];
     FILES
         .iter()
-        .map(|(id, text)| parse(id, text).expect("기본 프리셋 파일이 잘못됐다"))
+        .map(|(id, text)| parse(id, text).expect("a built-in preset file is invalid"))
         .collect()
 }
 
-/// 폴더의 `*.toml`을 프리셋으로 읽는다. 폴더가 없으면 빈 목록. 읽지 못한 파일은 이유와 함께 따로 돌려준다.
+/// Reads the `*.toml` files in a folder as presets. An empty list if the folder is missing. Files
+/// that could not be read are returned separately with the reason.
 pub fn load_dir(dir: &Path) -> (Vec<Preset>, Vec<String>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return (Vec::new(), Vec::new());
@@ -70,7 +71,7 @@ pub fn load_dir(dir: &Path) -> (Vec<Preset>, Vec<String>) {
     (presets, problems)
 }
 
-/// TOML 글에서 프리셋 하나를 읽는다.
+/// Reads one preset from TOML text.
 pub fn parse(id: &str, text: &str) -> Result<Preset> {
     let mut preset: Preset = toml::from_str(text).map_err(|e| {
         text!(
@@ -82,8 +83,8 @@ pub fn parse(id: &str, text: &str) -> Result<Preset> {
     Ok(preset)
 }
 
-/// 사진에 최종으로 적용할 보정 값: 프리셋 × 강도 + 수동 조정.
-/// 프리셋을 찾지 못하면 수동 조정만 적용한다.
+/// The final adjustment values to apply to a photo: preset × strength + manual adjustments.
+/// If the preset is not found, only the manual adjustments are applied.
 pub fn resolve(presets: &[Preset], preset: Option<&str>, strength: f32, adjust: &Params) -> Params {
     match preset.and_then(|id| presets.iter().find(|p| p.id == id)) {
         Some(preset) => preset.params.scaled(strength).plus(adjust),
@@ -104,7 +105,7 @@ mod tests {
         assert_eq!(ids, ["food", "portrait", "landscape", "night", "mono"]);
         assert!(
             presets.iter().all(|p| !p.params.is_neutral()),
-            "효과가 없는 프리셋은 없다"
+            "no preset is without effect"
         );
         assert_eq!(presets[4].params.mono, 1.0);
         assert_eq!(presets[0].category.as_deref(), Some("food"));
@@ -142,7 +143,7 @@ mod tests {
         let (presets, problems) = load_dir(&dir);
         std::fs::remove_dir_all(&dir).unwrap();
         let ids: Vec<&str> = presets.iter().map(|p| p.id.as_str()).collect();
-        assert_eq!(ids, ["a-cool", "b-warm"], "파일 이름 순서");
+        assert_eq!(ids, ["a-cool", "b-warm"], "file name order");
         assert_eq!(presets[1].params.temp, 0.3);
         assert_eq!(problems.len(), 1);
         assert!(problems[0].contains("broken"), "{problems:?}");
@@ -171,7 +172,7 @@ mod tests {
         assert_eq!(
             resolve(&presets, None, 1.0, &manual),
             manual,
-            "프리셋이 없으면 수동 조정만"
+            "without a preset, only the manual adjustments"
         );
         assert_eq!(
             resolve(&presets, Some("지워진 프리셋"), 1.0, &manual),
@@ -189,7 +190,7 @@ mod tests {
                 .collect()
         };
         assert_eq!(labels(&builtin), ["음식", "인물", "풍경", "야경", "흑백"]);
-        // 영어 이름이 없는 사용자 프리셋은 원래 이름을 그대로 쓴다.
+        // A user preset without an English name keeps its original name.
         let mine = parse("mine", "name = \"따뜻한 오후\"").unwrap();
         let named = parse(
             "named",

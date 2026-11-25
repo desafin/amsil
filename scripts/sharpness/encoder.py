@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""x265 설정마다 용량과, 압축이 세부를 얼마나 남기는지.
+"""File size per x265 setting, and how much detail survives compression.
 
     cargo test --release -- --ignored render_for_sharpness_measurement
     cargo test --release -- --ignored encode_for_encoder_comparison
-    python3 scripts/sharpness/encoder.py [폴더]
+    python3 scripts/sharpness/encoder.py [folder]
 
-keep: 압축 전 그림에 대한 압축 후 진폭 (세부 구역, 0.2와 0.3 cycles/pixel). final: 샤픈 없는 현상 대비.
-크기는 캡처 샤픈을 끈 그림을 품질 55로 압축한 것에 대한 비율.
+keep: amplitude after compression relative to before (detail tiles, at 0.2 and 0.3 cycles/pixel).
+final: the same relative to the unsharpened render. Size is relative to the capture-sharpening-off image
+encoded at quality 55.
 """
 import collections
 import sys
@@ -40,8 +41,8 @@ def main():
                 psnr = 10 * np.log10(1 / np.mean((dec - src) ** 2))
                 size = sizes[(f"{name}-{source}", label)] / reference * 100
                 rows[(source, label)].append((size, at(keep, 0.2), at(keep, 0.3), at(final, 0.2), at(final, 0.3), psnr))
-    print(f"평균 ({len(PHOTOS)}장, 2048×2048 영역)")
-    print(f"{'그림':12s} {'인코더':10s} {'크기%':>6s} {'keep.2':>7s} {'keep.3':>7s} {'final.2':>8s} {'final.3':>8s} {'PSNR':>6s}")
+    print(f"Mean ({len(PHOTOS)} photos, 2048x2048 area)")
+    print(f"{'image':12s} {'encoder':10s} {'size%':>6s} {'keep.2':>7s} {'keep.3':>7s} {'final.2':>8s} {'final.3':>8s} {'PSNR':>6s}")
     for source in sources:
         for label in labels:
             m = np.mean(rows[(source, label)], axis=0)

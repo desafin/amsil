@@ -1,4 +1,4 @@
-//! RAW 파일을 읽어 카메라 RGB와 현상에 필요한 값들을 꺼낸다.
+//! Reads a RAW file and extracts camera RGB and the values needed for development.
 
 use crate::denoise::{Packed, pack_rggb};
 use crate::frame::Shot;
@@ -17,39 +17,43 @@ use std::io::Cursor;
 use std::path::Path;
 
 pub struct Raw {
-    /// 블랙·화이트 레벨 보정이 끝난 센서 데이터.
+    /// Sensor data with black and white level correction applied.
     image: RawImage,
-    /// 센서에서 첫 R 화소의 위치. AI 모델은 RGGB 배치를 전제로 한다.
+    /// Position of the first R pixel on the sensor. The AI model assumes an RGGB layout.
     rggb_offset: (usize, usize),
-    /// 촬영 시 화이트밸런스 배율 (G = 1).
+    /// As-shot white balance multipliers (G = 1).
     pub wb: [f32; 3],
-    /// D65 기준 XYZ → 카메라 행렬.
+    /// D65 XYZ → camera matrix.
     pub xyz_to_cam: [[f32; 3]; 3],
-    /// 바로 세우는 데 필요한 (전치, 좌우 뒤집기, 상하 뒤집기). `develop::orient`의 인자.
+    /// (transpose, horizontal flip, vertical flip) needed to make the image upright. Arguments to
+    /// `develop::orient`.
     pub flips: (bool, bool, bool),
-    /// 출력 파일에 넣을 EXIF (TIFF 형식). 픽셀을 돌려서 내보내므로 방향은 1로 고쳐 둔다.
+    /// EXIF to embed in the output file (TIFF format). The pixels are rotated on export, so the
+    /// orientation is rewritten to 1.
     pub exif: Vec<u8>,
-    /// 프레임에 적을 촬영 정보.
+    /// Shooting information to print on the frame.
     pub shot: Shot,
 }
 
-/// 센서 전체의 CFA와 그 배치. 캡처 샤픈이 하이라이트 보호와 반경을 구하는 데 쓴다.
+/// The full-sensor CFA and its layout. Capture sharpening uses it to derive highlight protection
+/// and the radius.
 pub struct Sensor<'a> {
-    /// 블랙·화이트 보정이 끝난 0..1 값 (화이트밸런스 전). 센서 전체, 줄 우선.
+    /// Values in 0..1 after black/white correction (before white balance). Full sensor, row-major.
     pub cfa: Cow<'a, [f32]>,
     pub width: usize,
     pub height: usize,
-    /// 첫 R 화소의 위치 (x, y).
+    /// Position of the first R pixel (x, y).
     pub red: (usize, usize),
-    /// 출력 영역: (x, y, 가로, 세로). `Raw::demosaic`의 결과가 센서의 이 영역이다.
+    /// Output area: (x, y, width, height). `Raw::demosaic` returns this area of the sensor.
     pub crop: (usize, usize, usize, usize),
 }
 
 impl Raw {
-    /// RCD 디모자익을 거친 카메라 RGB. 선형 값이고 센서 포화가 1.0이며 출력 영역으로 잘려 있다.
-    /// RCD는 화이트밸런스를 맞춘 값을 전제로 하므로, 카메라 화이트밸런스를 곱해 [0, 1]로 자른 뒤
-    /// 복원하고 다시 나눈다. 그래서 포화한 화소는 카메라 화이트밸런스 기준으로 잘린다
-    /// (현상 단계도 화이트밸런스를 곱한 뒤 1.0에서 자른다).
+    /// Camera RGB after RCD demosaicing. Linear, with sensor saturation at 1.0, cropped to the
+    /// output area. RCD assumes white-balanced input, so the data is multiplied by the camera white
+    /// balance, clipped to [0, 1], demosaiced, and divided back. Saturated pixels are therefore
+    /// clipped relative to the camera white balance (development also clips at 1.0 after applying
+    /// white balance).
     pub fn demosaic(&self) -> Result<Image> {
         let sensor = self.sensor();
         let (w, h) = (sensor.width, sensor.height);
@@ -69,7 +73,7 @@ impl Raw {
         Ok(image)
     }
 
-    /// 센서 전체의 CFA와 배치, 출력 영역.
+    /// The full-sensor CFA, its layout, and the output area.
     pub fn sensor(&self) -> Sensor<'_> {
         let (x, y, w, h) = self.crop_area();
         Sensor {
@@ -84,7 +88,7 @@ impl Raw {
         }
     }
 
-    /// 출력 영역 (x, y, 가로, 세로), 센서 좌표.
+    /// Output area (x, y, width, height) in sensor coordinates.
     fn crop_area(&self) -> (usize, usize, usize, usize) {
         match self.image.crop_area.or(self.image.active_area) {
             Some(area) => (area.p.x, area.p.y, area.d.w, area.d.h),
@@ -92,11 +96,12 @@ impl Raw {
         }
     }
 
-    /// 비교용: rawler의 PPG 디모자익 (예전에 쓰던 것).
+    /// For comparison: rawler's PPG demosaic (the one used previously).
     #[cfg(test)]
     pub fn demosaic_ppg_for_tests(&self) -> Result<Image> {
         use rawler::imgop::develop::{Intermediate, ProcessingStep, RawDevelop};
-        // 화이트밸런스와 색행렬은 develop 단계에서 직접 적용하므로 여기서는 디모자익과 크롭까지만 한다.
+        // White balance and the color matrix are applied directly in the develop stage, so only
+        // demosaic and crop happen here.
         let steps = [
             ProcessingStep::Demosaic,
             ProcessingStep::CropActiveArea,
@@ -119,7 +124,8 @@ impl Raw {
         })
     }
 
-    /// AI 노이즈 제거 모델의 입력. 센서 전체를 RGGB 4채널로 묶은 것이고 값은 0..1이다.
+    /// Input for the AI denoising model: the full sensor packed into 4 RGGB channels, values in
+    /// 0..1.
     pub fn packed_bayer(&self) -> Packed {
         let (ox, oy) = self.rggb_offset;
         let mut packed = pack_rggb(
@@ -137,13 +143,13 @@ impl Raw {
         packed
     }
 
-    /// `packed_bayer`로 만든 모델 출력(센서 전체 크기)을 `demosaic`과 같은 영역으로 자른다.
-    /// 모델 출력의 (0, 0)은 센서의 첫 R 화소 자리다.
+    /// Crops the model output made from `packed_bayer` (full sensor size) to the same area as
+    /// `demosaic`. The model output's (0, 0) is at the sensor's first R pixel.
     pub fn crop_model_output(&self, full: &Image) -> Result<Image> {
         self.crop(full, self.rggb_offset)
     }
 
-    /// 센서의 `origin` 자리에서 시작하는 그림 `full`을 출력 영역으로 자른다.
+    /// Crops the image `full`, which starts at the sensor position `origin`, to the output area.
     fn crop(&self, full: &Image, (ox, oy): (usize, usize)) -> Result<Image> {
         let (x, y, w, h) = self.crop_area();
         if x < ox || y < oy || x - ox + w > full.width || y - oy + h > full.height {
@@ -169,7 +175,7 @@ impl Raw {
     }
 }
 
-/// 2×2 Bayer 배치에서 R 화소의 위치 (x, y). RGB Bayer가 아니면 None.
+/// Position (x, y) of the R pixel in a 2×2 Bayer layout. None if not an RGB Bayer.
 fn rggb_offset(cfa: &CFA) -> Option<(usize, usize)> {
     if cfa.width != 2 || cfa.height != 2 {
         return None;
@@ -184,7 +190,7 @@ fn rggb_offset(cfa: &CFA) -> Option<(usize, usize)> {
         })
 }
 
-/// RAW 파일 안에 들어 있는 미리보기 JPEG를 바로 세워서 돌려준다. 없으면 None.
+/// Returns the preview JPEG embedded in the RAW file, rotated upright. None if there is none.
 pub fn embedded_preview(path: &Path) -> Result<Option<image::DynamicImage>> {
     let source = RawSource::new(path)?;
     let decoder = decoder(&source)?;
@@ -209,14 +215,15 @@ pub fn embedded_preview(path: &Path) -> Result<Option<image::DynamicImage>> {
     }))
 }
 
-/// 센서의 가로·세로 화소 수. 화소 데이터를 풀지 않고 헤더만 읽는다 (메모리 사용량을 미리 가늠하는 데 쓴다).
+/// Sensor width and height in pixels. Reads only the header without decoding pixel data (used to
+/// estimate memory use in advance).
 pub fn sensor_size(path: &Path) -> Result<(usize, usize)> {
     let source = RawSource::new(path)?;
     let image = decoder(&source)?.raw_image(&source, &RawDecodeParams::default(), true)?;
     Ok((image.width, image.height))
 }
 
-/// 파일 형식에 맞는 디코더를 찾는다.
+/// Finds the decoder for the file format.
 fn decoder(source: &RawSource) -> Result<Box<dyn rawler::decoders::Decoder>> {
     rawler::get_decoder(source).map_err(|e| {
         text!(
@@ -227,12 +234,12 @@ fn decoder(source: &RawSource) -> Result<Box<dyn rawler::decoders::Decoder>> {
     })
 }
 
-/// 프레임에 적을 촬영 정보를 꺼낸다.
+/// Extracts the shooting information to print on the frame.
 fn shot(metadata: &rawler::decoders::RawMetadata) -> Shot {
     let exif = &metadata.exif;
     let ratio = |r: &rawler::formats::tiff::Rational| (r.d != 0).then(|| r.n as f32 / r.d as f32);
     let (make, model) = (metadata.make.trim(), metadata.model.trim());
-    // 기종 이름에 제조사가 이미 들어 있으면(예: "Canon EOS R5") 되풀이하지 않는다.
+    // Don't repeat the maker if the model name already contains it (e.g. "Canon EOS R5").
     let camera = if model.to_lowercase().starts_with(&make.to_lowercase()) {
         model.to_owned()
     } else {
@@ -286,7 +293,8 @@ pub fn decode(path: &Path) -> Result<Raw> {
         [wb[0] / wb[1], 1.0, wb[2] / wb[1]]
     };
 
-    // ponytail: D65 행렬만 쓴다. 다른 광원 행렬만 있는 카메라가 나오면 Bradford 변환을 추가.
+    // ponytail: only the D65 matrix is used. Add a Bradford transform if a camera turns up with
+    // only other illuminant matrices.
     let m = image
         .color_matrix
         .get(&Illuminant::D65)
@@ -297,7 +305,7 @@ pub fn decode(path: &Path) -> Result<Raw> {
         ))?;
     let xyz_to_cam = [0, 1, 2].map(|i| [m[i * 3], m[i * 3 + 1], m[i * 3 + 2]]);
 
-    // rawler의 `RawImage::orientation`은 항상 Normal이다. 실제 방향은 EXIF에 있다.
+    // rawler's `RawImage::orientation` is always Normal. The real orientation is in the EXIF.
     let flips = Orientation::from_u16(metadata.exif.orientation.unwrap_or(1)).to_flips();
     metadata.exif.orientation = Some(1);
     let mut exif = Cursor::new(Vec::new());
@@ -367,7 +375,7 @@ mod tests {
         assert_eq!(raw.xyz_to_cam[0], [0.5209, -0.1072, -0.0397]);
         assert!(
             raw.flips.0,
-            "세로로 찍은 사진이라 전치가 필요하다: {:?}",
+            "a portrait shot needs a transpose: {:?}",
             raw.flips
         );
 
@@ -375,14 +383,14 @@ mod tests {
         let has = |needle: &[u8]| raw.exif.windows(needle.len()).any(|w| w == needle);
         assert!(has(b"DSLR-A900") && has(b"2026:11:07 13:27:19"));
 
-        // 센서는 6080×4048이고 카메라 JPG와 같은 6048×4032로 크롭된다.
+        // The sensor is 6080×4048 and is cropped to 6048×4032, the same as the camera JPG.
         let cam = raw.demosaic().unwrap();
         assert_eq!((cam.width, cam.height), (6048, 4032));
         let mean = |p: &[f32]| p.iter().sum::<f32>() / p.len() as f32;
         let green = mean(&cam.planes[1]);
-        assert!(green > 0.005 && green < 0.6, "평균 {green}");
+        assert!(green > 0.005 && green < 0.6, "mean {green}");
 
-        // 모델 입력은 센서 전체의 절반 크기다.
+        // The model input is half the size of the full sensor.
         let packed = raw.packed_bayer();
         assert_eq!((packed.width, packed.height), (3040, 2024));
         assert!(
@@ -392,13 +400,13 @@ mod tests {
                 .flatten()
                 .all(|v| (0.0..=1.0).contains(v))
         );
-        // 두 G 채널은 거의 같고, 화이트밸런스 전이라 G가 R과 B보다 밝다.
+        // The two G channels are nearly equal, and before white balance G is brighter than R and B.
         let [r, g1, g2, b] = [0, 1, 2, 3].map(|c| mean(&packed.planes[c]));
         assert!((g1 - g2).abs() < 0.02 * g1, "G1 {g1} G2 {g2}");
         assert!(g1 > r && g1 > b, "R {r} G {g1} B {b}");
 
-        // 모델 출력을 자르면 일반 디모자익과 같은 영역이 된다:
-        // R 화소 자리에서는 디모자익 결과의 R이 센서 값 그대로다.
+        // Cropping the model output gives the same area as the regular demosaic:
+        // at R pixel sites, the demosaiced R equals the sensor value.
         let full = Image {
             width: packed.width * 2,
             height: packed.height * 2,
@@ -432,7 +440,7 @@ mod tests {
         let ours = raw.demosaic().unwrap();
         let ppg = raw.demosaic_ppg_for_tests().unwrap();
         assert_eq!((ours.width, ours.height), (ppg.width, ppg.height));
-        // 초록 평면의 상관이 제자리에서 가장 높아야 한다 (한 화소라도 밀리면 낮아진다).
+        // Green-plane correlation must peak at zero offset (it drops with even a one-pixel shift).
         let corr = |dx: isize, dy: isize| {
             let (w, h) = (ours.width as isize, ours.height as isize);
             let (mut sab, mut saa, mut sbb) = (0f64, 0f64, 0f64);
@@ -451,7 +459,7 @@ mod tests {
         for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
             assert!(here > corr(dx, dy), "({dx}, {dy}): {here} {}", corr(dx, dy));
         }
-        // 색은 PPG와 거의 같다 (평균 절대 차이).
+        // Colors are nearly the same as PPG (mean absolute difference).
         for c in 0..3 {
             let diff = ours.planes[c]
                 .iter()
@@ -475,7 +483,8 @@ mod tests {
         assert_eq!((sensor.width, sensor.height), (6080, 4048));
         assert_eq!(sensor.cfa.len(), sensor.width * sensor.height);
         assert_eq!(sensor.red, raw.rggb_offset);
-        // 잘린 그림의 (0, 0)은 센서의 crop 자리다: 그 화소의 제 색 값이 센서 값과 같다.
+        // (0, 0) of the cropped image is at the sensor's crop position: that pixel's own-color
+        // value equals the sensor value.
         let (cx, cy) = (sensor.crop.0, sensor.crop.1);
         let colour = |x: usize, y: usize| match ((x + sensor.red.0) % 2, (y + sensor.red.1) % 2) {
             (0, 0) => 0,
@@ -506,6 +515,6 @@ mod tests {
             (Some(55.0), Some(2.8), Some((1, 60)), Some(200))
         );
         assert_eq!(shot.date.as_deref(), Some("2026:11:07 13:27:19"));
-        eprintln!("렌즈: {:?}", shot.lens);
+        eprintln!("lens: {:?}", shot.lens);
     }
 }

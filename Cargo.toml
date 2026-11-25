@@ -2,7 +2,7 @@
 name = "amsil"
 version = "0.3.0"
 edition = "2024"
-description = "RAW 사진을 HEIF로 변환하는 도구"
+description = "A tool for converting RAW photos to HEIF"
 license = "GPL-3.0-or-later"
 rust-version = "1.95"
 publish = false
@@ -24,7 +24,7 @@ toml = "1"
 [dev-dependencies]
 egui_kittest = { version = "0.37", features = ["wgpu"] }
 
-# 이미지 처리 코드는 최적화 없이는 테스트조차 너무 느리다.
+# Image-processing code is too slow even for tests without optimization.
 [profile.dev]
 opt-level = 1
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""캡처 샤픈 조건마다 선예도·노이즈·넘침·용량을 카메라 JPEG와 견준다.
+"""Compare sharpness, noise, overshoot, and file size against the camera JPEG for each capture-sharpening condition.
 
     cargo test --release -- --ignored render_for_sharpness_measurement
-    python3 scripts/sharpness/measure.py [폴더]
+    python3 scripts/sharpness/measure.py [folder]
 """
 import sys
 
@@ -13,7 +13,7 @@ from common import HIGH_ISO, PHOTOS, band, camera_jpeg, curve, data_dir, load_ra
 
 
 def overshoot(sharp, plain):
-    """경계 둘레에서 샤픈 전 5×5의 최댓값·최솟값을 넘은 정도: (평균×1000, 0.02 넘는 화소 %)."""
+    """Overshoot near edges beyond the pre-sharpening 5x5 max/min: (mean x 1000, % of pixels over 0.02)."""
     pad = np.pad(plain, 2, mode="edge")
     windows = np.lib.stride_tricks.sliding_window_view(pad, (5, 5))
     hi, lo = windows.max(axis=(-1, -2)), windows.min(axis=(-1, -2))
@@ -30,15 +30,15 @@ def main():
     seconds = {(r[0], r[1]): float(r[3]) for r in rows}
     auto = {r[0]: (r[4], r[5]) for r in rows}
     totals = {c: [] for c in conditions}
-    header = f"  {'조건':16s} {'세부/카메라':>10s} {'압축 후':>8s} {'평평/끔':>8s} {'넘침':>6s} {'넘침%':>6s} {'용량':>6s}"
+    header = f"  {'condition':16s} {'detail/cam':>10s} {'encoded':>8s} {'flat/off':>8s} {'over':>6s} {'over%':>6s} {'size':>6s}"
     for name in PHOTOS:
         camera = luma(camera_jpeg(name))
         plain = luma(load_raw(folder / f"{name}-off-pre.raw"))
         detail, flat = split(plain)
         cam = band(curve(camera, plain, detail), 0.15, 0.35)
-        note = " (고감도: 카메라가 노이즈를 지워 비교가 맞지 않음, 평균에서 뺌)" if name in HIGH_ISO else ""
-        print(f"\n{name} (자동 반경 {auto[name][0]}, 자동 문턱 {auto[name][1]}) — 카메라 JPEG의 세부: 샤픈 없는 현상의 {cam:.2f}배{note}")
-        print(header + f" {'시간':>6s}")
+        note = " (high ISO: camera noise reduction makes the comparison invalid; excluded from the mean)" if name in HIGH_ISO else ""
+        print(f"\n{name} (auto radius {auto[name][0]}, auto threshold {auto[name][1]}) - camera JPEG detail: {cam:.2f}x the unsharpened render{note}")
+        print(header + f" {'time':>6s}")
         for c in conditions:
             pre = luma(load_raw(folder / f"{name}-{c}-pre.raw"))
             post = luma(load_raw(folder / f"{name}-{c}-post.raw"))
@@ -53,7 +53,7 @@ def main():
             print(f"  {c:16s} {d:10.2f} {p:8.2f} {n:8.2f} {o:6.2f} {f:6.1f} {s:5.0f}% {seconds[(name, c)]:5.1f}s")
             if name not in HIGH_ISO:
                 totals[c].append(values)
-    print(f"\n평균 (고감도 사진 {', '.join(sorted(HIGH_ISO))}를 뺀 {len(PHOTOS) - len(HIGH_ISO)}장)")
+    print(f"\nMean ({len(PHOTOS) - len(HIGH_ISO)} photos, excluding high-ISO {', '.join(sorted(HIGH_ISO))})")
     print(header)
     for c in conditions:
         d, p, n, o, f, s = np.mean(totals[c], axis=0)

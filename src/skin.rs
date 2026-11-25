@@ -1,8 +1,10 @@
-//! 인물 피부 보정 (실험 기능): 피부를 자동으로 찾아, 그 안에서만 얼룩과 고르지 않은 톤을 누그러뜨린다.
+//! Portrait skin retouch (experimental): finds skin automatically and softens blemishes and uneven
+//! tone only within it.
 //!
-//! 피부를 찾는 일은 MediaPipe selfie multiclass 모델이 한다 (256×256 격자). 보정은 신경망이 아니라
-//! 흐림 두 번의 차이로 한다: 가는 결(모공, 잔털)과 큰 명암(얼굴의 입체감)은 남기고, 그 사이 크기의
-//! 얼룩만 줄인다. 눈·입술 같은 뚜렷한 윤곽은 차이가 커서 건드리지 않는다.
+//! Finding skin is done by the MediaPipe selfie multiclass model (256×256 grid). The retouch is not
+//! a neural network but the difference of two blurs: fine texture (pores, fine hair) and broad
+//! shading (the face's form) are kept, and only blemishes of the size in between are reduced.
+//! Distinct edges such as eyes and lips differ too much to be touched.
 
 use crate::develop::box_blur;
 use crate::lang::{Text, text};
@@ -14,18 +16,20 @@ use ort::value::TensorRef;
 use rayon::prelude::*;
 use std::path::Path;
 
-/// 모델 폴더 안에서 피부를 찾는 모델의 위치.
+/// Location of the skin model inside the model folder.
 pub const MODEL: &str = "selfie-multiclass/model.onnx";
 
-/// 모델 입력과 출력 격자의 한 변 (화소).
+/// One side of the model's input and output grid (pixels).
 const SIDE: usize = 256;
-/// 모델이 화소마다 내는 분류의 수: 배경, 머리카락, 몸의 피부, 얼굴의 피부, 옷, 그 밖.
+/// Number of classes the model outputs per pixel: background, hair, body skin, face skin, clothes,
+/// other.
 const CLASSES: usize = 6;
-/// 그 가운데 피부인 것.
+/// Those among them that are skin.
 const SKIN: [usize; 2] = [2, 3];
 
-/// 그림 전체를 256×256으로 맞춘다 (비율을 지키지 않고 늘이거나 줄인다. 모델이 그렇게 배웠다).
-/// 값은 0~1이고 화소마다 R, G, B 순서로 늘어놓는다.
+/// Fits the whole image to 256×256 (stretched or shrunk without keeping the aspect ratio, as the
+/// model was trained).
+/// Values are 0–1, laid out per pixel in R, G, B order.
 fn preprocess(picture: &Pixels) -> Vec<f32> {
     let (w, h) = (picture.width, picture.height);
     let mut input = vec![0.0; SIDE * SIDE * 3];
@@ -46,7 +50,7 @@ fn preprocess(picture: &Pixels) -> Vec<f32> {
     input
 }
 
-/// 화소 하나의 분류 점수(로짓 6개)에서 "피부인가"의 로짓을 구한다.
+/// Computes the "is it skin" logit from one pixel's class scores (6 logits).
 fn skin_logit(scores: &[f32]) -> f32 {
     let top = scores.iter().copied().fold(f32::MIN, f32::max);
     let total: f32 = scores.iter().map(|score| (score - top).exp()).sum();
@@ -55,7 +59,7 @@ fn skin_logit(scores: &[f32]) -> f32 {
     (p / (1.0 - p)).ln()
 }
 
-/// 사진에서 피부(얼굴과 몸)를 찾는 모델.
+/// A model that finds skin (face and body) in a photo.
 pub struct SkinFinder {
     session: Session,
 }
@@ -67,7 +71,7 @@ impl SkinFinder {
         })
     }
 
-    /// 피부일 가능성을 256×256 격자의 로짓으로 돌려준다. 격자는 그림 전체를 덮는다.
+    /// Returns the likelihood of skin as logits on a 256×256 grid. The grid covers the whole image.
     pub fn find(&mut self, picture: &Pixels) -> Result<Low> {
         let input = preprocess(picture);
         let input = TensorRef::from_array_view(([1, SIDE, SIDE, 3], input.as_slice()))?;
@@ -88,7 +92,7 @@ impl SkinFinder {
     }
 }
 
-/// 모델 폴더에서 피부를 찾는 모델을 읽는다. 모델 파일이 없으면 받는 방법을 알려 준다.
+/// Loads the skin model from the model folder. If the model file is missing, says how to get it.
 pub fn load_finder() -> Result<SkinFinder> {
     match missing() {
         Some(problem) => Err(problem.into()),
@@ -96,7 +100,7 @@ pub fn load_finder() -> Result<SkinFinder> {
     }
 }
 
-/// 피부를 찾는 모델이 없으면 그 사실과 받는 방법을 알리는 문구. 있으면 None.
+/// If the skin model is missing, a message saying so and how to get it. None if present.
 pub fn missing() -> Option<Text> {
     let path = crate::gpu::model_dir().join(MODEL);
     if path.exists() {
@@ -113,19 +117,21 @@ pub fn missing() -> Option<Text> {
     ))
 }
 
-/// 피부 영역(`alpha`, 0~1) 안에서 중간 크기의 얼룩을 `strength`(0~1)만큼 누그러뜨린다.
-// ponytail: 흐림 두 번의 차이를 빼는 단순한 방식이다. 뚜렷한 윤곽 바로 옆에는 옅은 번짐이 남을 수 있다.
-// 거슬리면 윤곽을 보존하는 필터(guided filter 등)로 바꾼다.
+/// Softens mid-sized blemishes by `strength` (0–1) within the skin area (`alpha`, 0–1).
+// ponytail: a simple method that subtracts the difference of two blurs. A faint halo may remain
+// right next to distinct edges.
+// If it bothers, switch to an edge-preserving filter (guided filter etc.).
 pub fn smooth(image: &mut Image, alpha: &[f32], strength: f32) {
-    /// 얼룩으로 보는 가장 큰 크기 (피부 넓이의 제곱근에 대한 비율).
+    /// The largest size seen as a blemish (ratio to the square root of the skin area).
     const COARSE: f32 = 0.06;
-    /// 그대로 남기는 가는 결의 크기 (큰 쪽의 몇 분의 일).
+    /// Size of the fine texture kept as is (a fraction of the larger size).
     const FINE: f32 = 1.0 / 8.0;
-    /// 이보다 큰 밝기 차이는 얼룩이 아니라 윤곽(눈, 입술, 머리카락)으로 본다.
+    /// A lightness difference larger than this is an edge (eyes, lips, hair), not a blemish.
     const EDGE: f32 = 0.06;
 
     let (w, h) = (image.width, image.height);
-    // 모델은 사람이 없는 곳에도 옅은 값(몇 %)을 낸다. 확실한 곳만 피부로 친다: 0.4 아래는 0, 0.8 위는 1.
+    // The model gives faint values (a few %) even where there is no person. Count only sure areas
+    // as skin: below 0.4 is 0, above 0.8 is 1.
     let alpha: Vec<f32> = alpha
         .par_iter()
         .map(|alpha| ((alpha - 0.4) / 0.4).clamp(0.0, 1.0))
@@ -134,10 +140,10 @@ pub fn smooth(image: &mut Image, alpha: &[f32], strength: f32) {
     if strength <= 0.0 || skin <= 0.0 {
         return;
     }
-    // 얼굴이 크게 찍혔으면 얼룩도 크다. 피부가 차지하는 넓이로 크기를 가늠한다.
+    // A face shot large has large blemishes too. Gauge the size from the area skin covers.
     let coarse = (COARSE * skin.sqrt() * w.min(h) as f32).round().max(2.0) as usize;
     let fine = (coarse as f32 * FINE).round().max(1.0) as usize;
-    // 중간 크기의 변화만 남긴 것: 가늘게 흐린 것 - 굵게 흐린 것
+    // Only mid-sized variation: lightly blurred - heavily blurred
     let band = |plane: &[f32]| -> Vec<f32> {
         let mut band = box_blur(plane, w, h, fine, 2);
         let wide = box_blur(plane, w, h, coarse, 2);
@@ -146,7 +152,8 @@ pub fn smooth(image: &mut Image, alpha: &[f32], strength: f32) {
             .for_each(|(band, wide)| *band -= wide);
         band
     };
-    // 밝기에서 변화가 작은 곳만 고른다 (세 채널에 같은 정도로 적용해야 색이 틀어지지 않는다).
+    // Pick only places with small variation in lightness (it must apply equally to all three
+    // channels so colours don't shift).
     let luma: Vec<f32> = (0..w * h)
         .into_par_iter()
         .map(|i| {
@@ -175,7 +182,7 @@ mod tests {
 
     #[test]
     fn the_whole_picture_is_stretched_to_the_model_size() {
-        // 왼쪽 절반은 희고 오른쪽 절반은 검은, 가로로 긴 그림
+        // A wide image, white on the left half and black on the right half
         let (w, h) = (512, 100);
         let mut picture = Pixels {
             width: w,
@@ -194,7 +201,7 @@ mod tests {
         assert_eq!(
             pixel(127, 255),
             [1.0; 3],
-            "자르지 않고 늘인다: 가운데까지가 흰색"
+            "stretched, not cropped: white up to the middle"
         );
         assert_eq!(pixel(128, 0), [0.0; 3]);
         assert_eq!(pixel(255, 255), [0.0; 3]);
@@ -202,37 +209,37 @@ mod tests {
 
     #[test]
     fn skin_is_face_plus_body_against_everything_else() {
-        // 순서: 배경, 머리카락, 몸의 피부, 얼굴의 피부, 옷, 그 밖
-        assert!(skin_logit(&[0.0, 0.0, 0.0, 9.0, 0.0, 0.0]) > 4.0, "얼굴");
-        assert!(skin_logit(&[0.0, 0.0, 9.0, 0.0, 0.0, 0.0]) > 4.0, "몸");
-        assert!(skin_logit(&[9.0, 0.0, 0.0, 0.0, 0.0, 0.0]) < -4.0, "배경");
+        // Order: background, hair, body skin, face skin, clothes, other
+        assert!(skin_logit(&[0.0, 0.0, 0.0, 9.0, 0.0, 0.0]) > 4.0, "face");
+        assert!(skin_logit(&[0.0, 0.0, 9.0, 0.0, 0.0, 0.0]) > 4.0, "body");
         assert!(
-            skin_logit(&[0.0, 9.0, 0.0, 0.0, 0.0, 0.0]) < -4.0,
-            "머리카락"
+            skin_logit(&[9.0, 0.0, 0.0, 0.0, 0.0, 0.0]) < -4.0,
+            "background"
         );
-        // 얼굴인지 몸인지는 갈려도 피부인 것은 분명한 경우
+        assert!(skin_logit(&[0.0, 9.0, 0.0, 0.0, 0.0, 0.0]) < -4.0, "hair");
+        // Split between face and body, but clearly skin
         assert!(skin_logit(&[0.0, 0.0, 9.0, 9.0, 0.0, 0.0]) > 4.0);
-        // 반반이면 0
+        // Half and half gives 0
         assert!(skin_logit(&[5.0, 0.0, -20.0, 5.0, -20.0, -20.0]).abs() < 0.1);
         assert!(skin_logit(&[-50.0, -50.0, 50.0, 50.0, -50.0, -50.0]).is_finite());
     }
 
-    /// 시험용 얼굴 피부: 고른 바탕에 가는 결, 중간 크기의 얼룩, 뚜렷한 윤곽이 있다.
+    /// Test face skin: an even base with fine texture, a mid-sized blemish, and a distinct edge.
     fn patch() -> Image {
         let (w, h) = (200, 200);
         let plane: Vec<f32> = (0..w * h)
             .map(|i| {
                 let (x, y) = ((i % w) as f32, (i / w) as f32);
-                // 가는 결: 한 화소마다 번갈아 ±0.01
+                // Fine texture: alternating ±0.01 per pixel
                 let grain = if (i % w + i / w) % 2 == 0 {
                     0.01
                 } else {
                     -0.01
                 };
-                // 얼룩: (60, 100)에 반지름 5쯤, 깊이 0.04의 어두운 점
+                // Blemish: a dark spot at (60, 100), radius about 5, depth 0.04
                 let d2 = (x - 60.0).powi(2) + (y - 100.0).powi(2);
                 let blotch = -0.04 * (-d2 / (2.0 * 3.0 * 3.0)).exp();
-                // 윤곽: 150열부터 훨씬 어둡다 (눈썹이나 머리카락)
+                // Edge: much darker from column 150 (eyebrow or hair)
                 let edge = if x >= 150.0 { -0.3 } else { 0.0 };
                 0.6 + grain + blotch + edge
             })
@@ -244,7 +251,7 @@ mod tests {
         }
     }
 
-    /// 한 점 둘레(반지름 1)의 평균. 가는 결을 지우고 그 자리의 밝기를 본다.
+    /// Mean around a point (radius 1). Removes the fine texture to see the lightness there.
     fn level(image: &Image, x: usize, y: usize) -> f32 {
         let mut sum = 0.0;
         for dy in 0..3 {
@@ -261,7 +268,7 @@ mod tests {
         let mut after = patch();
         smooth(&mut after, &vec![1.0; 200 * 200], 1.0);
 
-        // 얼룩: 둘레(60, 70)와 견준 깊이가 절반 아래로 준다.
+        // Blemish: depth relative to the surroundings (60, 70) drops below half.
         let depth = |image: &Image| level(image, 60, 70) - level(image, 60, 100);
         assert!(depth(&before) > 0.03, "{}", depth(&before));
         assert!(
@@ -270,11 +277,11 @@ mod tests {
             depth(&before),
             depth(&after)
         );
-        // 가는 결: 이웃한 화소의 차이(0.02)가 거의 그대로다.
+        // Fine texture: the difference between neighbouring pixels (0.02) is nearly unchanged.
         let grain =
             |image: &Image| (image.planes[1][30 * 200 + 30] - image.planes[1][30 * 200 + 31]).abs();
         assert!(grain(&after) > grain(&before) * 0.9, "{}", grain(&after));
-        // 윤곽: 149열과 150열의 차이(0.3)가 거의 그대로다.
+        // Edge: the difference between columns 149 and 150 (0.3) is nearly unchanged.
         let step = |image: &Image| level(image, 147, 40) - level(image, 152, 40);
         assert!(
             step(&after) > step(&before) * 0.9,
@@ -287,7 +294,7 @@ mod tests {
     #[test]
     fn smoothing_stays_inside_the_skin_and_follows_the_strength() {
         let before = patch();
-        // 피부가 아닌 곳은 그대로다.
+        // Non-skin areas are unchanged.
         let mut outside = patch();
         let alpha: Vec<f32> = (0..200 * 200)
             .map(|i| if i / 200 < 80 { 1.0 } else { 0.0 })
@@ -297,22 +304,23 @@ mod tests {
             outside.planes[0][100 * 200 + 60],
             before.planes[0][100 * 200 + 60]
         );
-        // 모델이 사람이 없는 곳에 내는 옅은 값(피부일 가능성 30%)으로는 아무것도 바뀌지 않는다.
+        // The faint value the model gives where there is no person (30% skin likelihood) changes
+        // nothing.
         let mut faint = patch();
         smooth(&mut faint, &vec![0.3; 200 * 200], 1.0);
         assert_eq!(faint.planes, before.planes);
-        // 세기가 0이면 아무것도 바뀌지 않는다.
+        // Strength 0 changes nothing.
         let mut none = patch();
         smooth(&mut none, &vec![1.0; 200 * 200], 0.0);
         assert_eq!(none.planes, before.planes);
-        // 세기가 절반이면 절반쯤만 준다.
+        // Half strength reduces only about half.
         let (mut half, mut full) = (patch(), patch());
         smooth(&mut half, &vec![1.0; 200 * 200], 0.5);
         smooth(&mut full, &vec![1.0; 200 * 200], 1.0);
         let moved = |image: &Image| level(image, 60, 100) - level(&before, 60, 100);
         assert!(
             (moved(&half) - moved(&full) / 2.0).abs() < 0.002,
-            "{} 대 {}",
+            "{} vs {}",
             moved(&half),
             moved(&full)
         );
@@ -320,42 +328,43 @@ mod tests {
 
     #[test]
     fn real_photos_show_skin_only_where_people_are() {
-        // 모델과 샘플 사진이 있을 때만 돈다.
+        // Runs only when the model and sample photos are present.
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("DCIM");
         let Ok(mut finder) = load_finder() else {
-            eprintln!("피부를 찾는 모델이 없어 건너뜀");
+            eprintln!("no skin model, skipping");
             return;
         };
         if !dir.exists() {
-            eprintln!("샘플 사진이 없어 건너뜀");
+            eprintln!("no sample photos, skipping");
             return;
         }
         let share = |file: &str, finder: &mut SkinFinder| {
             let picture = crate::preview::thumbnail(&dir.join(file), 1024)
                 .unwrap()
-                .expect("미리보기가 없다");
+                .expect("no preview");
             let started = std::time::Instant::now();
             let low = finder.find(&picture).unwrap();
-            eprintln!("{file}: 피부 찾기 {:.0?}", started.elapsed());
+            eprintln!("{file}: skin detection {:.0?}", started.elapsed());
             assert_eq!((low.width, low.height), (SIDE, SIDE));
             low.logits.iter().filter(|&&v| v > 0.0).count() as f32 / low.logits.len() as f32
         };
         let person = share("10161107/DSC04367.ARW", &mut finder);
         let buildings = share("10361110/DSC04551.ARW", &mut finder);
-        // 전신 사진이라 피부(얼굴과 팔)는 화면의 1%쯤이다.
+        // A full-body photo, so skin (face and arms) is about 1% of the frame.
         assert!(
             (0.003..0.3).contains(&person),
-            "인물 사진의 피부 비율 {person}"
+            "skin ratio of the portrait {person}"
         );
         assert!(
             buildings < person / 3.0,
-            "건물 사진의 피부 비율 {buildings} (인물 사진은 {person})"
+            "skin ratio of the building photo {buildings} (portrait: {person})"
         );
     }
 
-    /// 눈으로 확인하기 위한 전후 그림을 `target/ui/`에 남긴다. `cargo test -- --ignored render_skin`
+    /// Leaves before/after images in `target/ui/` for checking by eye.
+    /// `cargo test -- --ignored render_skin`
     #[test]
-    #[ignore = "모델과 샘플 사진이 필요하고, 그림 파일을 남기는 용도"]
+    #[ignore = "needs the model and sample photos, and leaves image files"]
     fn render_skin() {
         use crate::export::{Areas, Look};
         let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/ui");
@@ -380,8 +389,12 @@ mod tests {
             let before = loaded.develop(&loaded.cam, Look::new(&params), &Areas::default());
             let started = std::time::Instant::now();
             let after = loaded.develop(&loaded.cam, look, &areas);
-            eprintln!("{file}: 피부 보정을 켠 현상 {:.2?}", started.elapsed());
-            // 피부가 뚜렷한 곳을 가운데로 600×600을 잘라 전후를 나란히 놓는다 (사진의 위쪽 절반에서 찾는다).
+            eprintln!(
+                "{file}: develop with skin retouch {:.2?}",
+                started.elapsed()
+            );
+            // Crop 600×600 centred on a clear skin area and place before and after side by side
+            // (searched in the top half of the photo).
             let alpha = crate::mask::upscale(areas.skin.as_ref().unwrap(), &before, false);
             let (w, h) = (before.width, before.height);
             let (mut sx, mut sy, mut total) = (0.0f64, 0.0f64, 0.0f64);
@@ -392,7 +405,7 @@ mod tests {
                     total += *a as f64;
                 }
             }
-            assert!(total > 0.0, "{file}: 피부를 찾지 못했다");
+            assert!(total > 0.0, "{file}: no skin found");
             let (cx, cy) = ((sx / total) as usize, (sy / total) as usize);
             let side = 600;
             let (x0, y0) = (

@@ -1,9 +1,9 @@
-//! 실행 파일을 직접 돌려, 일어난 일이 로그 파일에 남는지 본다.
+//! Runs the executable directly to check that what happened is recorded in the log file.
 
 use std::path::Path;
 use std::process::Command;
 
-/// 임시 폴더를 설정·상태 폴더로 삼아 실행한다. 로그 파일의 내용을 돌려준다.
+/// Runs with a temp folder as the config and state folder. Returns the log file's contents.
 fn run(dir: &Path, args: &[&str]) -> String {
     let status = Command::new(env!("CARGO_BIN_EXE_amsil"))
         .args(args)
@@ -15,11 +15,12 @@ fn run(dir: &Path, args: &[&str]) -> String {
         .output()
         .unwrap()
         .status;
-    assert!(!status.success(), "이 테스트의 실행은 모두 실패해야 한다");
+    assert!(!status.success(), "every run in this test must fail");
     std::fs::read_to_string(dir.join("state/amsil/log.txt")).unwrap()
 }
 
-/// 경로를 뺀 나머지에 한글이 없는가. 경로(사진 이름)는 사용자가 정한 것이라 한글일 수 있다.
+/// Whether the text has no Korean apart from the paths. Paths (photo names) are chosen by the user,
+/// so they may be Korean.
 fn english_apart_from(log: &str, paths: &[&Path]) -> bool {
     let mut rest = log.to_owned();
     for path in paths {
@@ -33,11 +34,12 @@ fn failures_are_written_to_the_log_file_in_english() {
     let dir = std::env::temp_dir().join(format!("amsil-logtest-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("photos")).unwrap();
-    // RAW가 아닌 내용이 든 파일
+    // A file whose content is not RAW
     std::fs::write(dir.join("photos/broken.ARW"), [0x5a; 4096]).unwrap();
     let (photos, out) = (dir.join("photos"), dir.join("out"));
 
-    // 폴더 변환: 시작, 실패한 사진과 이유, 요약이 남는다. 화면이 한국어여도 로그는 영어다.
+    // Folder export: the start, each failed photo with its reason, and a summary are recorded. The
+    // log is English even when the screen is in Korean.
     let log = run(&dir, &[photos.to_str().unwrap(), out.to_str().unwrap()]);
     assert!(
         log.contains("[info] Amsil ") && log.contains("started"),
@@ -53,7 +55,7 @@ fn failures_are_written_to_the_log_file_in_english() {
     assert!(log.contains("done 0, skipped 0, failed 1"), "{log}");
     assert!(english_apart_from(&log, &[&dir]), "{log}");
 
-    // 한 장 변환의 실패도 남고, 앞의 기록 뒤에 이어 쓴다.
+    // A single-photo export failure is recorded too, appended after the earlier entries.
     let missing = dir.join("없는 사진.ARW");
     let log = run(
         &dir,
@@ -62,12 +64,12 @@ fn failures_are_written_to_the_log_file_in_english() {
             out.join("x.heic").to_str().unwrap(),
         ],
     );
-    // 잘못 쓴 옵션도 남는다.
+    // A mistyped option is recorded too.
     let log_after_bad_option = run(&dir, &["--nope", "in", "out"]);
     std::fs::remove_dir_all(&dir).unwrap();
     assert!(
         log.contains("Export started: 1 photos"),
-        "앞의 기록이 지워졌다: {log}"
+        "earlier entries were erased: {log}"
     );
     assert!(log.matches("[info] Amsil ").count() == 2, "{log}");
     assert!(log.lines().last().unwrap().contains("[error]"), "{log}");

@@ -1,51 +1,52 @@
-//! 보정 값(Params)과 그것을 화소에 적용하는 연산.
+//! Adjustment values (Params) and the operations that apply them to pixels.
 //!
-//! 모든 값은 0이 "변화 없음"이다. 그래서 프리셋에 강도를 곱하고 수동 조정을 더하는 것만으로 조합된다.
+//! Every value has 0 as "no change". So combining is just multiplying a preset by its strength and
+//! adding the manual adjustments.
 
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Params {
-    /// 노출 (EV).
+    /// Exposure (EV).
     #[serde(skip_serializing_if = "is_zero")]
     pub exposure: f32,
-    /// 이하 -1 ~ 1.
+    /// The following range from -1 to 1.
     #[serde(skip_serializing_if = "is_zero")]
     pub contrast: f32,
     #[serde(skip_serializing_if = "is_zero")]
     pub highlights: f32,
     #[serde(skip_serializing_if = "is_zero")]
     pub shadows: f32,
-    /// 색온도: +는 따뜻하게, -는 차갑게.
+    /// Colour temperature: + is warmer, - is cooler.
     #[serde(skip_serializing_if = "is_zero")]
     pub temp: f32,
-    /// 틴트: +는 자홍, -는 녹색.
+    /// Tint: + is magenta, - is green.
     #[serde(skip_serializing_if = "is_zero")]
     pub tint: f32,
     #[serde(skip_serializing_if = "is_zero")]
     pub saturation: f32,
-    /// 생동감: 채도가 낮은 색을 더 많이 올린다.
+    /// Vibrance: raises low-saturation colours more.
     #[serde(skip_serializing_if = "is_zero")]
     pub vibrance: f32,
-    /// 선명도: 넓은 범위의 대비.
+    /// Clarity: contrast over a wide range.
     #[serde(skip_serializing_if = "is_zero")]
     pub clarity: f32,
-    /// 샤픈: 가는 윤곽.
+    /// Sharpen: fine edges.
     #[serde(skip_serializing_if = "is_zero")]
     pub sharpen: f32,
-    /// 비네팅: +는 가장자리를 어둡게, -는 밝게.
+    /// Vignette: + darkens the edges, - brightens them.
     #[serde(skip_serializing_if = "is_zero")]
     pub vignette: f32,
-    /// 흑백 정도 (0 ~ 1).
+    /// Amount of black and white (0 to 1).
     #[serde(skip_serializing_if = "is_zero")]
     pub mono: f32,
-    /// 색상대별 채도와 밝기.
+    /// Saturation and lightness per hue band.
     #[serde(skip_serializing_if = "Hsl::is_default")]
     pub hsl: Hsl,
 }
 
-/// 색상대별 조정.
+/// Per-hue-band adjustment.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Hsl {
@@ -77,22 +78,22 @@ pub struct Band {
 }
 
 impl Params {
-    /// 모든 값에 `k`를 곱한다 (프리셋의 강도).
+    /// Multiplies every value by `k` (the preset strength).
     pub fn scaled(&self, k: f32) -> Params {
         self.zip(self, |value, _| value * k)
     }
 
-    /// 두 보정을 더한다 (프리셋 + 수동 조정).
+    /// Adds two adjustments (preset + manual adjustments).
     pub fn plus(&self, other: &Params) -> Params {
         self.zip(other, |a, b| a + b)
     }
 
-    /// 아무것도 바꾸지 않는 값인가.
+    /// Whether these values change nothing.
     pub fn is_neutral(&self) -> bool {
         *self == Params::default()
     }
 
-    /// 색을 다루는 값(화소 단위로 적용되는 것)이 하나라도 있는가.
+    /// Whether any colour value (applied per pixel) is set.
     pub fn changes_colour(&self) -> bool {
         let tone = [
             self.contrast,
@@ -105,7 +106,7 @@ impl Params {
         tone.iter().any(|&v| v != 0.0) || self.hsl != Hsl::default()
     }
 
-    /// 두 보정의 같은 항목끼리 `f`를 적용한다.
+    /// Applies `f` to matching fields of two adjustments.
     fn zip(&self, other: &Params, f: impl Fn(f32, f32) -> f32) -> Params {
         let band = |a: Band, b: Band| Band {
             sat: f(a.sat, b.sat),
@@ -168,7 +169,7 @@ impl Hsl {
     }
 }
 
-/// 선형 sRGB → Oklab.
+/// Linear sRGB → Oklab.
 pub fn to_oklab([r, g, b]: [f32; 3]) -> [f32; 3] {
     let l = (0.412_221_46 * r + 0.536_332_55 * g + 0.051_445_995 * b).cbrt();
     let m = (0.211_903_5 * r + 0.680_699_5 * g + 0.107_396_96 * b).cbrt();
@@ -180,7 +181,7 @@ pub fn to_oklab([r, g, b]: [f32; 3]) -> [f32; 3] {
     ]
 }
 
-/// Oklab → 선형 sRGB.
+/// Oklab → linear sRGB.
 pub fn from_oklab([l, a, b]: [f32; 3]) -> [f32; 3] {
     let cube = |v: f32| v * v * v;
     let l_ = cube(l + 0.396_337_78 * a + 0.215_803_76 * b);
@@ -193,19 +194,20 @@ pub fn from_oklab([l, a, b]: [f32; 3]) -> [f32; 3] {
     ]
 }
 
-/// 대비 슬라이더가 끝까지 갔을 때의 세기. 1을 넘으면 밝기 순서가 뒤집힐 수 있다.
+/// Strength when the contrast slider is at its end. Above 1, the lightness order can flip.
 const CONTRAST_GAIN: f32 = 0.9;
-/// 이 정도 채도면 이미 선명한 색으로 본다 (Oklab 채도).
+/// A colour this saturated already counts as vivid (Oklab chroma).
 const VIVID: f32 = 0.25;
-/// 색상대의 중심 (Oklab 색상각, 도). `Hsl`의 항목과 같은 순서.
+/// Centres of the hue bands (Oklab hue angle, degrees). Same order as the fields of `Hsl`.
 const HUE_CENTRES: [f32; 8] = [29.0, 58.0, 110.0, 142.0, 195.0, 264.0, 303.0, 328.0];
-/// 색상대별 밝기 조정이 끝까지 갔을 때의 세기.
+/// Strength when a per-hue-band lightness adjustment is at its end.
 const HUE_LUM_GAIN: f32 = 0.4;
 
-/// 화소 하나의 색 보정 (대비, 하이라이트/그림자, 채도, 생동감, 색상대별, 흑백). Oklab에서 한다.
+/// Colour adjustment of one pixel (contrast, highlights/shadows, saturation, vibrance, per hue
+/// band, black and white). Done in Oklab.
 pub fn adjust([l, a, b]: [f32; 3], p: &Params) -> [f32; 3] {
     use std::f32::consts::TAU;
-    // 밝기: 각 식은 0과 1을 고정하고 밝기 순서를 뒤집지 않는다.
+    // Lightness: each formula fixes 0 and 1 and does not flip the lightness order.
     let mut l = l.clamp(0.0, 1.0);
     l += p.shadows * l * (1.0 - l).powi(3);
     l += p.highlights * l.powi(3) * (1.0 - l);
@@ -221,21 +223,22 @@ pub fn adjust([l, a, b]: [f32; 3], p: &Params) -> [f32; 3] {
         let hue = b.atan2(a).to_degrees().rem_euclid(360.0);
         let (sat, lum) = hue_adjustment(hue, &p.hsl.bands());
         gain *= (1.0 + sat).max(0.0);
-        // 거의 무채색인 화소는 색상이 불안정하므로 밝기 조정을 약하게 건다.
+        // Near-neutral pixels have unstable hue, so the lightness adjustment is applied weakly.
         l = (l + lum * HUE_LUM_GAIN * (chroma / 0.04).min(1.0)).clamp(0.0, 1.0);
     }
     gain *= 1.0 - p.mono.clamp(0.0, 1.0);
     [l, a * gain, b * gain]
 }
 
-/// 색상각에 해당하는 (채도, 밝기) 조정. 이웃한 두 색상대 사이에서는 부드럽게 섞는다.
+/// The (saturation, lightness) adjustment for a hue angle. Blends smoothly between two neighbouring
+/// hue bands.
 fn hue_adjustment(hue: f32, bands: &[Band; 8]) -> (f32, f32) {
     for i in 0..8 {
         let next = (i + 1) % 8;
         let (from, mut to) = (HUE_CENTRES[i], HUE_CENTRES[next]);
         let mut h = hue;
         if to < from {
-            // 마지막 구간은 360도를 넘어 첫 색상대로 이어진다.
+            // The last segment wraps past 360 degrees into the first hue band.
             to += 360.0;
             if h < from {
                 h += 360.0;
@@ -277,7 +280,7 @@ mod tests {
         let white = to_oklab([1.0; 3]);
         assert!(
             near(white, [1.0, 0.0, 0.0], 1e-3),
-            "흰색은 L=1, 무채색: {white:?}"
+            "white is L=1, neutral: {white:?}"
         );
     }
 
@@ -302,7 +305,7 @@ mod tests {
         assert_eq!(total.hsl.orange.sat, 0.1);
         assert!(Params::default().is_neutral());
         assert!(!total.is_neutral());
-        assert!(preset.scaled(0.0).is_neutral(), "강도 0이면 효과가 없다");
+        assert!(preset.scaled(0.0).is_neutral(), "strength 0 has no effect");
     }
 
     #[test]
@@ -323,7 +326,7 @@ mod tests {
             },
         );
         assert!(chroma(grey) < 1e-6);
-        assert_eq!(grey[0], lab[0], "밝기는 그대로");
+        assert_eq!(grey[0], lab[0], "lightness unchanged");
         assert!(
             chroma(adjust(
                 lab,
@@ -367,10 +370,10 @@ mod tests {
         };
         let l = |v: f32| adjust([v, 0.0, 0.0], &p)[0];
         assert!(l(0.25) < 0.25 && l(0.75) > 0.75);
-        assert!((l(0.5) - 0.5).abs() < 1e-6, "중간은 그대로");
+        assert!((l(0.5) - 0.5).abs() < 1e-6, "the middle is unchanged");
         assert!(
             l(0.0).abs() < 1e-6 && (l(1.0) - 1.0).abs() < 1e-6,
-            "양 끝은 그대로"
+            "both ends are unchanged"
         );
     }
 
@@ -384,7 +387,7 @@ mod tests {
         assert!(l(0.2, shadows) > 0.25, "{}", l(0.2, shadows));
         assert!(
             (l(0.95, shadows) - 0.95).abs() < 0.01,
-            "밝은 곳은 거의 그대로"
+            "bright areas are nearly unchanged"
         );
         let highlights = Params {
             highlights: -1.0,
@@ -393,7 +396,7 @@ mod tests {
         assert!(l(0.8, highlights) < 0.75, "{}", l(0.8, highlights));
         assert!(
             (l(0.1, highlights) - 0.1).abs() < 0.01,
-            "어두운 곳은 거의 그대로"
+            "dark areas are nearly unchanged"
         );
     }
 
@@ -427,18 +430,18 @@ mod tests {
         let green = to_oklab([0.1, 0.6, 0.1]);
         assert!(
             chroma(adjust(orange, &p)) > chroma(orange) * 1.3,
-            "주황의 채도가 오른다"
+            "orange saturation rises"
         );
-        assert!(adjust(blue, &p)[0] < blue[0] - 0.03, "파랑이 어두워진다");
+        assert!(adjust(blue, &p)[0] < blue[0] - 0.03, "blue gets darker");
         assert!(
             (chroma(adjust(blue, &p)) - chroma(blue)).abs() < 1e-3,
-            "파랑의 채도는 그대로"
+            "blue saturation is unchanged"
         );
-        assert!(near(adjust(green, &p), green, 1e-3), "초록은 그대로");
+        assert!(near(adjust(green, &p), green, 1e-3), "green is unchanged");
         assert_eq!(
             adjust([0.5, 0.0, 0.0], &p),
             [0.5, 0.0, 0.0],
-            "무채색은 색상이 없으니 그대로"
+            "neutrals have no hue, so they are unchanged"
         );
     }
 
@@ -451,7 +454,7 @@ mod tests {
         );
         assert!(
             toml::from_str::<Params>("contrsat = 0.2\n").is_err(),
-            "오타는 조용히 넘어가지 않는다"
+            "a typo is not silently ignored"
         );
     }
 }

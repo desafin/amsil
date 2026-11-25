@@ -1,4 +1,4 @@
-//! AI 모델 실행 (ONNX Runtime). GPU(WebGPU)를 먼저 시도하고, 안 되면 CPU로 돌린다.
+//! Runs AI models (ONNX Runtime). Tries the GPU (WebGPU) first and falls back to the CPU.
 
 use crate::Result;
 use crate::denoise::TILE;
@@ -12,44 +12,44 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Instant;
 
-/// ONNX Runtime 환경은 프로세스에 하나만 만들 수 있다.
+/// Only one ONNX Runtime environment can be created per process.
 static ENV: LazyLock<std::result::Result<Environment, String>> =
     LazyLock::new(|| ort::init().build().map_err(|e| e.to_string()));
 
-/// 모델을 실제로 돌린 시간의 누적 (나노초). 화면에 GPU 사용률을 보여 주는 데 쓴다.
+/// Accumulated time spent actually running models (nanoseconds). Used to show GPU usage on screen.
 static BUSY_NANOS: AtomicU64 = AtomicU64::new(0);
 
-/// 프로그램 시작부터 지금까지 모델을 돌린 시간 (나노초).
+/// Time spent running models since program start (nanoseconds).
 pub fn busy_nanos() -> u64 {
     BUSY_NANOS.load(Relaxed)
 }
 
-/// CPU에서 돌리는 세션을 만든다. 작은 모델에 쓴다.
+/// Creates a session that runs on the CPU. Used for small models.
 pub fn cpu_session(model: &Path) -> Result<Session> {
     let env = ENV.as_ref().map_err(|e| e.clone())?;
     Ok(Session::builder(env)?.commit_from_file(model)?)
 }
 
-/// 모델이 실제로 돌아가는 곳.
+/// Where the model actually runs.
 #[derive(Debug)]
 pub enum Backend {
     Gpu,
-    /// GPU를 쓰지 못한 이유와 함께.
+    /// Along with the reason the GPU could not be used.
     Cpu {
         reason: String,
     },
 }
 
-/// 노이즈 제거 모델 (RawNIND Bayer).
+/// Denoising model (RawNIND Bayer).
 pub struct Denoiser {
     session: Session,
     pub backend: Backend,
-    /// 타일 하나를 처리하는 데 걸린 시간. 읽어 들일 때 한 번 잰다.
+    /// Time taken to process one tile. Measured once at load time.
     pub tile_seconds: f32,
 }
 
 impl Denoiser {
-    /// 모델을 읽고 시험 추론까지 해 본다. GPU에서 실패하면 CPU로 다시 읽는다.
+    /// Loads the model and runs a trial inference. If the GPU fails, reloads it on the CPU.
     pub fn load(model: &Path) -> Result<Self> {
         match Self::open(model, true) {
             Ok(denoiser) => Ok(denoiser),
@@ -78,7 +78,8 @@ impl Denoiser {
             tile_seconds: 0.0,
         };
 
-        // 첫 실행은 준비 작업이 섞여 느리다. 동작 확인에 쓰고, 두 번째 실행으로 시간을 잰다.
+        // The first run is slow because it includes warm-up work. Use it to check that the model
+        // works, and time the second run.
         let probe = vec![0.1; 4 * TILE * TILE];
         if denoiser.infer(&probe)?.iter().any(|v| !v.is_finite()) {
             return Err(text!(
@@ -93,7 +94,7 @@ impl Denoiser {
         Ok(denoiser)
     }
 
-    /// 4×512×512 타일(채널 우선)을 받아 3×1024×1024를 돌려준다.
+    /// Takes a 4×512×512 tile (channel-first) and returns 3×1024×1024.
     pub fn infer(&mut self, tile: &[f32]) -> Result<Vec<f32>> {
         let started = Instant::now();
         let input = TensorRef::from_array_view(([1, 4, TILE, TILE], tile))?;
@@ -105,10 +106,10 @@ impl Denoiser {
     }
 }
 
-/// 모델 폴더 안에서 노이즈 제거 모델의 위치.
+/// Location of the denoising model inside the model folder.
 pub const DENOISE_MODEL: &str = "rawdenoise-nind/model_bayer.onnx";
 
-/// 모델을 두는 폴더. `AMSIL_MODELS`로 바꿀 수 있다.
+/// Folder that holds the models. Can be changed with `AMSIL_MODELS`.
 pub fn model_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("AMSIL_MODELS") {
         return dir.into();
@@ -120,12 +121,13 @@ pub fn model_dir() -> PathBuf {
     data.join("amsil/models")
 }
 
-/// 테스트용 모델. 저장소에 없고 (`scripts/fetch-models.sh`로 받는다) 없으면 해당 테스트는 건너뛴다.
+/// Model for tests. Not in the repository (fetch it with `scripts/fetch-models.sh`); tests that
+/// need it are skipped when it is missing.
 #[cfg(test)]
 pub fn test_denoiser() -> Option<Denoiser> {
     let path = model_dir().join(DENOISE_MODEL);
     if !path.exists() {
-        eprintln!("노이즈 제거 모델이 없어 건너뜀");
+        eprintln!("denoising model not found, skipping");
         return None;
     }
     Some(Denoiser::load(&path).unwrap())
@@ -143,10 +145,10 @@ mod tests {
         assert_eq!(out.len(), 3 * (TILE * 2) * (TILE * 2));
         assert!(out.iter().all(|v| v.is_finite()));
         assert!(model.tile_seconds > 0.0);
-        eprintln!("{:?}, 타일당 {:.3}초", model.backend, model.tile_seconds);
+        eprintln!("{:?}, {:.3} s per tile", model.backend, model.tile_seconds);
     }
 
-    /// 재현 가능한 정규분포 난수 (Box-Muller).
+    /// Reproducible normally distributed random numbers (Box-Muller).
     fn noise(seed: &mut u64) -> f32 {
         let mut uniform = || {
             *seed = seed
@@ -160,7 +162,8 @@ mod tests {
     #[test]
     fn denoising_a_noisy_flat_patch_keeps_its_colour_and_removes_most_noise() {
         let Some(mut model) = denoiser() else { return };
-        // 화이트밸런스 전의 균일한 색(R 0.10, G 0.20, B 0.15)에 표준편차 0.02의 노이즈
+        // A uniform color before white balance (R 0.10, G 0.20, B 0.15) plus noise with a standard
+        // deviation of 0.02
         let (w, h, sigma) = (512, 512, 0.02);
         let mut seed = 1;
         let mut plane = |level: f32| {
@@ -188,9 +191,9 @@ mod tests {
                 .sqrt();
             assert!(
                 (mean - level).abs() < 0.03 * level,
-                "채널 {c}: 평균 {mean} (기대 {level})"
+                "channel {c}: mean {mean} (expected {level})"
             );
-            assert!(std < sigma / 4.0, "채널 {c}: 남은 노이즈 {std}");
+            assert!(std < sigma / 4.0, "channel {c}: remaining noise {std}");
         }
     }
 }

@@ -1,4 +1,4 @@
-//! 기본 현상: 카메라 RGB → 화이트밸런스 → 색행렬 → 톤 커브 → sRGB.
+//! Basic development: camera RGB → white balance → color matrix → tone curve → sRGB.
 
 use crate::Image;
 use crate::edit::{self, Params};
@@ -17,43 +17,49 @@ const REC2020_TO_SRGB: M3 = [
     [-0.018151, -0.100579, 1.11873],
 ];
 
-// ponytail: 고정 톤 커브. A900 카메라 JPG 두 장의 밝기 분포에 맞춘 값이다 (휘도 RMSE 3.6/255).
-// 다른 카메라나 취향에 따라 달라질 수 있어서 프리셋 단계(M5)에서 노출·대비 조절이 붙는다.
-/// 톤 커브의 대비. 클수록 어두운 곳은 더 어둡고 밝은 곳은 더 밝다.
+// ponytail: fixed tone curve. Fitted to the brightness distribution of two A900 camera JPGs
+// (luminance RMSE 3.6/255). Since it may differ by camera or taste, exposure and contrast controls
+// are added in the preset stage (M5).
+/// Tone curve contrast. Higher makes shadows darker and highlights brighter.
 const CONTRAST: f32 = 1.55;
-/// 톤 커브의 밝기. 작을수록 전체가 밝아진다.
+/// Tone curve brightness. Lower makes the whole image brighter.
 const TONE_K: f32 = 0.10;
 
-/// 색온도 슬라이더가 끝까지 갔을 때 빨강과 파랑을 서로 반대로 옮기는 양 (스톱).
+/// How far red and blue move in opposite directions at the end of the temperature slider (stops).
 const TEMP_STOPS: f32 = 0.5;
-/// 틴트 슬라이더가 끝까지 갔을 때 초록을 옮기는 양 (스톱).
+/// How far green moves at the end of the tint slider (stops).
 const TINT_STOPS: f32 = 0.3;
-/// 샤픈과 선명도가 보는 범위 (긴 변 대비). 해상도가 달라도 같은 느낌이 나도록 비율로 둔다.
+/// Radius used by sharpen and clarity (relative to the long side). Kept as a ratio so the look is
+/// the same at any resolution.
 const SHARPEN_RADIUS: f32 = 0.0004;
 const CLARITY_RADIUS: f32 = 0.012;
 const SHARPEN_GAIN: f32 = 1.0;
 const CLARITY_GAIN: f32 = 0.6;
-/// 비네팅 슬라이더가 끝까지 갔을 때 모서리의 밝기 변화 비율.
+/// Relative brightness change at the corners at the end of the vignette slider.
 const VIGNETTE_GAIN: f32 = 0.5;
 
-/// 카메라 RGB(선형, 센서 포화 = 1.0)를 sRGB(감마 적용, 0..1)로 바꾼다.
+/// Converts camera RGB (linear, sensor saturation = 1.0) to sRGB (gamma-encoded, 0..1).
 ///
-/// `wb`는 채널별 화이트밸런스 배율, `xyz_to_cam`은 D65 기준 XYZ → 카메라 행렬, `params`는 보정 값.
+/// `wb` is the per-channel white balance multipliers, `xyz_to_cam` the D65 XYZ → camera matrix, and
+/// `params` the adjustments.
 pub fn develop(cam: &Image, wb: [f32; 3], xyz_to_cam: M3, params: &Params) -> Image {
-    // 색온도와 틴트는 화이트밸런스 배율에 합친다.
+    // Temperature and tint are folded into the white balance multipliers.
     let wb = [
         wb[0] * 2f32.powf(params.temp * TEMP_STOPS),
         wb[1] * 2f32.powf(-params.tint * TINT_STOPS),
         wb[2] * 2f32.powf(-params.temp * TEMP_STOPS),
     ];
-    // 배율이 가장 작은 채널을 1로 맞춘다. 그러면 1.0에서 자르는 것만으로 포화 영역이 무채색이 된다.
+    // Scale so the smallest multiplier is 1. Then clipping at 1.0 alone makes saturated areas
+    // neutral.
     let min_wb = wb.iter().copied().fold(f32::INFINITY, f32::min);
     let wb = wb.map(|v| v / min_wb);
-    // 행의 합을 1로 맞추면 화이트밸런스를 거친 흰색이 작업 공간의 흰색이 된다 (dcraw 방식).
+    // Normalizing rows to sum to 1 makes white-balanced white the working-space white (as dcraw
+    // does).
     let cam_to_rec2020 = invert(&normalize_rows(&mul(&xyz_to_cam, &REC2020_TO_XYZ)));
     let gain = 2f32.powf(params.exposure);
     let spatial = params.clarity != 0.0 || params.sharpen != 0.0 || params.vignette != 0.0;
-    // 색 보정이나 공간 필터가 있으면 Oklab을 거친다. 없으면 바로 sRGB로 간다 (더 빠르다).
+    // With color adjustments or spatial filters, go through Oklab. Otherwise go straight to sRGB
+    // (faster).
     let through_oklab = params.changes_colour() || spatial;
 
     let (w, h) = (cam.width, cam.height);
@@ -83,7 +89,8 @@ pub fn develop(cam: &Image, wb: [f32; 3], xyz_to_cam: M3, params: &Params) -> Im
     }
 }
 
-/// 세 평면의 같은 자리 화소를 하나씩 넘겨준다 (행 단위 병렬). `f(화소 번호, 화소)`.
+/// Passes each pixel at the same position in the three planes (parallel by row).
+/// `f(pixel index, pixel)`.
 fn for_each_pixel(
     planes: &mut [Vec<f32>; 3],
     width: usize,
@@ -106,7 +113,7 @@ fn for_each_pixel(
         });
 }
 
-/// 이웃 화소를 보는 보정(샤픈, 선명도, 비네팅)을 밝기 평면에 적용한다.
+/// Applies the neighborhood adjustments (sharpen, clarity, vignette) to the lightness plane.
 fn spatial_filters(l: &mut [f32], w: usize, h: usize, p: &Params) {
     let long = w.max(h) as f32;
     let radius = |fraction: f32| ((long * fraction).round() as usize).max(1);
@@ -119,7 +126,7 @@ fn spatial_filters(l: &mut [f32], w: usize, h: usize, p: &Params) {
     if p.clarity != 0.0 {
         let blurred = box_blur(l, w, h, radius(CLARITY_RADIUS), 2);
         l.par_iter_mut().zip(&blurred).for_each(|(v, b)| {
-            // 아주 어둡거나 밝은 곳은 덜 건드린다.
+            // Touch very dark or very bright areas less.
             let midtone = 4.0 * *v * (1.0 - *v);
             *v += p.clarity * CLARITY_GAIN * (*v - b) * midtone.clamp(0.0, 1.0);
         });
@@ -130,7 +137,7 @@ fn spatial_filters(l: &mut [f32], w: usize, h: usize, p: &Params) {
             let dy = if cy > 0.0 { (y as f32 - cy) / cy } else { 0.0 };
             for (x, v) in row.iter_mut().enumerate() {
                 let dx = if cx > 0.0 { (x as f32 - cx) / cx } else { 0.0 };
-                // 중심 0, 모서리 1
+                // 0 at the center, 1 at the corners
                 let distance = (dx * dx + dy * dy) / 2.0;
                 *v *= 1.0 - p.vignette * VIGNETTE_GAIN * distance;
             }
@@ -139,12 +146,13 @@ fn spatial_filters(l: &mut [f32], w: usize, h: usize, p: &Params) {
     l.par_iter_mut().for_each(|v| *v = v.clamp(0.0, 1.0));
 }
 
-/// 상자 흐림. 가장자리에서는 창을 이미지 안으로 줄인다. `passes`번 되풀이하면 가우시안에 가까워진다.
+/// Box blur. At the edges the window shrinks to stay inside the image. Repeating it `passes` times
+/// approximates a Gaussian.
 pub fn box_blur(src: &[f32], w: usize, h: usize, radius: usize, passes: usize) -> Vec<f32> {
     let mut current = src.to_vec();
     let mut tmp = vec![0f32; src.len()];
     for _ in 0..passes {
-        // 가로
+        // Horizontal
         tmp.par_chunks_mut(w)
             .zip(current.par_chunks(w))
             .for_each(|(out, row)| {
@@ -160,7 +168,7 @@ pub fn box_blur(src: &[f32], w: usize, h: usize, radius: usize, passes: usize) -
                     }
                 }
             });
-        // 세로: 열마다 창 안의 합을 들고 행을 따라 내려간다.
+        // Vertical: keep a running window sum per column and walk down the rows.
         let mut sums = vec![0f64; w];
         for row in tmp.chunks(w).take(radius.min(h - 1) + 1) {
             sums.iter_mut().zip(row).for_each(|(s, &v)| *s += v as f64);
@@ -185,7 +193,7 @@ pub fn box_blur(src: &[f32], w: usize, h: usize, radius: usize, passes: usize) -
     current
 }
 
-/// S자 톤 커브. 0 → 0, 1 → 1.
+/// S-shaped tone curve. 0 → 0, 1 → 1.
 fn tone(v: f32) -> f32 {
     let p = v.max(0.0).powf(CONTRAST);
     (1.0 + TONE_K) * p / (p + TONE_K)
@@ -222,7 +230,8 @@ fn invert(m: &M3) -> M3 {
     [0, 1, 2].map(|i| [0, 1, 2].map(|j| c(j, i) / det))
 }
 
-/// EXIF 방향대로 픽셀을 돌려 바로 세운다. 뒤집기를 먼저 하고 전치(x, y 교환)를 나중에 한다.
+/// Rotates pixels upright according to the EXIF orientation. Flips first, then transposes (swaps
+/// x and y).
 pub fn orient(img: Image, transpose: bool, flip_h: bool, flip_v: bool) -> Image {
     if !(transpose || flip_h || flip_v) {
         return img;
@@ -252,7 +261,7 @@ pub fn orient(img: Image, transpose: bool, flip_h: bool, flip_v: bool) -> Image 
 mod tests {
     use super::*;
 
-    /// Sony A900의 D65 행렬 (rawler의 카메라 데이터).
+    /// The Sony A900 D65 matrix (from rawler's camera data).
     const XYZ_TO_CAM: [[f32; 3]; 3] = [
         [0.5209, -0.1072, -0.0397],
         [-0.8845, 1.6121, 0.2919],
@@ -268,12 +277,12 @@ mod tests {
         [0, 1, 2].map(|i| m[i][0] * v[0] + m[i][1] * v[1] + m[i][2] * v[2])
     }
 
-    /// 선형 sRGB 색을 이 카메라가 찍었을 때의 RAW 값.
+    /// The RAW values this camera would record for a linear sRGB color.
     fn shoot(srgb: [f32; 3]) -> [f32; 3] {
         mul(&XYZ_TO_CAM, mul(&SRGB_TO_XYZ, srgb))
     }
 
-    /// 흰색을 찍은 RAW 값의 역수 = 이 장면의 화이트밸런스 (G = 1).
+    /// Reciprocal of the RAW values for white = this scene's white balance (G = 1).
     fn wb() -> [f32; 3] {
         let w = shoot([1.0; 3]);
         [w[1] / w[0], 1.0, w[1] / w[2]]
@@ -293,7 +302,7 @@ mod tests {
         [out.planes[0][0], out.planes[1][0], out.planes[2][0]]
     }
 
-    /// 균일한 중간 회색을 찍은 사진.
+    /// A photo of a uniform middle gray.
     fn grey_image(width: usize, height: usize) -> Image {
         let cam = shoot([0.18; 3]);
         Image {
@@ -325,7 +334,7 @@ mod tests {
             darker < normal && normal < brighter,
             "{darker} {normal} {brighter}"
         );
-        // +1EV는 빛이 두 배인 장면을 찍은 것과 같다.
+        // +1 EV equals shooting a scene with twice the light.
         assert!((brighter - develop_px(shoot([0.2; 3]))[1]).abs() < 2e-3);
     }
 
@@ -341,7 +350,7 @@ mod tests {
         );
         assert!(
             warm[0] > warm[1] && warm[1] > warm[2],
-            "따뜻하게: 빨강 > 초록 > 파랑 {warm:?}"
+            "warm: red > green > blue {warm:?}"
         );
         let cool = develop_px_with(
             grey,
@@ -360,7 +369,7 @@ mod tests {
         );
         assert!(
             magenta[1] < magenta[0] && magenta[1] < magenta[2],
-            "자홍: 초록이 가장 낮다 {magenta:?}"
+            "magenta: green is lowest {magenta:?}"
         );
     }
 
@@ -393,13 +402,13 @@ mod tests {
         let plain = develop_px(red);
         assert!(
             vivid[0] - vivid[1] > plain[0] - plain[1],
-            "채도를 올리면 빨강과 초록의 차이가 커진다"
+            "raising saturation widens the red-green difference"
         );
     }
 
     #[test]
     fn an_unrelated_parameter_does_not_disturb_neutral_pixels() {
-        // 색 보정 경로(Oklab 왕복)를 타더라도 값이 틀어지면 안 된다.
+        // Values must not drift even through the color adjustment path (Oklab round trip).
         let grey = shoot([0.18; 3]);
         let through_colour_path = develop_px_with(
             grey,
@@ -412,7 +421,7 @@ mod tests {
         for c in 0..3 {
             assert!(
                 (through_colour_path[c] - plain[c]).abs() < 2e-3,
-                "{through_colour_path:?} 대 {plain:?}"
+                "{through_colour_path:?} vs {plain:?}"
             );
         }
     }
@@ -445,7 +454,7 @@ mod tests {
         assert!(light.planes[1][corner] > plain.planes[1][corner] + 0.03);
     }
 
-    /// 왼쪽 절반은 어둡고 오른쪽 절반은 밝은 사진.
+    /// A photo whose left half is dark and right half is bright.
     fn step_image(width: usize, height: usize) -> Image {
         let (dark, bright) = (shoot([0.08; 3]), shoot([0.3; 3]));
         let planes = [0, 1, 2].map(|c| {
@@ -483,15 +492,15 @@ mod tests {
         let (left_of_edge, right_of_edge) = (row + w / 2 - 1, row + w / 2);
         assert!(
             sharp.planes[1][left_of_edge] < plain.planes[1][left_of_edge] - 0.01,
-            "어두운 쪽 가장자리는 더 어둡게"
+            "the dark side of the edge gets darker"
         );
         assert!(
             sharp.planes[1][right_of_edge] > plain.planes[1][right_of_edge] + 0.01,
-            "밝은 쪽 가장자리는 더 밝게"
+            "the bright side of the edge gets brighter"
         );
         assert!(
             (sharp.planes[1][row + 4] - plain.planes[1][row + 4]).abs() < 2e-3,
-            "평평한 곳은 그대로"
+            "flat areas stay unchanged"
         );
     }
 
@@ -500,7 +509,7 @@ mod tests {
         let (w, h) = (256, 8);
         let spread = |image: &Image| {
             let row = &image.planes[1][4 * w..5 * w];
-            // 경계 바로 옆 (선명도가 보는 범위 안)
+            // Right next to the edge (within the clarity radius)
             row[w / 2 + 1] - row[w / 2 - 2]
         };
         let plain = spread(&develop(
@@ -550,7 +559,7 @@ mod tests {
     #[test]
     fn black_is_black_and_brightest_gray_is_white() {
         assert_eq!(develop_px([0.0; 3]), [0.0; 3]);
-        // 화이트밸런스 뒤 세 채널이 모두 1.0이 되는 회색
+        // A gray whose three channels all become 1.0 after white balance
         let w = wb();
         let out = develop_px([1.0 / w[0], 1.0, 1.0 / w[2]]);
         assert!(out.iter().all(|&v| v > 0.995), "{out:?}");
@@ -558,7 +567,8 @@ mod tests {
 
     #[test]
     fn clipped_highlight_has_no_colour_cast() {
-        // 세 채널 모두 센서 포화. 화이트밸런스를 곱하면 R, B가 G보다 커지는데 색이 끼면 안 된다.
+        // All three channels at sensor saturation. White balance makes R and B larger than G, but
+        // no color cast may appear.
         let out = develop_px([1.0; 3]);
         assert_neutral(out);
         assert!(out[1] > 0.995, "{out:?}");

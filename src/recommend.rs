@@ -1,7 +1,7 @@
-//! 프리셋 추천: CLIP으로 사진이 무엇을 찍은 것인지 가늠한다.
+//! Preset suggestions: CLIP guesses what a photo is of.
 //!
-//! 사진을 CLIP 이미지 인코더에 넣어 얻은 벡터를, 분류마다 미리 계산해 둔 문장 벡터
-//! (`assets/clip/categories.txt`)와 견준다. 가장 가까운 분류가 답이다.
+//! The vector from running the photo through the CLIP image encoder is compared with text vectors
+//! precomputed per category (`assets/clip/categories.txt`). The closest category is the answer.
 
 use crate::Result;
 use crate::lang::{t, text};
@@ -11,17 +11,17 @@ use ort::session::Session;
 use ort::value::TensorRef;
 use std::path::Path;
 
-/// 모델 폴더 안에서 분류 모델의 위치.
+/// Location of the classification model inside the model folder.
 pub const MODEL: &str = "clip-vit-b32/vision_model_fp16.onnx";
 
-/// 모델 입력의 한 변 (화소).
+/// One side of the model input (pixels).
 const SIDE: usize = 224;
-/// 임베딩의 길이.
+/// Length of the embedding.
 const EMBEDDING: usize = 512;
-/// 이보다 확신이 낮으면 추천하지 않는다.
+/// Below this confidence, nothing is suggested.
 const CONFIDENT: f32 = 0.6;
 
-/// 사진의 종류.
+/// The kind of photo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Category {
     Food,
@@ -33,7 +33,7 @@ pub enum Category {
 }
 
 impl Category {
-    /// 표(`categories.txt`)의 줄 순서와 같다.
+    /// Same as the row order of the table (`categories.txt`).
     pub const ALL: [Category; 6] = [
         Category::Food,
         Category::Portrait,
@@ -43,7 +43,7 @@ impl Category {
         Category::Other,
     ];
 
-    /// 표와 프리셋 파일의 `category`에 쓰는 이름.
+    /// Name used in the table and in the preset files' `category`.
     pub fn id(self) -> &'static str {
         match self {
             Category::Food => "food",
@@ -55,7 +55,7 @@ impl Category {
         }
     }
 
-    /// 화면에 보이는 이름.
+    /// Name shown on screen.
     pub fn label(self) -> &'static str {
         match self {
             Category::Food => t("음식", "Food"),
@@ -68,7 +68,7 @@ impl Category {
     }
 }
 
-/// 사진의 종류에 대한 짐작과 그 확신(0~1).
+/// A guess at the kind of photo and its confidence (0–1).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Guess {
     pub category: Category,
@@ -76,13 +76,14 @@ pub struct Guess {
 }
 
 impl Guess {
-    /// 믿고 보여 줄 만큼 확실한가.
+    /// Whether it is certain enough to show with trust.
     pub fn is_confident(&self) -> bool {
         self.confidence >= CONFIDENT
     }
 }
 
-/// 짐작에 맞는 프리셋. 확신이 낮거나 그 분류의 프리셋이 없으면 추천하지 않는다.
+/// The preset matching the guess. Nothing is suggested if confidence is low or the category has no
+/// preset.
 pub fn preset_for<'a>(presets: &'a [Preset], guess: &Guess) -> Option<&'a Preset> {
     presets
         .iter()
@@ -90,7 +91,7 @@ pub fn preset_for<'a>(presets: &'a [Preset], guess: &Guess) -> Option<&'a Preset
         .filter(|_| guess.is_confident())
 }
 
-/// 분류마다의 문장 벡터. 저장소에 넣어 둔 표를 읽는다.
+/// Text vectors per category. Reads the table kept in the repository.
 fn text_table() -> Vec<(Category, Vec<f32>)> {
     let rows: Vec<Vec<f32>> = include_str!("../assets/clip/categories.txt")
         .lines()
@@ -98,29 +99,39 @@ fn text_table() -> Vec<(Category, Vec<f32>)> {
         .map(|line| {
             line.split_whitespace()
                 .skip(1)
-                .map(|value| value.parse().expect("분류 표의 숫자가 잘못됐다"))
+                .map(|value| {
+                    value
+                        .parse()
+                        .expect("a number in the category table is invalid")
+                })
                 .collect()
         })
         .collect();
-    assert_eq!(rows.len(), Category::ALL.len(), "분류 표의 줄 수가 다르다");
+    assert_eq!(
+        rows.len(),
+        Category::ALL.len(),
+        "the category table has the wrong row count"
+    );
     assert!(
         rows.iter().all(|row| row.len() == EMBEDDING),
-        "분류 표의 벡터 길이가 다르다"
+        "a vector in the category table has the wrong length"
     );
     Category::ALL.into_iter().zip(rows).collect()
 }
 
-/// 그림의 가운데 정사각형을 224×224로 맞추고 CLIP의 평균·표준편차로 정규화한다 (채널 우선).
+/// Fits the image's centre square to 224×224 and normalizes with CLIP's mean and standard deviation
+/// (channel-first).
 fn preprocess(pixels: &Pixels) -> Vec<f32> {
     const MEAN: [f32; 3] = [0.48145466, 0.4578275, 0.40821073];
-    // CLIP의 값(0.26862954, 0.26130258, 0.27577711)을 f32가 담을 수 있는 자리까지 적는다.
+    // CLIP's values (0.26862954, 0.26130258, 0.27577711), written to the digits an f32 can hold.
     const STD: [f32; 3] = [0.26862954, 0.2613026, 0.2757771];
     let (w, h) = (pixels.width, pixels.height);
     let square = w.min(h);
     let (left, top) = ((w - square) / 2, (h - square) / 2);
     let mut input = vec![0.0; 3 * SIDE * SIDE];
     for oy in 0..SIDE {
-        // 출력 화소 하나가 덮는 원본 영역의 평균. 원본이 더 작으면 가장 가까운 화소 하나다.
+        // Average of the source area one output pixel covers. If the source is smaller, the single
+        // nearest pixel.
         let (y0, y1) = (
             oy * square / SIDE,
             ((oy + 1) * square / SIDE).max(oy * square / SIDE + 1),
@@ -144,7 +155,8 @@ fn preprocess(pixels: &Pixels) -> Vec<f32> {
     input
 }
 
-/// 이미지 벡터와 가장 가까운 분류를 고른다. 확신은 CLIP과 같은 방식(코사인 유사도 × 100의 소프트맥스)이다.
+/// Picks the category closest to the image vector. Confidence works as in CLIP (softmax of cosine
+/// similarity × 100).
 fn pick(embedding: &[f32], table: &[(Category, Vec<f32>)]) -> Guess {
     let norm = embedding
         .iter()
@@ -158,7 +170,7 @@ fn pick(embedding: &[f32], table: &[(Category, Vec<f32>)]) -> Guess {
         .collect();
     let best = (0..logits.len())
         .max_by(|&a, &b| logits[a].total_cmp(&logits[b]))
-        .expect("분류가 하나도 없다");
+        .expect("there are no categories");
     let total: f32 = logits
         .iter()
         .map(|logit| (logit - logits[best]).exp())
@@ -169,14 +181,14 @@ fn pick(embedding: &[f32], table: &[(Category, Vec<f32>)]) -> Guess {
     }
 }
 
-/// 사진 분류기 (CLIP ViT-B/32 이미지 인코더).
+/// Photo classifier (CLIP ViT-B/32 image encoder).
 pub struct Classifier {
     session: Session,
     table: Vec<(Category, Vec<f32>)>,
 }
 
 impl Classifier {
-    // ponytail: CPU로만 돌린다 (사진 한 장에 수십 ms). GPU는 노이즈 제거가 쓰게 둔다.
+    // ponytail: runs on CPU only (tens of ms per photo). The GPU is left to noise reduction.
     pub fn load(model: &Path) -> Result<Self> {
         Ok(Self {
             session: crate::gpu::cpu_session(model)?,
@@ -184,7 +196,7 @@ impl Classifier {
         })
     }
 
-    /// 그림이 무엇을 찍은 것인지 가늠한다. 긴 변이 300화소쯤 되는 작은 그림이면 충분하다.
+    /// Guesses what the image is of. A small image with a long side of about 300 pixels is enough.
     pub fn classify(&mut self, pixels: &Pixels) -> Result<Guess> {
         let input = preprocess(pixels);
         let input = TensorRef::from_array_view(([1, 3, SIDE, SIDE], input.as_slice()))?;
@@ -194,7 +206,8 @@ impl Classifier {
     }
 }
 
-/// 모델 폴더에서 분류 모델을 읽는다. 모델 파일이 없으면 받는 방법을 알려 준다.
+/// Loads the classification model from the model folder. If the model file is missing, says how to
+/// get it.
 pub fn load_classifier() -> Result<Classifier> {
     let path = crate::gpu::model_dir().join(MODEL);
     if !path.exists() {
@@ -212,7 +225,7 @@ pub fn load_classifier() -> Result<Classifier> {
 mod tests {
     use super::*;
 
-    /// 한 가지 색으로 채운 그림.
+    /// An image filled with one colour.
     fn flat(width: usize, height: usize, rgb: [u8; 3]) -> Pixels {
         Pixels {
             width,
@@ -221,7 +234,7 @@ mod tests {
         }
     }
 
-    /// `hot`번째만 1인 단위 벡터.
+    /// A unit vector with 1 only at index `hot`.
     fn axis(hot: usize) -> Vec<f32> {
         (0..EMBEDDING).map(|i| (i == hot) as u8 as f32).collect()
     }
@@ -238,12 +251,13 @@ mod tests {
     fn the_input_is_the_centre_square_scaled_to_224_and_normalised() {
         let white = preprocess(&flat(448, 300, [255, 255, 255]));
         assert_eq!(white.len(), 3 * SIDE * SIDE);
-        // CLIP의 평균과 표준편차로 정규화한다: (1 - 0.48145466) / 0.26862954
+        // Normalized with CLIP's mean and standard deviation: (1 - 0.48145466) / 0.26862954
         assert!((white[0] - 1.930_336).abs() < 1e-4, "{}", white[0]);
         assert!((white[SIDE * SIDE] - 2.074_875).abs() < 1e-4);
         assert!((white[2 * SIDE * SIDE] - 2.145_897).abs() < 1e-4);
 
-        // 가로로 긴 그림: 가운데 정사각형만 쓴다. 왼쪽 끝의 빨간 띠(가운데 300 밖)는 들어가지 않는다.
+        // A wide image: only the centre square is used. The red strip at the left edge (outside the
+        // middle 300) is not included.
         let mut wide = flat(448, 300, [0, 0, 0]);
         for y in 0..300 {
             for x in 0..70 {
@@ -256,7 +270,7 @@ mod tests {
             input[..SIDE * SIDE]
                 .iter()
                 .all(|v| (v - black).abs() < 1e-4),
-            "가운데 정사각형(74..374) 밖은 잘려야 한다"
+            "outside the centre square (74..374) must be cropped"
         );
     }
 
@@ -270,14 +284,14 @@ mod tests {
 
     #[test]
     fn the_closest_category_wins_and_confidence_tells_how_clearly() {
-        // 풍경 쪽으로 뚜렷이 기운 임베딩
+        // An embedding clearly leaning toward landscape
         let mut clear = axis(2);
         clear[0] = 0.2;
         let guess = pick(&clear, &table());
         assert_eq!(guess.category, Category::ALL[2]);
         assert!(guess.confidence > 0.99, "{}", guess.confidence);
 
-        // 두 분류의 한가운데: 어느 쪽인지 알 수 없다.
+        // Right between two categories: no telling which.
         let mut torn = axis(0);
         torn[1] = 1.0;
         let guess = pick(&torn, &table());
@@ -287,7 +301,7 @@ mod tests {
             guess.confidence
         );
 
-        // 크기가 달라도(정규화하지 않은 임베딩) 결과는 같다.
+        // The result is the same even at a different magnitude (unnormalized embedding).
         let scaled: Vec<f32> = clear.iter().map(|v| v * 37.0).collect();
         assert_eq!(pick(&scaled, &table()).category, Category::ALL[2]);
     }
@@ -316,14 +330,14 @@ mod tests {
 
     #[test]
     fn real_photos_are_told_apart() {
-        // 모델과 샘플 사진이 있을 때만 돈다.
+        // Runs only when the model and sample photos are present.
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("DCIM");
         let Ok(mut classifier) = load_classifier() else {
-            eprintln!("사진 분류 모델이 없어 건너뜀");
+            eprintln!("no photo classification model, skipping");
             return;
         };
         if !dir.exists() {
-            eprintln!("샘플 사진이 없어 건너뜀");
+            eprintln!("no sample photos, skipping");
             return;
         }
         for (file, expected) in [
@@ -334,11 +348,11 @@ mod tests {
         ] {
             let pixels = crate::preview::thumbnail(&dir.join(file), 448)
                 .unwrap()
-                .expect("미리보기가 없다");
+                .expect("no preview");
             let started = std::time::Instant::now();
             let guess = classifier.classify(&pixels).unwrap();
             eprintln!(
-                "{file}: {guess:?}, 분류 {:.0}ms",
+                "{file}: {guess:?}, classified in {:.0}ms",
                 started.elapsed().as_secs_f32() * 1000.0
             );
             assert_eq!(guess.category, expected, "{file}: {guess:?}");
@@ -364,12 +378,12 @@ mod tests {
         assert_eq!(
             preset(Category::Food, 0.5),
             None,
-            "확신이 낮으면 추천하지 않는다"
+            "nothing is suggested when confidence is low"
         );
         assert_eq!(
             preset(Category::Architecture, 0.99),
             None,
-            "그 분류의 프리셋이 없으면 추천하지 않는다"
+            "nothing is suggested when the category has no preset"
         );
     }
 }

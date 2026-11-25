@@ -31,7 +31,7 @@ use lang::t;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-/// 작업용 이미지. 채널별 평면(R, G, B), 값은 f32.
+/// Working image. One plane per channel (R, G, B), values are f32.
 #[derive(Clone)]
 pub struct Image {
     pub width: usize,
@@ -40,7 +40,7 @@ pub struct Image {
 }
 
 fn main() -> std::process::ExitCode {
-    // 화면에서 고른 언어가 있으면 그것을, 없으면 시스템 언어를 쓴다.
+    // Use the language picked in the UI if there is one, otherwise the system language.
     let config = project::Config::load(&project::Config::path());
     lang::set(config.lang.unwrap_or_else(lang::system));
     log::init();
@@ -55,7 +55,7 @@ fn main() -> std::process::ExitCode {
         }
     ));
 
-    // 인자 없이 실행하면 창을 띄운다.
+    // Run without arguments to open the window.
     if std::env::args_os().len() <= 1 {
         return match gui::run() {
             Ok(()) => std::process::ExitCode::SUCCESS,
@@ -105,12 +105,13 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-/// 테스트용 샘플 RAW. 개인 사진이라 저장소에 없고, 없으면 해당 테스트는 건너뛴다.
+/// Sample RAW for tests. It is a personal photo, so it is not in the repository; tests that
+/// need it are skipped when it is missing.
 #[cfg(test)]
 pub fn sample_arw() -> Option<std::path::PathBuf> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("DCIM/10161107/DSC04307.ARW");
     if !path.exists() {
-        eprintln!("샘플 ARW가 없어 건너뜀");
+        eprintln!("Sample ARW missing, skipping");
     }
     path.exists().then_some(path)
 }

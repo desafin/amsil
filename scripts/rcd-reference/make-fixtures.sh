@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# 원본 RCD로 정답지(tests/data/rcd/*.bin)를 다시 만든다. gcc가 필요하다.
-# 원본 코드는 임시 폴더에 복사해서 그 안에서 빌드한다.
+# Regenerates the reference outputs (tests/data/rcd/*.bin) from the original RCD. Requires gcc.
+# The original source is copied to a temporary folder and built there.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
@@ -9,7 +9,7 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
 cp "$here/harness.c" "$here/rcd_demosaicing.c" "$work/"
-# 부동소수점 계산을 정해진 대로 하게: FMA로 묶지 않고, 빠른 수학을 끈다.
+# Keep floating-point deterministic: no FMA contraction, no fast-math.
 gcc -O2 -std=gnu99 -ffp-contract=off -fno-fast-math -o "$work/harness" "$work/harness.c" -lm
 
 mkdir -p "$out"

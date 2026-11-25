@@ -1,4 +1,5 @@
-//! 일괄 처리: 폴더 탐색, 메모리 예산 안에서의 동시 실행, 진행률과 남은 시간.
+//! Batch processing: folder scanning, concurrent runs within a memory budget, progress and time
+//! left.
 
 use crate::Result;
 use crate::lang::{Text, t, text};
@@ -9,9 +10,10 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
-/// 동시에 처리하는 사진들의 예상 메모리 합을 한도 안으로 묶는다.
+/// Keeps the estimated memory of the photos being processed at once within a limit.
 ///
-/// 메모리가 바닥나면 프로그램이 오류 없이 강제 종료되므로, 부족해지기 전에 시작을 막는다.
+/// Running out of memory kills the program without an error, so starts are held back before it
+/// runs short.
 pub struct Budget {
     limit: u64,
     max_jobs: usize,
@@ -26,14 +28,14 @@ struct BudgetState {
     low_memory: bool,
 }
 
-/// 확보한 예산. 버리면 반납된다.
+/// Reserved budget. Returned when dropped.
 pub struct Permit<'a> {
     budget: &'a Budget,
     cost: u64,
 }
 
 impl Budget {
-    /// `limit`은 바이트, `max_jobs`는 동시에 처리할 최대 장수.
+    /// `limit` is in bytes; `max_jobs` is the most photos processed at once.
     pub fn new(limit: u64, max_jobs: usize) -> Self {
         Self {
             limit,
@@ -43,15 +45,17 @@ impl Budget {
         }
     }
 
-    /// `cost`만큼 확보될 때까지 기다린다. 한도보다 큰 작업은 다른 작업이 없을 때 혼자 실행된다.
-    // ponytail: 먼저 온 순서를 지키지 않는다. 큰 작업은 작은 작업들에 밀려 배치 끝으로 갈 수 있다.
+    /// Waits until `cost` can be reserved. A job larger than the limit runs alone when nothing else
+    /// is running.
+    // ponytail: not first-come-first-served. A large job can be pushed to the end of the batch by
+    // smaller ones.
     pub fn acquire(&self, cost: u64) -> Permit<'_> {
         let mut state = self.state.lock().unwrap();
         loop {
             let fits = state.running < self.max_jobs
                 && !state.low_memory
                 && state.used.saturating_add(cost) <= self.limit;
-            // 아무것도 돌고 있지 않으면 무조건 하나는 시작한다. 그래야 전체가 멈추지 않는다.
+            // If nothing is running, always start one. Otherwise the whole batch could stall.
             if fits || state.running == 0 {
                 state.used = state.used.saturating_add(cost);
                 state.running += 1;
@@ -61,13 +65,13 @@ impl Budget {
         }
     }
 
-    /// 시스템의 여유 메모리가 부족한지 알린다. 부족한 동안에는 새 작업을 한 번에 하나만 시작한다.
+    /// Reports whether the system is low on free memory. While it is, new jobs start one at a time.
     pub fn set_low_memory(&self, low: bool) {
         self.state.lock().unwrap().low_memory = low;
         self.changed.notify_all();
     }
 
-    /// 지금 처리 중인 장수.
+    /// Number of photos being processed now.
     pub fn running(&self) -> usize {
         self.state.lock().unwrap().running
     }
@@ -82,14 +86,14 @@ impl Drop for Permit<'_> {
     }
 }
 
-/// 남은 시간을 계산할 때 보는 최근 구간(초).
+/// Recent window used to compute the time left (seconds).
 const ETA_WINDOW: f64 = 60.0;
-/// 이보다 짧게 지켜본 속도는 믿지 않는다(초).
+/// A speed observed for less than this is not trusted (seconds).
 const ETA_MIN_SPAN: f64 = 5.0;
 
-/// 남은 시간 계산. 시간은 초 단위 숫자로 받는다.
+/// Time-left estimate. Times are given as seconds.
 pub struct Eta {
-    /// (시각, 끝난 양). 맨 앞은 최근 구간이 시작되기 직전의 기록이다.
+    /// (time, amount done). The front entry is the last record before the recent window starts.
     history: VecDeque<(f64, f64)>,
     last_change: f64,
 }
@@ -102,7 +106,7 @@ impl Eta {
         }
     }
 
-    /// 지금까지 끝난 양(장 단위, 처리 중인 사진의 부분 진행 포함)을 기록한다.
+    /// Records the amount done so far (in photos, including partial progress on photos in flight).
     pub fn record(&mut self, now: f64, done: f64) {
         if self.history.back().is_some_and(|&(_, last)| done > last) {
             self.last_change = now;
@@ -113,7 +117,7 @@ impl Eta {
         }
     }
 
-    /// 최근 속도로 계산한 남은 시간(초). 아직 알 수 없으면 None.
+    /// Time left at the recent speed (seconds). None if it can't be known yet.
     pub fn remaining(&self, total: f64) -> Option<f64> {
         let (&(t0, d0), &(t1, d1)) = (self.history.front()?, self.history.back()?);
         if t1 - t0 < ETA_MIN_SPAN || d1 <= d0 {
@@ -122,13 +126,14 @@ impl Eta {
         Some((total - d1) * (t1 - t0) / (d1 - d0))
     }
 
-    /// 마지막으로 진행이 있은 뒤 흐른 시간(초). 느린 것과 멈춘 것을 구분하는 데 쓴다.
+    /// Time since the last progress (seconds). Used to tell slow from stalled.
     pub fn idle_for(&self, now: f64) -> f64 {
         now - self.last_change
     }
 }
 
-/// 진행 막대 옆에 쓰는 문구. 30초 넘게 진행이 없으면 남은 시간 대신 그 사실을 알린다.
+/// Text shown next to the progress bar. With no progress for over 30 seconds, says so instead of
+/// the time left.
 pub fn describe_remaining(remaining: Option<f64>, idle: f64) -> String {
     if idle > STALL_AFTER {
         return t(
@@ -162,7 +167,7 @@ pub fn describe_remaining(remaining: Option<f64>, idle: f64) -> String {
     }
 }
 
-/// 자원 사용량 한 줄. 메모리는 바이트로 받는다.
+/// One-line resource usage. Memory is given in bytes.
 pub fn describe_resources(
     cpu: f32,
     memory: u64,
@@ -190,45 +195,47 @@ pub fn describe_resources(
     text
 }
 
-/// 이만큼(초) 진행 신호가 없으면 멈춘 것일 수 있다고 알린다.
+/// With no progress signal for this long (seconds), warn that it may be stalled.
 const STALL_AFTER: f64 = 30.0;
 
-/// 사진 한 장의 변환 작업.
+/// Conversion task for one photo.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Task {
     pub input: PathBuf,
     pub output: PathBuf,
 }
 
-/// 사진 한 장을 실제로 변환하는 함수. 두 번째 인자로 그 사진의 진행 정도(0~1)를 알린다.
+/// Function that actually converts one photo. Reports that photo's progress (0..1) through the
+/// second argument.
 pub type Work<'a> = dyn Fn(&Task, &dyn Fn(f32)) -> Result<()> + Sync + 'a;
 
-/// 배치 하나를 돌리는 데 필요한 것들.
+/// Everything needed to run one batch.
 pub struct Batch<'a> {
     pub tasks: &'a [Task],
-    /// 동시에 일하는 스레드 수.
+    /// Number of worker threads.
     pub workers: usize,
     pub budget: &'a Budget,
-    /// 출력 파일이 이미 있어도 다시 만든다. 끄면 건너뛴다 (중단된 배치를 이어 하기 좋다).
+    /// Recreate output files even if they already exist. When off, they are skipped (handy for
+    /// resuming an interrupted batch).
     pub overwrite: bool,
-    /// 켜지면 새 사진을 시작하지 않는다.
+    /// When set, no new photos are started.
     pub cancel: &'a AtomicBool,
-    /// 사진 한 장에 필요한 메모리(바이트)의 추정값.
+    /// Estimated memory needed for one photo (bytes).
     pub cost: &'a (dyn Fn(&Task) -> Result<u64> + Sync),
-    /// 지금 시스템에 남아 있는 메모리(바이트).
+    /// Memory currently left on the system (bytes).
     pub available: &'a (dyn Fn() -> u64 + Sync),
     pub work: &'a Work<'a>,
 }
 
-/// 진행 상황. 주기적으로 `tick`에 전달된다.
+/// Progress. Passed to `tick` periodically.
 #[derive(Debug, Clone, Copy)]
 pub struct Status {
     pub total: usize,
-    /// 끝난 장수 (성공, 건너뜀, 실패 모두).
+    /// Photos finished (done, skipped and failed).
     pub finished: usize,
-    /// 끝난 양. 처리 중인 사진의 부분 진행을 포함한다.
+    /// Amount done. Includes partial progress on photos in flight.
     pub progress: f64,
-    /// 지금 처리 중인 장수.
+    /// Number of photos being processed now.
     pub running: usize,
 }
 
@@ -236,19 +243,20 @@ pub struct Status {
 pub struct Outcome {
     pub done: usize,
     pub skipped: usize,
-    /// 실패한 입력 파일과 이유.
+    /// Failed input files and why.
     pub failed: Vec<(PathBuf, Text)>,
-    /// 배치가 끝까지 가지 못했으면 그 이유.
+    /// Why the batch didn't run to the end, if it didn't.
     pub stopped: Option<Text>,
 }
 
-/// 배치를 실행한다. 한 장이 실패해도 나머지는 계속한다. `tick`은 0.2초마다, 그리고 끝날 때 한 번 불린다.
+/// Runs the batch. One photo failing doesn't stop the rest. `tick` is called every 0.2 s and once
+/// at the end.
 pub fn run_batch(batch: &Batch, mut tick: impl FnMut(&Status)) -> Outcome {
     let total = batch.tasks.len();
     let workers = batch.workers.clamp(1, total.max(1));
     let next = AtomicUsize::new(0);
     let finished = AtomicUsize::new(0);
-    // 일꾼마다 지금 잡고 있는 사진의 진행 정도 (천분율)
+    // Progress of each worker's current photo (per mille)
     let partial: Vec<AtomicU32> = (0..workers).map(|_| AtomicU32::new(0)).collect();
     let outcome = Mutex::new(Outcome::default());
     let stop = AtomicBool::new(false);
@@ -319,13 +327,13 @@ pub fn run_batch(batch: &Batch, mut tick: impl FnMut(&Status)) -> Outcome {
     outcome
 }
 
-/// `tick`을 부르는 간격.
+/// Interval between `tick` calls.
 const TICK_INTERVAL: Duration = Duration::from_millis(200);
 
 enum Step {
     Done,
     Skipped,
-    /// 기다리는 사이에 배치가 멈춰서 시작하지 않았다.
+    /// The batch stopped while waiting, so it never started.
     NotStarted,
 }
 
@@ -338,7 +346,8 @@ fn run_one(batch: &Batch, task: &Task, stop: &AtomicBool, partial: &AtomicU32) -
     if stop.load(SeqCst) || batch.cancel.load(SeqCst) {
         return Ok(Step::NotStarted);
     }
-    // 한도보다 커서 혼자 실행되는 사진이다. 그래도 남은 메모리에 안 들어가면 시작하지 않는다.
+    // This photo exceeds the limit and runs alone. Still, if it doesn't fit in free memory, don't
+    // start it.
     let available = (batch.available)();
     if cost > batch.budget.limit && cost > available {
         const GB: f64 = (1u64 << 30) as f64;
@@ -364,13 +373,13 @@ fn is_disk_full(error: &(dyn std::error::Error + 'static)) -> bool {
         .is_some_and(|io| io.kind() == std::io::ErrorKind::StorageFull)
 }
 
-/// 폴더와 하위 폴더에서 RAW 파일을 찾는다. 결과는 `dir` 기준 상대 경로이고 정렬돼 있다.
+/// Finds RAW files in a folder and its subfolders. Results are paths relative to `dir`, sorted.
 pub fn scan(dir: &Path) -> Result<Vec<PathBuf>> {
     fn walk(root: &Path, dir: &Path, found: &mut Vec<PathBuf>) -> std::io::Result<()> {
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
-            // 심볼릭 링크로 연결된 폴더는 따라가지 않는다 (순환 방지).
+            // Don't follow symlinked folders (avoids cycles).
             if entry.file_type()?.is_dir() {
                 walk(root, &path, found)?;
             } else if path.is_file() && is_raw(&path) {
@@ -393,7 +402,7 @@ fn is_raw(path: &Path) -> bool {
         })
 }
 
-/// 입력의 상대 경로에 대응하는 출력 경로. 하위 폴더 구조를 그대로 따른다.
+/// Output path for an input's relative path. Mirrors the subfolder structure.
 pub fn output_path(out_dir: &Path, relative: &Path) -> PathBuf {
     out_dir.join(relative).with_extension("heic")
 }
@@ -424,7 +433,7 @@ mod tests {
         assert_eq!(
             peak.load(SeqCst),
             90,
-            "30짜리 작업이 동시에 3개까지 돌아야 한다"
+            "up to three jobs of 30 should run at once"
         );
     }
 
@@ -439,7 +448,7 @@ mod tests {
                 started.store(true, SeqCst);
             });
             thread::sleep(TICK);
-            assert!(!started.load(SeqCst), "세 번째 작업은 기다려야 한다");
+            assert!(!started.load(SeqCst), "the third job should wait");
             drop(_a);
         });
         assert!(started.load(SeqCst));
@@ -465,14 +474,11 @@ mod tests {
             thread::sleep(TICK);
             assert!(
                 !big_started.load(SeqCst),
-                "다른 작업이 있는 동안에는 시작하지 않는다"
+                "does not start while other jobs are running"
             );
             drop(small);
             thread::sleep(TICK);
-            assert!(
-                big_started.load(SeqCst),
-                "혼자 남으면 한도를 넘어도 시작한다"
-            );
+            assert!(big_started.load(SeqCst), "starts alone even over the limit");
 
             s.spawn(|| {
                 let _late = budget.acquire(10);
@@ -481,7 +487,7 @@ mod tests {
             thread::sleep(TICK);
             assert!(
                 !late_started.load(SeqCst),
-                "큰 작업이 도는 동안에는 다른 작업이 끼어들지 않는다"
+                "no other job cuts in while the large one runs"
             );
             big_release.store(true, SeqCst);
         });
@@ -492,7 +498,7 @@ mod tests {
     fn low_memory_lets_only_one_job_run_at_a_time() {
         let budget = Budget::new(100, 16);
         budget.set_low_memory(true);
-        let first = budget.acquire(10); // 아무것도 안 돌고 있으면 하나는 시작한다 (전부 멈추지는 않는다)
+        let first = budget.acquire(10); // With nothing running, one still starts (no full stall)
         let second_started = AtomicBool::new(false);
         thread::scope(|s| {
             s.spawn(|| {
@@ -505,7 +511,7 @@ mod tests {
             thread::sleep(TICK);
             assert!(
                 second_started.load(SeqCst),
-                "메모리가 회복되면 다시 동시에 돈다"
+                "runs concurrently again once memory recovers"
             );
             drop(first);
         });
@@ -515,9 +521,9 @@ mod tests {
     fn steady_speed_gives_the_right_remaining_time() {
         let mut eta = Eta::new(0.0);
         for t in 0..=30 {
-            eta.record(t as f64, t as f64 * 0.5); // 초당 0.5장
+            eta.record(t as f64, t as f64 * 0.5); // 0.5 photos per second
         }
-        let remaining = eta.remaining(100.0).unwrap(); // 85장 남음
+        let remaining = eta.remaining(100.0).unwrap(); // 85 photos left
         assert!((remaining - 170.0).abs() < 1.0, "{remaining}");
     }
 
@@ -526,24 +532,28 @@ mod tests {
         let mut eta = Eta::new(0.0);
         assert_eq!(eta.remaining(100.0), None);
         eta.record(1.0, 0.5);
-        assert_eq!(eta.remaining(100.0), None, "1초 지켜본 것으로는 알 수 없다");
+        assert_eq!(
+            eta.remaining(100.0),
+            None,
+            "one second of history is not enough"
+        );
 
         let mut eta = Eta::new(0.0);
         eta.record(15.0, 0.0);
         eta.record(30.0, 0.0);
-        assert_eq!(eta.remaining(100.0), None, "진행이 없으면 남은 시간도 없다");
+        assert_eq!(eta.remaining(100.0), None, "no progress means no time left");
     }
 
     #[test]
     fn estimate_follows_the_recent_speed() {
         let mut eta = Eta::new(0.0);
         for t in 0..=100 {
-            eta.record(t as f64, t as f64); // 처음에는 초당 1장
+            eta.record(t as f64, t as f64); // 1 photo per second at first
         }
         for t in 101..=200 {
-            eta.record(t as f64, 100.0 + (t - 100) as f64 * 0.25); // 그 뒤로 초당 0.25장
+            eta.record(t as f64, 100.0 + (t - 100) as f64 * 0.25); // then 0.25 photos per second
         }
-        let remaining = eta.remaining(225.0).unwrap(); // 100장 남음
+        let remaining = eta.remaining(225.0).unwrap(); // 100 photos left
         assert!((remaining - 400.0).abs() < 5.0, "{remaining}");
     }
 
@@ -551,7 +561,7 @@ mod tests {
     fn idle_time_counts_from_the_last_real_progress() {
         let mut eta = Eta::new(0.0);
         eta.record(10.0, 5.0);
-        eta.record(20.0, 5.0); // 값이 그대로면 진행이 아니다
+        eta.record(20.0, 5.0); // An unchanged value is not progress
         assert_eq!(eta.idle_for(50.0), 40.0);
         eta.record(51.0, 5.5);
         assert_eq!(eta.idle_for(52.0), 1.0);
@@ -607,7 +617,7 @@ mod tests {
         assert_eq!(out, Path::new("/out/10161107/DSC04307.heic"));
     }
 
-    /// 테스트용 배치 환경: 임시 폴더와 작업 목록.
+    /// Test batch setup: a temp folder and a task list.
     struct Fixture {
         dir: PathBuf,
         tasks: Vec<Task>,
@@ -662,7 +672,7 @@ mod tests {
         }
     }
 
-    /// 출력 파일을 실제로 쓰는 가짜 변환.
+    /// Fake conversion that actually writes the output file.
     fn write_output(task: &Task, _: &dyn Fn(f32)) -> Result<()> {
         Ok(std::fs::write(&task.output, b"heic")?)
     }
@@ -701,10 +711,7 @@ mod tests {
                 ("sub/bad1.ARW".into(), "읽을 수 없는 파일".into())
             ]
         );
-        assert!(
-            fx.dir.join("sub/c.heic").exists(),
-            "하위 폴더도 만들어서 쓴다"
-        );
+        assert!(fx.dir.join("sub/c.heic").exists(), "creates subfolders too");
     }
 
     #[test]
@@ -729,12 +736,12 @@ mod tests {
             1,
             false,
             &|task, progress| {
-                fx.cancel.store(true, SeqCst); // 첫 장을 처리하는 도중에 취소
+                fx.cancel.store(true, SeqCst); // Cancel while the first photo is in progress
                 write_output(task, progress)
             },
             |_| {},
         );
-        assert_eq!(outcome.done, 1, "하던 사진은 끝낸다");
+        assert_eq!(outcome.done, 1, "finishes the photo in progress");
         assert!(outcome.stopped.is_some());
         assert!(!fx.dir.join("b.heic").exists());
     }
@@ -774,7 +781,8 @@ mod tests {
             },
             |status| {
                 seen.push(*status);
-                // 첫 장이 절반까지 온 것을 본 뒤에 놓아준다 (첫 tick은 일꾼이 시작하기 전일 수 있다).
+                // Release once the first photo is seen halfway (the first tick may come before the
+                // worker starts).
                 if status.progress >= 0.5 {
                     release.store(true, SeqCst);
                 }
@@ -783,7 +791,7 @@ mod tests {
         assert_eq!(outcome.done, 2);
         let mid = seen.iter().find(|status| status.running == 1).unwrap();
         assert_eq!((mid.total, mid.finished), (2, 0));
-        assert_eq!(mid.progress, 0.5, "첫 장을 절반 처리한 상태");
+        assert_eq!(mid.progress, 0.5, "first photo half done");
         let last = seen.last().unwrap();
         assert_eq!((last.finished, last.progress, last.running), (2, 2.0, 0));
     }

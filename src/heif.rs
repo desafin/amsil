@@ -1,4 +1,4 @@
-//! sRGB 이미지를 10bit HEIF(HEVC 4:2:0)로 인코딩한다.
+//! Encodes an sRGB image to 10-bit HEIF (HEVC 4:2:0).
 
 use crate::lang::text;
 use crate::{Image, Result};
@@ -7,23 +7,25 @@ use libheif_rs::{
     LibHeif, RgbChroma,
 };
 
-/// 인코딩 결과.
+/// Encoding result.
 pub struct Encoded {
     pub bytes: Vec<u8>,
-    /// 실제로 쓴 품질. 용량 한도 때문에 요청한 값보다 낮을 수 있다.
+    /// The quality actually used. May be lower than requested because of the size limit.
     pub quality: u8,
 }
 
-/// HEVC 데이터가 이 크기(2^24바이트)를 넘으면 libde265가 파일을 열지 못한다. 여유를 두고 그 아래로 맞춘다.
+/// libde265 cannot open the file when the HEVC data exceeds this size (2^24 bytes). Stay below it
+/// with some margin.
 const MAX_BYTES: usize = 16_000_000;
 
-/// `img`는 sRGB 감마가 적용된 0..1 값. `exif`는 TIFF 헤더로 시작하는 EXIF 블록.
-/// `threads`는 인코더가 쓸 스레드 수 (여러 장을 동시에 인코딩할 때는 작게 준다).
+/// `img` holds sRGB-gamma-encoded values in 0..1. `exif` is an EXIF block starting with a TIFF
+/// header. `threads` is the number of encoder threads (pass a small value when encoding several
+/// images at once).
 pub fn encode(img: &Image, quality: u8, exif: Option<&[u8]>, threads: usize) -> Result<Encoded> {
     encode_within(img, quality, exif, threads, MAX_BYTES)
 }
 
-/// 결과가 `max_bytes`를 넘으면 품질을 낮춰 다시 인코딩한다.
+/// If the result exceeds `max_bytes`, lowers the quality and encodes again.
 fn encode_within(
     img: &Image,
     quality: u8,
@@ -51,10 +53,11 @@ fn encode_within(
     }
 }
 
-/// 용량을 맞추려고 품질을 낮출 때의 하한.
+/// Lower bound when lowering quality to fit the size limit.
 const MIN_QUALITY: u8 = 30;
 
-/// 한 번 인코딩한다. `extra`는 libheif 인코더에 더 줄 매개변수(측정에서 x265 설정을 바꿔 볼 때 쓴다).
+/// Encodes once. `extra` holds additional libheif encoder parameters (used by measurements to try
+/// different x265 settings).
 fn encode_once(
     img: &Image,
     quality: u8,
@@ -79,17 +82,19 @@ fn encode_once(
             }
         }
     }
-    // 색 정보는 따로 지정하지 않는다. libheif 기본값이 sRGB(BT.709 원색, sRGB 전달함수, full range)이고
-    // 그 값이 HEVC 비트스트림에 기록된다.
+    // Color information is not set explicitly. The libheif default is sRGB (BT.709 primaries, sRGB
+    // transfer function, full range), and that is written into the HEVC bitstream.
 
     let lib = LibHeif::new();
     let mut ctx = HeifContext::new()?;
     let mut encoder = lib.encoder_for_format(CompressionFormat::Hevc)?;
     encoder.set_quality(EncoderQuality::Lossy(quality))?;
-    // libheif의 기본값은 slow다. medium은 파일이 8% 크지만 화질은 같거나 약간 높고 인코딩 시간이 절반이다
+    // The libheif default is slow. medium gives 8% larger files but equal or slightly better
+    // quality in half the encoding time
     encoder.set_parameter_value("preset", EncoderParameterValue::String("medium".into()))?;
-    // x265는 인코더마다 스레드 풀을 따로 만든다. 여러 장을 동시에 인코딩할 때 그대로 두면 스레드가
-    // 코어 수의 몇십 배가 되어 서로 방해한다.
+    // x265 creates a separate thread pool per encoder. Left alone while encoding several images at
+    // once, the thread count grows to tens of times the core count and the threads get in each
+    // other's way.
     encoder.set_parameter_value(
         "x265:pools",
         EncoderParameterValue::String(threads.max(1).to_string()),
@@ -104,7 +109,7 @@ fn encode_once(
     Ok(ctx.write_to_bytes()?)
 }
 
-/// HEIF를 0..1 값의 RGB로 되읽는다 (테스트와 측정에서 쓴다).
+/// Reads a HEIF back as RGB in 0..1 (used by tests and measurements).
 #[cfg(test)]
 pub fn decode(bytes: &[u8]) -> Result<Image> {
     let ctx = HeifContext::read_from_bytes(bytes)?;
@@ -133,20 +138,20 @@ pub fn decode(bytes: &[u8]) -> Result<Image> {
 mod tests {
     use super::*;
 
-    /// 인코더 설정 비교용 그림을 만든다 (`scripts/sharpness/encoder.py`가 읽는다).
+    /// Produces images for comparing encoder settings (read by `scripts/sharpness/encoder.py`).
     /// `cargo test --release -- --ignored encode_for_encoder_comparison`
     ///
-    /// 먼저 `render_for_sharpness_measurement`를 돌려 둔다. 그 그림 가운데 캡처 샤픈을 끈 것(`off`)과
-    /// 기본값인 것(`it20-t0.4`)의 압축 전 영역을 x265 설정마다 인코딩해 되읽고 `encoder/`에 쓴다.
-    /// 크기는 `encoder/sizes.tsv`.
+    /// Run `render_for_sharpness_measurement` first. From its images, the pre-compression crops
+    /// with capture sharpening off (`off`) and at the default (`it20-t0.4`) are encoded with each
+    /// x265 setting, read back, and written to `encoder/`. Sizes go to `encoder/sizes.tsv`.
     #[test]
-    #[ignore = "render_for_sharpness_measurement의 그림이 필요하다"]
+    #[ignore = "needs the images from render_for_sharpness_measurement"]
     fn encode_for_encoder_comparison() {
         use rayon::prelude::*;
         let dir = crate::raw16::dir();
         let out = dir.join("encoder");
         std::fs::create_dir_all(&out).unwrap();
-        /// (이름, 품질, libheif 매개변수)
+        /// (name, quality, libheif parameters)
         type Variant = (&'static str, u8, &'static [(&'static str, &'static str)]);
         let variants: &[Variant] = &[
             ("q55", 55, &[]),
@@ -177,7 +182,7 @@ mod tests {
         inputs.par_iter().for_each(|(stem, path)| {
             assert!(
                 path.exists(),
-                "먼저 render_for_sharpness_measurement를 돌린다: {}",
+                "run render_for_sharpness_measurement first: {}",
                 path.display()
             );
             let image = crate::raw16::read(path);
@@ -216,7 +221,7 @@ mod tests {
     fn encodes_10bit_heif_with_exif_that_decodes_back() {
         let (w, h) = (256, 192);
         let img = gradient(w, h);
-        // 최소 EXIF: TIFF 헤더 + 항목 0개짜리 IFD
+        // Minimal EXIF: TIFF header + an IFD with zero entries
         let exif = b"II*\0\x08\0\0\0\0\0\0\0\0\0";
 
         let bytes = encode(&img, 55, Some(exif), 4).unwrap().bytes;
@@ -250,7 +255,7 @@ mod tests {
         assert!(psnr > 35.0, "PSNR {psnr:.1} dB");
     }
 
-    /// 압축이 잘 안 되는 이미지 (재현 가능한 잡음).
+    /// An image that compresses poorly (reproducible noise).
     fn noise(w: usize, h: usize) -> Image {
         let mut seed = 7u64;
         let mut plane = || {
@@ -286,7 +291,7 @@ mod tests {
         assert_eq!(one.quality, 55);
         assert!(
             one.bytes == many.bytes,
-            "스레드 수와 무관하게 같은 파일이 나와야 한다"
+            "the output must be identical regardless of thread count"
         );
     }
 

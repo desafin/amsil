@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""카메라 JPEG가 굵기(공간 주파수)마다 무엇을 하는지: 세부가 있는 곳과 평평한 곳을 나눠서.
+"""What the camera JPEG does at each spatial frequency, separately for detailed and flat areas.
 
-샤픈 없이 현상한 그림(`*-off-pre.raw`)에 대한 카메라 JPEG의 진폭 비율이다. 1보다 크면 카메라가 그 굵기를
-키운 것(샤픈), 작으면 깎은 것(노이즈 감소)이다. 결과는 `camera_curve.json`에 써서 fit_filter.py가 쓴다.
+This is the amplitude ratio of the camera JPEG to the unsharpened render (`*-off-pre.raw`). Above 1 means
+the camera boosted that frequency (sharpening); below 1 means it cut it (noise reduction). The result is
+written to `camera_curve.json` for fit_filter.py.
 
     cargo test --release -- --ignored render_for_sharpness_measurement
-    python3 scripts/sharpness/camera_curve.py [폴더]
+    python3 scripts/sharpness/camera_curve.py [folder]
 """
 import json
 import sys
@@ -19,8 +20,8 @@ SHOW = [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45]
 def main():
     folder = data_dir()
     result = {"frequencies": CENTRES.tolist(), "photos": {}}
-    print("카메라 JPEG / 샤픈 없는 현상, 진폭 비율 (cycles/pixel)")
-    print(f"{'사진':10s} {'구역':6s}" + "".join(f"{f:>7.2f}" for f in SHOW))
+    print("Camera JPEG / unsharpened render, amplitude ratio (cycles/pixel)")
+    print(f"{'photo':10s} {'area':6s}" + "".join(f"{f:>7.2f}" for f in SHOW))
     for name in PHOTOS:
         camera = luma(camera_jpeg(name))
         plain = luma(load_raw(folder / f"{name}-off-pre.raw"))

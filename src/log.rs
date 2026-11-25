@@ -1,10 +1,11 @@
-//! 로그 파일: 문제가 생겼을 때 원인을 볼 수 있도록 일어난 일을 남긴다.
+//! Log file: records what happened so the cause can be found when something goes wrong.
 //!
-//! 프로그램 전체가 파일 하나(`~/.local/state/amsil/log.txt`)에 쓴다. `init`을 부르기 전에는
-//! 아무것도 쓰지 않으므로, 테스트가 사용자의 로그 파일을 건드리지 않는다.
+//! The whole program writes to one file (`~/.local/state/amsil/log.txt`). Nothing is written before
+//! `init` is called, so tests do not touch the user's log file.
 //!
-//! 로그는 화면의 언어와 상관없이 영어로 쓴다. 누구에게 보여 주거나 검색하기 쉽게.
-//! 화면에도 나오는 글(오류 등)은 [`Text`](crate::lang::Text)로 넘기면 그 영어 쪽이 남는다.
+//! The log is in English regardless of the screen language, so it is easy to share or search.
+//! For text that also appears on screen (errors etc.), pass a [`Text`](crate::lang::Text) and its
+//! English side is recorded.
 
 use crate::lang::{self, Lang, t};
 use std::ffi::OsString;
@@ -14,10 +15,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-/// 이보다 커진 로그는 다음에 켤 때 `log.old.txt`로 옮기고 새로 시작한다.
+/// A log larger than this is moved to `log.old.txt` at the next launch and a new one starts.
 const MAX_BYTES: u64 = 1 << 20;
 
-/// 얼마나 심각한 일인지.
+/// How serious something is.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Level {
     Info,
@@ -35,19 +36,20 @@ impl Level {
     }
 }
 
-/// 로그 파일 하나.
+/// One log file.
 pub struct Logger {
     file: File,
 }
 
 impl Logger {
-    /// 로그 파일을 열어 이어 쓴다. 폴더가 없으면 만든다.
+    /// Opens the log file for appending. Creates the folder if missing.
     pub fn open(path: &Path) -> std::io::Result<Self> {
         Self::open_within(path, MAX_BYTES)
     }
 
-    /// `limit`바이트를 넘은 로그는 `log.old.txt`로 옮기고(이전 것 하나만 남긴다) 새로 시작한다.
-    // ponytail: 켤 때만 크기를 본다. 한 번 켜서 1MB 넘게 쓰는 일은 드물다.
+    /// A log over `limit` bytes is moved to `log.old.txt` (keeping only the previous one) and a new
+    /// one starts.
+    // ponytail: the size is checked only at launch. Writing over 1MB in one session is rare.
     fn open_within(path: &Path, limit: u64) -> std::io::Result<Self> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -61,7 +63,7 @@ impl Logger {
         Ok(Self { file })
     }
 
-    /// 한 항목을 쓴다: `시각 [수준] 내용`. 여러 줄이면 둘째 줄부터 들여 쓴다.
+    /// Writes one entry: `time [level] message`. Lines after the first are indented.
     pub fn write(&mut self, level: Level, text: &str) {
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
         let mut lines = text.lines();
@@ -75,15 +77,15 @@ impl Logger {
             entry.push_str(line);
             entry.push('\n');
         }
-        // 로그를 쓰지 못해도 하던 일은 계속한다.
+        // Carry on with the work even if the log cannot be written.
         let _ = self.file.write_all(entry.as_bytes());
     }
 }
 
-/// 프로그램 전체가 함께 쓰는 로그. `init` 전에는 없다.
+/// The log the whole program shares. Absent before `init`.
 static LOGGER: Mutex<Option<Logger>> = Mutex::new(None);
 
-/// 로그 파일의 위치.
+/// Location of the log file.
 pub fn path() -> PathBuf {
     path_from(|key| std::env::var_os(key))
 }
@@ -97,7 +99,8 @@ fn path_from(var: impl Fn(&str) -> Option<OsString>) -> PathBuf {
     state.join("amsil/log.txt")
 }
 
-/// 로그 파일을 열고, 프로그램이 튕길 때 그 이유도 남기게 해 둔다. 프로그램을 켤 때 한 번 부른다.
+/// Opens the log file and sets it up to record the reason if the program crashes. Called once at
+/// launch.
 pub fn init() {
     let path = path();
     match Logger::open(&path) {
@@ -115,7 +118,7 @@ pub fn init() {
     }
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        // 로그를 쓰던 중에 멈춘 것일 수도 있으니, 잠겨 있으면 기다리지 않는다.
+        // It may have stopped while writing the log, so do not wait if it is locked.
         if let Ok(mut logger) = LOGGER.try_lock()
             && let Some(logger) = logger.as_mut()
         {
@@ -128,7 +131,7 @@ pub fn init() {
     }));
 }
 
-/// 영어로 그려서 쓴다. `Text`나 그것을 담은 오류는 영어 쪽이 나온다.
+/// Renders in English and writes. A `Text`, or an error holding one, gives its English side.
 fn write(level: Level, text: &dyn Display) {
     if let Ok(mut logger) = LOGGER.lock()
         && let Some(logger) = logger.as_mut()
@@ -163,7 +166,7 @@ mod tests {
         dir
     }
 
-    /// `2026-11-18 15:04:05 ` 꼴의 시각으로 시작하는가.
+    /// Whether it starts with a time of the form `2026-11-18 15:04:05 `.
     fn starts_with_time(line: &str) -> bool {
         let bytes = line.as_bytes();
         bytes.len() > 20
@@ -181,12 +184,12 @@ mod tests {
         let dir = temp("lines");
         let path = dir.join("deep/log.txt");
         {
-            // 폴더가 없으면 만든다.
+            // Creates the folder if missing.
             let mut logger = Logger::open(&path).unwrap();
             logger.write(Level::Info, "시작");
             logger.write(Level::Error, "a.ARW: 읽을 수 없습니다");
         }
-        // 다시 열면 이어서 쓴다.
+        // Reopening appends.
         Logger::open(&path)
             .unwrap()
             .write(Level::Warn, "품질을 낮췄습니다");
@@ -213,7 +216,8 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2, "{text}");
         assert!(starts_with_time(lines[0]) && lines[0].ends_with("모델이 없습니다"));
-        // 이어지는 줄은 들여 써서, 시각으로 시작하는 줄만 세면 항목 수가 된다.
+        // Continuation lines are indented, so counting only lines that start with a time gives the
+        // number of entries.
         assert_eq!(lines[1], "    받는 방법: scripts/fetch-models.sh");
     }
 
@@ -224,12 +228,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(&path, "옛 기록\n".repeat(100)).unwrap();
         std::fs::write(dir.join("log.old.txt"), "더 옛 기록\n").unwrap();
-        // 한도보다 작으면 그대로 이어 쓴다.
+        // Below the limit, append as is.
         Logger::open_within(&path, 1 << 20)
             .unwrap()
             .write(Level::Info, "이어서");
         assert!(std::fs::read_to_string(&path).unwrap().contains("옛 기록"));
-        // 한도를 넘었으면 이전 것 하나만 남기고 새로 시작한다.
+        // Over the limit, keep only the previous one and start anew.
         Logger::open_within(&path, 100)
             .unwrap()
             .write(Level::Info, "새로");
@@ -274,15 +278,15 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "a.ARW: 손상된 파일입니다",
-            "화면에는 한국어"
+            "Korean on screen"
         );
         assert_eq!(english(&error), "a.ARW: The file is damaged");
     }
 
     #[test]
     fn nothing_is_written_until_the_log_is_set_up() {
-        // 테스트에서는 `init`을 부르지 않는다. 그래도 로그를 남기는 코드는 탈 없이 지나가야 한다.
-        info("테스트 중");
-        error("테스트 중");
+        // Tests do not call `init`. Code that logs must still pass through without trouble.
+        info("in a test");
+        error("in a test");
     }
 }

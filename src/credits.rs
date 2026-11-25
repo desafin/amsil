@@ -1,7 +1,8 @@
-//! AI 기능이 쓰는 모델의 출처. 화면의 "AI 정보" 창과 각 패널의 한 줄 표시가 이것을 쓴다.
-//! README(한국어, 영어)의 "AI 기능과 출처"와 같은 내용이어야 한다 (테스트가 확인한다).
+//! Sources of the models the AI features use. The "AI info" window and each panel's one-line note
+//! use this.
+//! Must match "AI features and sources" in the READMEs (Korean, English); a test checks it.
 
-/// 모델을 쓰는 기능.
+/// A feature that uses a model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Feature {
     Denoise,
@@ -10,21 +11,21 @@ pub enum Feature {
     Skin,
 }
 
-/// AI 모델 하나의 출처.
+/// Where one AI model comes from.
 pub struct Credit {
     pub feature: Feature,
-    /// 기능의 이름 (한국어, 영어).
+    /// Feature name (Korean, English).
     pub name: (&'static str, &'static str),
     pub model: &'static str,
-    /// 만든 곳.
+    /// Who made it.
     pub by: &'static str,
     pub license: &'static str,
-    /// 만든 곳이 공개한 저장소나 모델 설명.
+    /// The repository or model description the maker published.
     pub source: &'static str,
     pub paper: Option<&'static str>,
-    /// 이 프로그램이 모델 파일을 받는 곳 (한국어, 영어).
+    /// Where this program downloads the model file from (Korean, English).
     pub from: (&'static str, &'static str),
-    /// 알아 둘 것 (한국어, 영어).
+    /// Things to know (Korean, English).
     pub note: (&'static str, &'static str),
 }
 
@@ -100,7 +101,7 @@ pub const SKIN: Credit = Credit {
     ),
 };
 
-/// 모든 AI 기능의 출처.
+/// Sources of every AI feature.
 pub const ALL: [&Credit; 4] = [&DENOISE, &MASK, &RECOMMEND, &SKIN];
 
 #[cfg(test)]
@@ -109,7 +110,11 @@ mod tests {
 
     #[test]
     fn every_ai_feature_names_its_model_maker_licence_and_source() {
-        assert_eq!(ALL.len(), 4, "노이즈 제거, 마스크, 프리셋 추천, 피부 보정");
+        assert_eq!(
+            ALL.len(),
+            4,
+            "noise reduction, masks, preset suggestions, skin retouch"
+        );
         for credit in ALL {
             for text in [credit.model, credit.by, credit.license] {
                 assert!(!text.trim().is_empty(), "{}", credit.model);
@@ -132,8 +137,8 @@ mod tests {
 
     #[test]
     fn the_readme_gives_the_same_sources_as_the_program() {
-        // 화면과 문서가 서로 다른 말을 하지 않도록, 화면에 나오는 출처가 README에도 그대로 있어야 한다.
-        // 한국어와 영어 README 둘 다.
+        // So the screen and the docs never say different things, the sources shown on screen must
+        // appear verbatim in the README too. Both the Korean and the English README.
         let readmes = [
             ("README.md", include_str!("../README.md")),
             ("README.en.md", include_str!("../README.en.md")),
@@ -143,7 +148,7 @@ mod tests {
                 let mut wanted = vec![credit.model, credit.by, credit.license, credit.source];
                 wanted.extend(credit.paper);
                 for text in wanted {
-                    assert!(readme.contains(text), "{file}에 없다: {text}");
+                    assert!(readme.contains(text), "missing from {file}: {text}");
                 }
             }
         }

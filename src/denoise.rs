@@ -1,26 +1,29 @@
-//! AI 노이즈 제거(RawNIND)의 전처리와 후처리: Bayer 묶기, 타일 나누기와 이어붙이기, 밝기 맞추기.
+//! Pre- and post-processing for AI denoising (RawNIND): Bayer packing, tiling and stitching, and
+//! brightness matching.
 //!
-//! 규칙은 darktable-ai의 `rawdenoise-nind` 데모와 같다. 모델 실행 자체는 `infer` 함수로 받는다.
+//! The rules follow darktable-ai's `rawdenoise-nind` demo. Model execution itself is passed in
+//! as the `infer` function.
 
 use crate::lang::text;
 use crate::{Image, Result};
 use rayon::prelude::*;
 
-/// 모델 입력 타일의 한 변 (화소, 반해상도 기준). 모델에 고정된 값이다.
+/// Side length of a model input tile (pixels, at half resolution). Fixed by the model.
 pub const TILE: usize = 512;
-/// 타일 가장자리에서 버리는 폭. 이웃 타일과 겹치는 부분이라 이음매가 생기지 않는다.
+/// Width discarded at tile edges. It overlaps neighboring tiles, so no seams appear.
 const OVERLAP: usize = 64;
-/// 모델은 입력의 2배 해상도로 출력한다 (디모자익 포함).
+/// The model outputs at twice the input resolution (demosaic included).
 const SCALE: usize = 2;
 
-/// [R, G1, G2, B] 순서의 반해상도 4채널.
+/// Half-resolution 4 channels in [R, G1, G2, B] order.
 pub struct Packed {
     pub width: usize,
     pub height: usize,
     pub planes: [Vec<f32>; 4],
 }
 
-/// Bayer 모자이크를 4채널로 묶는다. `(ox, oy)`는 모자이크에서 첫 R 화소의 위치(0 또는 1)다.
+/// Packs a Bayer mosaic into 4 channels. `(ox, oy)` is the position (0 or 1) of the first R pixel
+/// in the mosaic.
 pub fn pack_rggb(mosaic: &[f32], width: usize, height: usize, ox: usize, oy: usize) -> Packed {
     let (w, h) = ((width - ox) / 2, (height - oy) / 2);
     let plane = |dx: usize, dy: usize| {
@@ -38,13 +41,14 @@ pub fn pack_rggb(mosaic: &[f32], width: usize, height: usize, ox: usize, oy: usi
     }
 }
 
-/// 묶은 Bayer 데이터에 노이즈 제거 모델을 돌려 센서 전체 크기의 카메라 RGB를 만든다.
+/// Runs the denoising model on packed Bayer data to produce full-sensor-size camera RGB.
 ///
-/// `infer`는 4×512×512 입력(채널 우선)을 받아 3×1024×1024 출력을 돌려준다.
+/// `infer` takes a 4×512×512 input (channel-first) and returns a 3×1024×1024 output.
 pub fn run(packed: &Packed, infer: impl FnMut(&[f32]) -> Result<Vec<f32>>) -> Result<Image> {
     let mut out = run_tiled(packed, infer)?;
-    // 모델 출력의 배율은 임의라서 평균을 센서 데이터에 맞춘다. darktable-ai 데모는 4채널 평균에 맞추지만
-    // 그러면 G가 두 번 세어져 실제 RGB보다 밝아진다. 여기서는 RGB 평균(G는 두 채널의 평균)에 맞춘다.
+    // The model output has an arbitrary scale, so its mean is matched to the sensor data. The
+    // darktable-ai demo matches the 4-channel mean, but that counts G twice and comes out brighter
+    // than the real RGB. Here we match the RGB mean (G being the mean of its two channels).
     let mean = |c: usize| {
         packed.planes[c].par_iter().map(|&v| v as f64).sum::<f64>() / packed.planes[c].len() as f64
     };
@@ -53,21 +57,22 @@ pub fn run(packed: &Packed, infer: impl FnMut(&[f32]) -> Result<Vec<f32>>) -> Re
     Ok(out)
 }
 
-/// `run`이 모델을 부르는 횟수.
+/// Number of times `run` calls the model.
 pub fn tile_count(packed: &Packed) -> usize {
     let step = TILE - 2 * OVERLAP;
     packed.width.div_ceil(step) * packed.height.div_ceil(step)
 }
 
-/// 타일마다 `infer`를 불러 2배 해상도의 3채널 이미지를 만든다.
+/// Calls `infer` per tile to build a 3-channel image at twice the resolution.
 ///
-/// `infer`는 4×512×512 입력(채널 우선)을 받아 3×1024×1024 출력을 돌려준다.
+/// `infer` takes a 4×512×512 input (channel-first) and returns a 3×1024×1024 output.
 pub fn run_tiled(
     packed: &Packed,
     mut infer: impl FnMut(&[f32]) -> Result<Vec<f32>>,
 ) -> Result<Image> {
     let (w, h) = (packed.width, packed.height);
-    // 각 타일은 가운데 step×step만 결과에 쓰고, 둘레 OVERLAP은 문맥으로만 쓴다.
+    // Each tile contributes only its central step×step to the result; the surrounding OVERLAP
+    // serves only as context.
     let step = TILE - 2 * OVERLAP;
     let (out_w, out_side) = (w * SCALE, TILE * SCALE);
     let mut planes = [0, 1, 2].map(|_| vec![0f32; out_w * h * SCALE]);
@@ -116,7 +121,7 @@ pub fn run_tiled(
     })
 }
 
-/// 이미지 밖의 좌표를 거울처럼 접어 안쪽 좌표로 바꾼다 (가장자리 화소는 반복하지 않는다).
+/// Mirrors coordinates outside the image back inside (the edge pixel is not repeated).
 fn mirror(i: isize, n: usize) -> usize {
     if n == 1 {
         return 0;
@@ -126,7 +131,7 @@ fn mirror(i: isize, n: usize) -> usize {
     (if m < n as isize { m } else { period - m }) as usize
 }
 
-/// 노이즈 제거 강도. 0이면 `plain` 그대로, 1이면 `denoised` 그대로, 그 사이는 섞는다.
+/// Denoising strength. 0 gives `plain` as is, 1 gives `denoised` as is, values in between blend.
 pub fn mix(mut plain: Image, denoised: &Image, strength: f32) -> Image {
     for (a, b) in plain.planes.iter_mut().zip(&denoised.planes) {
         a.par_iter_mut()
@@ -136,7 +141,8 @@ pub fn mix(mut plain: Image, denoised: &Image, strength: f32) -> Image {
     plain
 }
 
-/// 이미지 전체에 같은 배율을 곱해 평균을 `target_mean`으로 맞춘다. 모델 출력의 배율이 임의이기 때문이다.
+/// Multiplies the whole image by one gain so its mean becomes `target_mean`. Needed because the
+/// model output has an arbitrary scale.
 pub fn match_gain(img: &mut Image, target_mean: f32) {
     let count = (img.width * img.height * 3) as f64;
     let sum: f64 = img
@@ -175,7 +181,7 @@ mod tests {
 
     #[test]
     fn packing_starts_at_the_first_red_pixel() {
-        // G R G R G R     R이 (1, 0)에 있는 GRBG 센서. 첫 열을 건너뛰어 RGGB로 맞춘다.
+        // G R G R G R     GRBG sensor with R at (1, 0). Skip the first column to get RGGB.
         // B G B G B G
         let mosaic: Vec<f32> = (0..12).map(|v| v as f32).collect();
         let p = pack_rggb(&mosaic, 6, 2, 1, 0);
@@ -186,7 +192,7 @@ mod tests {
         assert_eq!(p.planes[3], [8.0, 10.0]); // B
     }
 
-    /// 화소마다 값이 다른 4채널 이미지.
+    /// A 4-channel image with a different value at every pixel.
     fn numbered(width: usize, height: usize) -> Packed {
         let plane = |c: usize| (0..width * height).map(|i| (i * 4 + c) as f32).collect();
         Packed {
@@ -196,7 +202,7 @@ mod tests {
         }
     }
 
-    /// 가짜 모델: 출력 채널 c의 (x, y)는 입력 채널 c의 (x/2 + dx, y/2 + dy).
+    /// Fake model: output channel c at (x, y) is input channel c at (x/2 + dx, y/2 + dy).
     fn shifted_copy(dx: isize, dy: isize) -> impl FnMut(&[f32]) -> Result<Vec<f32>> {
         move |tile| {
             let out_side = TILE * SCALE;
@@ -218,7 +224,7 @@ mod tests {
 
     #[test]
     fn stitched_tiles_reproduce_the_whole_image_without_seams() {
-        // 타일 여러 개가 필요하고 타일 간격의 배수가 아닌 크기
+        // A size that needs several tiles and is not a multiple of the tile step
         let packed = numbered(900, 600);
         let mut calls = 0;
         let mut model = shifted_copy(0, 0);
@@ -238,7 +244,7 @@ mod tests {
                     assert_eq!(
                         out.planes[c][y * out.width + x],
                         want,
-                        "채널 {c} ({x}, {y})"
+                        "channel {c} ({x}, {y})"
                     );
                 }
             }
@@ -248,15 +254,15 @@ mod tests {
     #[test]
     fn image_borders_are_mirror_padded() {
         let packed = numbered(600, 520);
-        // 왼쪽 위 이웃을 읽는 모델: 이미지 밖은 거울처럼 접힌 화소여야 한다.
+        // A model that reads the top-left neighbor: outside the image it must see mirrored pixels.
         let out = run_tiled(&packed, shifted_copy(-1, -1)).unwrap();
         let at = |x: usize, y: usize| out.planes[0][y * out.width + x];
         let src = |x: usize, y: usize| packed.planes[0][y * packed.width + x];
         assert_eq!(at(0, 0), src(1, 1)); // (-1, -1) → (1, 1)
         assert_eq!(at(10, 0), src(4, 1)); // (4, -1) → (4, 1)
-        assert_eq!(at(10, 10), src(4, 4)); // 안쪽은 그대로 한 칸 이동
+        assert_eq!(at(10, 10), src(4, 4)); // Inside, just a one-pixel shift
 
-        // 오른쪽 아래 이웃을 읽는 모델
+        // A model that reads the bottom-right neighbor
         let out = run_tiled(&packed, shifted_copy(1, 1)).unwrap();
         let at = |x: usize, y: usize| out.planes[0][y * out.width + x];
         assert_eq!(at(1199, 1039), src(598, 518)); // (600, 520) → (598, 518)
@@ -264,7 +270,7 @@ mod tests {
 
     #[test]
     fn output_brightness_follows_the_sensor_data_whatever_the_model_gain() {
-        // 화이트밸런스 전의 균일한 색: R 0.1, G 0.2, B 0.15
+        // A uniform color before white balance: R 0.1, G 0.2, B 0.15
         let (w, h) = (600, 520);
         let flat = |v: f32| vec![v; w * h];
         let packed = Packed {
@@ -272,7 +278,7 @@ mod tests {
             height: h,
             planes: [flat(0.1), flat(0.2), flat(0.2), flat(0.15)],
         };
-        // 가짜 모델: 색은 맞지만 배율이 제멋대로 (×1000)
+        // Fake model: correct colors but an arbitrary scale (×1000)
         let model = |tile: &[f32]| {
             let side = TILE * SCALE;
             let mut out = vec![0f32; 3 * side * side];
@@ -292,7 +298,7 @@ mod tests {
         assert_eq!((out.width, out.height), (w * 2, h * 2));
         for (c, want) in [0.1, 0.2, 0.15].into_iter().enumerate() {
             let got = out.planes[c][out.width * 500 + 700];
-            assert!((got - want).abs() < 1e-4, "채널 {c}: {got}");
+            assert!((got - want).abs() < 1e-4, "channel {c}: {got}");
         }
     }
 
@@ -321,7 +327,7 @@ mod tests {
         assert!((mean - 0.25).abs() < 1e-6, "{mean}");
         assert!(
             (img.planes[0][1] / img.planes[0][0] - 3.0).abs() < 1e-5,
-            "비율은 유지된다"
+            "ratios are preserved"
         );
     }
 

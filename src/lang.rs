@@ -1,9 +1,10 @@
-//! 화면과 메시지의 언어. 한국어와 영어 두 가지다.
+//! The language of the screen and messages. There are two: Korean and English.
 //!
-//! 문구는 쓰는 자리에 두 언어를 나란히 적는다: `t("사진", "Photos")`.
+//! Wording is written with both languages side by side where it is used: `t("사진", "Photos")`.
 //!
-//! 오류와 알림처럼 화면에도 나오고 로그에도 남는 글은 `text!("…", "…")`로 두 언어를 함께 지닌
-//! [`Text`]로 만든다. 화면에는 지금 언어로 보이고, 로그에는 언제나 영어로 남는다.
+//! Text that both appears on screen and stays in the log, like errors and notices, is made with
+//! `text!("…", "…")` as a [`Text`] that carries both languages. On screen it shows in the current
+//! language; in the log it is always English.
 
 use serde::{Deserialize, Serialize};
 
@@ -14,18 +15,19 @@ pub enum Lang {
     En,
 }
 
-// 오류 문구는 백그라운드 스레드에서도 만들어지므로, 언어는 프로그램 전체가 함께 보는 값 하나로 둔다.
+// Error text is also built on background threads, so the language is a single value shared by the
+// whole program.
 #[cfg(not(test))]
 static ENGLISH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-// 테스트는 한 프로세스에서 여러 개가 동시에 돈다. 한 테스트가 언어를 바꿔도 다른 테스트가
-// 흔들리지 않도록 스레드마다 따로 둔다.
+// Tests run several at once in one process. Keep it per thread so that one test changing the
+// language does not disturb the others.
 #[cfg(test)]
 thread_local!(static ENGLISH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) });
 
-// `with`가 잠시 정한 언어. 그 스레드에서만 보인다.
+// The language set temporarily by `with`. Visible only on that thread.
 thread_local!(static OVERRIDE: std::cell::Cell<Option<Lang>> = const { std::cell::Cell::new(None) });
 
-/// 지금 언어. 따로 정하지 않으면 한국어다.
+/// The current language. Korean unless set otherwise.
 pub fn current() -> Lang {
     if let Some(lang) = OVERRIDE.get() {
         return lang;
@@ -45,7 +47,7 @@ pub fn set(lang: Lang) {
     ENGLISH.set(english);
 }
 
-/// 지금 언어에 맞는 쪽을 고른다.
+/// Picks the side that matches the current language.
 pub fn t<T>(ko: T, en: T) -> T {
     match current() {
         Lang::Ko => ko,
@@ -53,9 +55,9 @@ pub fn t<T>(ko: T, en: T) -> T {
     }
 }
 
-/// `f`를 부르는 동안만 이 스레드의 언어를 `lang`으로 둔다. 화면의 언어는 그대로다.
+/// Sets this thread's language to `lang` only while `f` is called. The screen language stays as is.
 pub fn with<R>(lang: Lang, f: impl FnOnce() -> R) -> R {
-    // `f`가 패닉해도 원래 언어로 돌려놓는다.
+    // Restore the original language even if `f` panics.
     struct Restore(Option<Lang>);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -66,10 +68,10 @@ pub fn with<R>(lang: Lang, f: impl FnOnce() -> R) -> R {
     f()
 }
 
-/// 두 언어로 된 [`Text`]를 만든다: `text!(format!("{n}장"), format!("{n} photos"))`.
+/// Makes a bilingual [`Text`]: `text!(format!("{n}장"), format!("{n} photos"))`.
 ///
-/// 한국어 쪽은 한국어로, 영어 쪽은 영어로 그린다. 그래서 글 안에 넣은 다른 오류(`{e}`)도
-/// 언어마다 제 말로 들어간다.
+/// The Korean side is rendered in Korean and the English side in English, so another error put into
+/// the text (`{e}`) also comes out in each language's own words.
 macro_rules! text {
     ($ko:expr, $en:expr $(,)?) => {
         $crate::lang::Text::new(
@@ -84,8 +86,8 @@ macro_rules! text {
 }
 pub(crate) use text;
 
-/// 두 언어로 된 글. 오류와 알림처럼 화면에도 나오고 로그에도 남는 글이다.
-/// 화면에는 지금 언어로 보이고(`Display`), 로그에는 영어로 남는다.
+/// Bilingual text. Text that both appears on screen and stays in the log, like errors and notices.
+/// On screen it shows in the current language (`Display`); in the log it stays in English.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Text {
     ko: String,
@@ -97,7 +99,7 @@ impl Text {
         Self { ko, en }
     }
 
-    /// 다른 오류를 두 언어로 옮겨 담는다. 그 안에 `Text`가 들어 있으면 언어마다 제 말로 나온다.
+    /// Carries another error over in both languages. A `Text` inside comes out in each language.
     pub fn of(value: &(impl std::fmt::Display + ?Sized)) -> Self {
         text!(value, value)
     }
@@ -115,8 +117,9 @@ impl std::fmt::Display for Text {
 
 impl std::error::Error for Text {}
 
-/// 시스템의 언어. POSIX 규칙대로 `LC_ALL`, `LC_MESSAGES`, `LANG` 순서로 본다.
-// ponytail: 환경 변수만 본다. 이 변수들이 없는 Windows에서는 영어가 된다. Windows를 지원할 때 시스템 API로 바꾼다.
+/// The system language. Checks `LC_ALL`, `LC_MESSAGES`, `LANG` in that order, per POSIX rules.
+// ponytail: only looks at environment variables. On Windows, which lacks them, this becomes
+// English. Switch to the system API when Windows is supported.
 pub fn system() -> Lang {
     system_from(|key| std::env::var(key).ok())
 }
@@ -129,7 +132,7 @@ fn system_from(var: impl Fn(&str) -> Option<String>) -> Lang {
         .map_or(Lang::En, |locale| from_locale(&locale))
 }
 
-/// 로캘 이름(`ko_KR.UTF-8` 등)의 언어. 한국어가 아니면 모두 영어로 본다.
+/// The language of a locale name (`ko_KR.UTF-8` etc.). Anything not Korean counts as English.
 fn from_locale(locale: &str) -> Lang {
     if locale.split(['_', '.', '@']).next() == Some("ko") {
         Lang::Ko
@@ -170,14 +173,14 @@ mod tests {
             system(&[("LANG", "en_US.UTF-8"), ("LC_MESSAGES", "ko_KR.UTF-8")]),
             Lang::Ko
         );
-        // 빈 값은 정하지 않은 것으로 본다.
+        // An empty value counts as unset.
         assert_eq!(system(&[("LANG", "ko_KR.UTF-8"), ("LC_ALL", "")]), Lang::Ko);
         assert_eq!(system(&[]), Lang::En);
     }
 
     #[test]
     fn t_picks_the_text_for_the_current_language() {
-        assert_eq!(current(), Lang::Ko, "따로 정하지 않으면 한국어");
+        assert_eq!(current(), Lang::Ko, "Korean unless set otherwise");
         assert_eq!(t("사진", "Photos"), "사진");
         set(Lang::En);
         assert_eq!(current(), Lang::En);
@@ -188,7 +191,7 @@ mod tests {
     #[test]
     fn a_text_shows_the_current_language_and_keeps_the_english() {
         let missing = text!("모델이 없습니다", "The model is missing");
-        // 글 안에 넣은 오류도 언어마다 제 말로 들어간다.
+        // An error put into the text also comes out in each language's own words.
         let wrapped = text!(format!("a.ARW: {missing}"), format!("a.ARW: {missing}"));
         let boxed: Box<dyn std::error::Error + Send + Sync> = wrapped.clone().into();
         let carried = Text::of(&boxed);
@@ -202,6 +205,10 @@ mod tests {
             with(Lang::Ko, || boxed.to_string()),
             "a.ARW: 모델이 없습니다"
         );
-        assert_eq!(current(), Lang::En, "with는 끝나면 언어를 돌려놓는다");
+        assert_eq!(
+            current(),
+            Lang::En,
+            "with restores the language when it ends"
+        );
     }
 }

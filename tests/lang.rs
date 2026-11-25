@@ -1,9 +1,10 @@
-//! 실행 파일을 직접 돌려, 메시지의 언어가 시스템 로캘과 설정 파일을 따르는지 본다.
+//! Runs the executable directly to check that the message language follows the system locale and
+//! the settings file.
 
 use std::path::Path;
 use std::process::Command;
 
-/// 모르는 옵션을 주고 실행했을 때의 오류 출력.
+/// Error output when run with an unknown option.
 fn complaint(config_home: &Path, locale: &str) -> String {
     let output = Command::new(env!("CARGO_BIN_EXE_amsil"))
         .arg("--nope")
@@ -11,7 +12,7 @@ fn complaint(config_home: &Path, locale: &str) -> String {
         .env_remove("LC_MESSAGES")
         .env("LANG", locale)
         .env("XDG_CONFIG_HOME", config_home)
-        // 로그도 임시 폴더에 쓰게 한다 (사용자의 실제 로그를 건드리지 않는다).
+        // Write the log to the temp folder too (leave the user's real log alone).
         .env("XDG_STATE_HOME", config_home.join("state"))
         .output()
         .unwrap();
@@ -34,7 +35,7 @@ fn messages_follow_the_system_locale_unless_a_language_was_chosen() {
         "{english}"
     );
 
-    // 화면에서 고른 언어는 설정 파일에 남고, 시스템 로캘보다 먼저다.
+    // The language chosen on screen is kept in the settings file and overrides the system locale.
     std::fs::write(dir.join("amsil/config.toml"), "lang = \"ko\"\n").unwrap();
     let chosen = complaint(&dir, "en_US.UTF-8");
     std::fs::remove_dir_all(&dir).unwrap();

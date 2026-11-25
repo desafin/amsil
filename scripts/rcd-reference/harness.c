@@ -1,13 +1,13 @@
 /*
- * 원본 RCD(rcd_demosaicing.c)를 dcraw 밖에서 돌려 정답지를 만드는 시험용 틀.
+ * Test harness that runs the original RCD (rcd_demosaicing.c) outside dcraw to produce reference outputs.
  *
- * rcd_demosaicing.c는 dcraw의 함수로 짜여 있어서 dcraw의 전역 변수(width, height, filters, image 등)와
- * 도우미(FC, LIM, CLIP, merror, border_interpolate)가 필요하다. 그것들을 dcraw와 같은 뜻으로 여기 둔다.
- * border_interpolate()는 dcraw.c(Dave Coffin)에서 그대로 옮겼다.
+ * rcd_demosaicing.c is written as a dcraw function, so it needs dcraw's globals (width, height, filters,
+ * image, etc.) and helpers (FC, LIM, CLIP, merror, border_interpolate). They are defined here with the
+ * same semantics as in dcraw. border_interpolate() is copied verbatim from dcraw.c (Dave Coffin).
  *
- * 쓰는 법: harness <가로> <세로> <filters 16진> <random|edges> <출력 파일>
- * 출력 형식 (리틀 엔디언): "RCD1", u32 가로, u32 세로, u32 filters,
- *   u16 × (가로·세로) 입력 CFA, u16 × (가로·세로·3) 출력 RGB (화소마다 R, G, B).
+ * Usage: harness <width> <height> <filters hex> <random|edges> <output file>
+ * Output format (little-endian): "RCD1", u32 width, u32 height, u32 filters,
+ *   u16 x (width*height) input CFA, u16 x (width*height*3) output RGB (R, G, B per pixel).
  *
  * This program is free software: you can redistribute it and/or modify it under the terms of the
  * GNU General Public License as published by the Free Software Foundation, either version 3 of the
@@ -44,7 +44,7 @@ static void merror(void *ptr, const char *where)
 
 static int fcol(int row, int col) { return FC(row, col); }
 
-/* dcraw.c의 border_interpolate (그대로) */
+/* border_interpolate from dcraw.c (verbatim) */
 void CLASS border_interpolate(int border)
 {
     unsigned row, col, y, x, f, c, sum[8];
@@ -67,7 +67,8 @@ void CLASS border_interpolate(int border)
         }
 }
 
-/* 원본은 4행에서 버퍼 앞을 읽는다(정의되지 않은 동작). 앞에 0을 채운 여유를 두어 결과를 결정적으로 만든다. */
+/* The original reads before the start of the buffer at row 4 (undefined behavior). A zero-filled margin
+ * in front of each allocation makes the result deterministic. */
 static void *pcalloc(size_t n, size_t s)
 {
     char *p = calloc(n * s + 64, 1);
@@ -90,15 +91,15 @@ static unsigned lcg(void)
     return state >> 16;
 }
 
-/* 경계, 가는 선, 포화 조각이 든 그림. 대칭이 되지 않게 약한 노이즈를 더한다. */
+/* Test image with edges, a thin line, and a saturated patch. Faint noise is added to break symmetry. */
 static unsigned edges_value(int row, int col)
 {
-    double v = 8000.0 + 30000.0 * col / width;          /* 가로 그라데이션 */
-    if (col >= width / 3) v += 12000.0;                 /* 세로 경계 */
-    if (row >= height / 2) v *= 0.6;                    /* 가로 경계 */
-    if (col + 2 * row > (width + height) * 3 / 4) v += 5000.0; /* 기운 경계 */
-    if (row == 7) v = 50000.0;                          /* 1화소 가는 선 */
-    if (row >= 10 && row < 14 && col >= 30 && col < 34) v = 65535.0; /* 포화 조각 */
+    double v = 8000.0 + 30000.0 * col / width;          /* horizontal gradient */
+    if (col >= width / 3) v += 12000.0;                 /* vertical edge */
+    if (row >= height / 2) v *= 0.6;                    /* horizontal edge */
+    if (col + 2 * row > (width + height) * 3 / 4) v += 5000.0; /* diagonal edge */
+    if (row == 7) v = 50000.0;                          /* 1-pixel line */
+    if (row >= 10 && row < 14 && col >= 30 && col < 34) v = 65535.0; /* saturated patch */
     v += (double)(lcg() % 401) - 200.0;
     if (v < 0) v = 0;
     if (v > 65535) v = 65535;

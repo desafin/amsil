@@ -1,12 +1,12 @@
-//! 측정 도구(`scripts/sharpness`)와 주고받는 16비트 그림 파일. 테스트에서만 쓴다.
+//! 16-bit image files exchanged with the measurement tools (`scripts/sharpness`). Test-only.
 //!
-//! 형식 (리틀 엔디언): u32 가로, u32 세로, 그 뒤에 화소마다 R, G, B의 u16 (0..65535 = 0..1).
-//! 파이썬 쪽은 `scripts/sharpness/common.py`의 `load_raw`, `save_raw`.
+//! Format (little-endian): u32 width, u32 height, then u16 R, G, B per pixel (0..65535 = 0..1).
+//! The Python side is `load_raw` and `save_raw` in `scripts/sharpness/common.py`.
 
 use crate::Image;
 use std::path::Path;
 
-/// `image`에서 (`x0`, `y0`)부터 `width` × `height`를 잘라 쓴다.
+/// Crops `width` × `height` from `image` starting at (`x0`, `y0`) and writes it.
 pub fn write(
     image: &Image,
     (x0, y0): (usize, usize),
@@ -42,7 +42,7 @@ pub fn read(path: &Path) -> Image {
     }
 }
 
-/// 측정 그림을 두는 폴더 (`AMSIL_SHARPNESS_DIR`, 없으면 `/tmp/amsil-sharpness`).
+/// Folder for measurement images (`AMSIL_SHARPNESS_DIR`, or `/tmp/amsil-sharpness` if unset).
 pub fn dir() -> std::path::PathBuf {
     let dir = std::path::PathBuf::from(
         std::env::var("AMSIL_SHARPNESS_DIR").unwrap_or("/tmp/amsil-sharpness".into()),
@@ -51,8 +51,9 @@ pub fn dir() -> std::path::PathBuf {
     dir
 }
 
-/// 측정에 쓰는 샘플: (DCIM 아래 경로, 2048×2048로 자를 곳의 왼쪽 위 y, x).
-/// 2026-11-20 측정에서 세부가 가장 많던 창이다. `scripts/sharpness/common.py`의 `PHOTOS`와 같아야 한다.
+/// Samples used for measurement: (path under DCIM, top-left y, x of the 2048×2048 crop).
+/// These were the windows with the most detail in the 2026-11-20 measurement. Must match `PHOTOS`
+/// in `scripts/sharpness/common.py`.
 pub const PHOTOS: [(&str, usize, usize); 6] = [
     ("10361110/DSC04551", 3328, 0),
     ("10361110/DSC04546", 3072, 0),
@@ -62,7 +63,7 @@ pub const PHOTOS: [(&str, usize, usize); 6] = [
     ("10161107/DSC04286", 768, 1536),
 ];
 
-/// 자르는 크기.
+/// Crop size.
 pub const SIDE: usize = 2048;
 
 #[cfg(test)]

@@ -9,10 +9,10 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: 시스템 패키지
+      - name: System packages
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential cmake pkg-config libx265-dev libde265-dev libnuma-dev
-      # Rust 버전은 rust-toolchain.toml이 정한다.
+      # The Rust version is set by rust-toolchain.toml.
       - run: cargo build --locked
       - run: cargo test --locked

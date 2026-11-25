@@ -1,7 +1,8 @@
-"""선예도 측정 도구가 같이 쓰는 것: 그림 읽기·쓰기, 스펙트럼, 구역 나누기, 샤픈 필터의 주파수 응답.
+"""Shared helpers for the sharpness tools: image I/O, spectra, tile classification, and the frequency
+response of sharpening filters.
 
-그림은 Rust 쪽의 측정 테스트(`src/raw16.rs` 형식)가 만든다. 폴더는 명령의 첫 인자, 없으면
-`AMSIL_SHARPNESS_DIR`, 그것도 없으면 `/tmp/amsil-sharpness`.
+Images come from the Rust measurement tests (`src/raw16.rs` format). The folder is the first argument,
+else `AMSIL_SHARPNESS_DIR`, else `/tmp/amsil-sharpness`.
 """
 import os
 import sys
@@ -12,7 +13,7 @@ from PIL import Image, ImageOps
 
 ROOT = Path(__file__).resolve().parents[2]
 SIDE = 2048
-# src/raw16.rs의 PHOTOS와 같아야 한다: 이름 → (DCIM 아래 폴더, 자를 곳의 y, x)
+# Must match PHOTOS in src/raw16.rs: name -> (folder under DCIM, crop origin y, x)
 PHOTOS = {
     "DSC04551": ("10361110", 3328, 0),
     "DSC04546": ("10361110", 3072, 0),
@@ -21,10 +22,10 @@ PHOTOS = {
     "DSC04311": ("10161107", 1792, 768),
     "DSC04286": ("10161107", 768, 1536),
 }
-# 카메라 JPEG가 노이즈를 강하게 지워 선예도 비교가 맞지 않는 고감도 사진
+# High-ISO shots where the camera JPEG applies heavy noise reduction, so sharpness comparison is not meaningful
 HIGH_ISO = {"DSC04286"}
 
-N = 256  # 스펙트럼을 재는 구역의 크기
+N = 256  # tile size for spectrum measurement
 BINS = np.linspace(0, 0.5, 51)
 CENTRES = (BINS[:-1] + BINS[1:]) / 2  # cycles/pixel
 
@@ -37,7 +38,7 @@ def data_dir(argv=None):
 
 
 def load_raw(path):
-    """src/raw16.rs 형식 → (세로, 가로, 3) 0..1."""
+    """src/raw16.rs format -> (height, width, 3) in 0..1."""
     w, h = np.fromfile(path, dtype="<u4", count=2)
     return np.fromfile(path, dtype="<u2", offset=8).reshape(int(h), int(w), 3) / 65535.0
 
@@ -54,7 +55,7 @@ def luma(rgb):
 
 
 def camera_jpeg(name):
-    """카메라 JPEG를 EXIF 방향대로 세워 측정 영역과 같은 자리를 자른 RGB (0..1)."""
+    """Camera JPEG, rotated per EXIF orientation and cropped to the measurement area, as RGB (0..1)."""
     folder, y0, x0 = PHOTOS[name]
     jpeg = ImageOps.exif_transpose(Image.open(ROOT / f"DCIM/{folder}/{name}.JPG")).convert("RGB")
     return np.asarray(jpeg.crop((x0, y0, x0 + SIDE, y0 + SIDE)), dtype=np.float64) / 255.0
@@ -69,7 +70,7 @@ def tiles(size=SIDE, n=N):
 
 
 def spectrum(L, coords, n=N):
-    """구역들의 방사 평균 파워 스펙트럼 (CENTRES의 주파수마다)."""
+    """Radially averaged power spectrum over the tiles (at each frequency in CENTRES)."""
     win = np.outer(np.hanning(n), np.hanning(n))
     f = np.sqrt(np.fft.fftfreq(n)[None, :] ** 2 + np.fft.fftfreq(n)[:, None] ** 2).ravel()
     idx = np.digitize(f, BINS) - 1
@@ -85,7 +86,7 @@ def spectrum(L, coords, n=N):
 
 
 def split(L):
-    """중간 대역(0.08~0.2) 에너지로 구역을 나눈다: (세부 = 위 15%, 평평한 곳 = 아래 25%)."""
+    """Classify tiles by mid-band (0.08-0.2) energy: (detail = top 15%, flat = bottom 25%)."""
     coords = tiles(L.shape[0])
     mid = (CENTRES > 0.08) & (CENTRES < 0.2)
     energy = np.array([spectrum(L, [c])[mid].mean() for c in coords])
@@ -95,13 +96,13 @@ def split(L):
 
 
 def curve(a, b, coords):
-    """a의 진폭이 b의 몇 배인가, 주파수마다. 0.02~0.06 대역을 1로 맞춘다 (밝기·대비 차이를 뺀다)."""
+    """Amplitude ratio of a to b at each frequency, normalized to 1 over 0.02-0.06 (removes brightness/contrast differences)."""
     g = np.sqrt(spectrum(a, coords) / spectrum(b, coords))
     return g / g[(CENTRES > 0.02) & (CENTRES < 0.06)].mean()
 
 
 def band(g, low, high):
-    """곡선의 [low, high] cycles/pixel 평균."""
+    """Mean of the curve over [low, high] cycles/pixel."""
     sel = (CENTRES > low) & (CENTRES < high)
     return g[sel].mean()
 
@@ -110,9 +111,9 @@ def at(g, frequency):
     return g[np.argmin(abs(CENTRES - frequency))]
 
 
-# 샤픈 필터의 주파수 응답 (방사 평균을 1D로 근사)
+# Frequency response of sharpening filters (radial average approximated in 1D)
 def usm_gain(f, amount, r, passes=1):
-    """상자 흐림(반경 r, passes번)으로 만든 언샤프 마스크. 암실의 창작 샤픈은 r = 긴 변 × 0.0004, 1번."""
+    """Unsharp mask built from a box blur (radius r, `passes` passes). Amsil's creative sharpening uses r = long side x 0.0004, 1 pass."""
     n = 2 * r + 1
     with np.errstate(invalid="ignore", divide="ignore"):
         b = np.where(f == 0, 1.0, np.sin(np.pi * f * n) / (n * np.sin(np.pi * f)))
@@ -124,12 +125,12 @@ def gauss_gain(f, amount, sigma):
 
 
 def bandpass_gain(f, amount, s1, s2):
-    """작게 흐린 것(s1)과 크게 흐린 것(s2)의 차이를 더한다: 가장 고운 대역은 덜 키운다."""
+    """Adds the difference of a small blur (s1) and a large blur (s2): boosts the finest band less."""
     g = lambda s: np.exp(-2 * np.pi ** 2 * s ** 2 * f ** 2)
     return 1 + amount * (g(s1) - g(s2))
 
 
-# 공간 필터 (scipy 없이)
+# Spatial filters (no scipy)
 def _separable(L, k):
     r = len(k) // 2
     P = np.pad(L, ((0, 0), (r, r)), mode="reflect")

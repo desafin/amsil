@@ -1,44 +1,50 @@
-//! 캡처 샤픈: 렌즈·로우패스 필터·회절로 흐려진 것을 RAW 단계에서 되돌린다.
+//! Capture sharpening: undoes blur from the lens, low-pass filter, and diffraction at the RAW
+//! stage.
 //!
-//! RawTherapee의 Capture Sharpening(Ingo Weyrich, GPL-3.0-or-later)을 옮긴 것이다.
-//! 기준 판: `rtengine/capturesharpening.cc`·`boxblur.cc` 커밋 c6d04960e14f,
-//! `rtengine/rt_algo.cc` 커밋 1c2b3f33772e (<https://github.com/RawTherapee/RawTherapee>).
-//! 밝기에만 Richardson–Lucy 디컨볼루션을 하고, 경계가 뚜렷한 곳만 섞는다.
+//! A port of RawTherapee's Capture Sharpening (Ingo Weyrich, GPL-3.0-or-later).
+//! Reference version: `rtengine/capturesharpening.cc` and `boxblur.cc` at commit c6d04960e14f,
+//! `rtengine/rt_algo.cc` at commit 1c2b3f33772e (<https://github.com/RawTherapee/RawTherapee>).
+//! Richardson–Lucy deconvolution runs on luminance only, and is blended in only where edges are
+//! distinct.
 //!
-//! RawTherapee와 다른 점:
-//! - 32×32 구역으로 나눠 따로 계산하지 않고 그림 전체에 반복한다 (구역 분할은 속도를 위한 것이다).
-//!   자동 멈춤 판단만 구역마다 한다.
-//! - 대비 문턱이 0이어도 하이라이트 보호를 유지한다 (RawTherapee는 이때 보호 마스크를 버린다).
-//! - 끝 구역을 두 번 섞지 않는다. 모서리 반경 키우기에서 앞 구역의 값을 쓰지 않는다.
-//! - 샤픈 전·후의 노이즈 제거와 X-Trans 센서는 옮기지 않았다.
+//! Differences from RawTherapee:
+//! - Iterates over the whole image instead of computing 32×32 tiles separately (the tiling is for
+//!   speed). Only the auto-stop decision is made per tile.
+//! - Keeps highlight protection even when the contrast threshold is 0 (RawTherapee drops the
+//!   protection mask in that case).
+//! - Does not blend the last tile twice. The corner radius boost does not use the previous tile's
+//!   value.
+//! - Pre- and post-sharpening noise reduction and X-Trans sensors are not ported.
 
 use crate::raw::Sensor;
 use serde::{Deserialize, Serialize};
 use std::ops::RangeInclusive;
 
-/// 사진마다 저장하는 캡처 샤픈 값 (프로젝트 파일의 `capture`).
+/// Per-photo capture sharpening settings (`capture` in the project file).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Capture {
-    /// 캡처 샤픈을 할지.
+    /// Whether to apply capture sharpening.
     pub enabled: bool,
-    /// 반복 횟수. 많을수록 흐림을 더 되돌린다 (세기 역할).
+    /// Iteration count. More iterations undo more blur (acts as the strength).
     pub iterations: u32,
-    /// 되돌릴 흐림의 반경(σ, 화소). 없으면 사진에서 구한다.
+    /// Radius (σ, pixels) of the blur to undo. Derived from the photo if unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub radius: Option<f32>,
-    /// 대비 문턱. 높을수록 뚜렷한 경계만 샤픈한다. 없으면 사진에서 구한다 (RawTherapee의 자동).
+    /// Contrast threshold. Higher values sharpen only distinct edges. Derived from the photo if
+    /// unset (RawTherapee's auto).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub threshold: Option<f32>,
-    /// 모서리로 갈수록 반경에 더하는 값.
+    /// Amount added to the radius towards the corners.
     pub corner: f32,
-    /// 넘침이 생기면 그 구역의 반복을 멈춘다.
+    /// Stop iterating in a tile once overshoot appears.
     pub auto_stop: bool,
 }
 
-/// 대비 문턱의 기본값. RawTherapee는 사진에서 구하지만(자동), 그러면 카메라 JPEG보다 1.3배쯤 강하고
-/// 나무·잔디의 결과 노이즈까지 샤픈해 용량이 28% 는다. 2026-11-20 측정(`scripts/sharpness`)에서 0.4가
-/// 압축 후 카메라 JPEG와 같은 수준(1.02배)이었고 용량은 10% 늘었다. 사용자가 이 값으로 정했다.
+/// Default contrast threshold. RawTherapee derives it from the photo (auto), but that comes out
+/// about 1.3× stronger than the camera JPEG and sharpens even the texture noise in trees and grass,
+/// growing file size by 28%. In the 2026-11-20 measurement (`scripts/sharpness`), 0.4 matched the
+/// camera JPEG after compression (1.02×) with a 10% size increase. The user chose this value.
 pub const DEFAULT_THRESHOLD: f32 = 0.4;
 
 impl Default for Capture {
@@ -59,7 +65,7 @@ impl Capture {
         *self == Self::default()
     }
 
-    /// 캡처 샤픈을 하지 않는 값 (전후 비교의 보정 전 그림 등).
+    /// Settings with capture sharpening off (e.g. the unadjusted image in before/after comparison).
     pub fn off() -> Self {
         Self {
             enabled: false,
@@ -68,30 +74,32 @@ impl Capture {
     }
 }
 
-/// 샤픈 영역 보기: 캡처 샤픈이 걸리는 곳을 미리보기에 보여 주는 방식.
+/// Sharpening area view: how the preview shows where capture sharpening applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureView {
-    /// 사진 위에 빨갛게 ([마스크] 패널과 같은 색).
+    /// Red over the photo (same color as the [Mask] panel).
     Overlay,
-    /// 흑백 지도: 흰색은 샤픈하는 곳, 검정은 그대로 두는 곳.
+    /// Black-and-white map: white is sharpened, black is left alone.
     Map,
 }
 
-/// 고를 수 있는 반복 횟수.
+/// Selectable iteration counts.
 pub const ITERATIONS: RangeInclusive<u32> = 1..=100;
-/// 고를 수 있는 반경.
+/// Selectable radii.
 pub const RADIUS: RangeInclusive<f32> = 0.4..=2.0;
-/// 고를 수 있는 대비 문턱.
+/// Selectable contrast thresholds.
 pub const THRESHOLD: RangeInclusive<f32> = 0.0..=2.0;
-/// 고를 수 있는 모서리 반경.
+/// Selectable corner radii.
 pub const CORNER: RangeInclusive<f32> = -0.5..=0.5;
 
-/// 자동 반경의 상한 (RawTherapee의 `maxSigma`).
+/// Upper limit of the auto radius (RawTherapee's `maxSigma`).
 const MAX_SIGMA: f32 = 2.0;
-/// 이 비율 이상인 센서 값은 포화한 것으로 보고 둘레를 보호한다 (RawTherapee의 `clipLimit`).
+/// Sensor values at or above this fraction count as saturated and their surroundings are protected
+/// (RawTherapee's `clipLimit`).
 const CLIP_LIMIT: f32 = 0.95;
 
-/// 반경 σ에 맞는 커널의 반지름. 모서리 키우기가 없을 때의 선택이다 (RawTherapee CaptureDeconvSharpening).
+/// Kernel radius for blur radius σ. The choice used without the corner boost (RawTherapee
+/// CaptureDeconvSharpening).
 fn kernel_radius(sigma: f32) -> usize {
     if sigma < 0.6 {
         1
@@ -106,17 +114,18 @@ fn kernel_radius(sigma: f32) -> usize {
     }
 }
 
-/// 반지름 `r`인 가우스 커널 ((2r+1)² 계수, 줄 우선). RawTherapee `compute{3,5,7,9,13}x…kernel2`와 같은 계산이다:
-/// 지지 영역 밖은 0, `exp`는 double, 합은 float.
+/// Gaussian kernel of radius `r` ((2r+1)² coefficients, row-major). Same computation as
+/// RawTherapee's `compute{3,5,7,9,13}x…kernel2`: zero outside the support, `exp` in double, sum in
+/// float.
 fn kernel_of(sigma: f32, r: usize) -> Vec<f32> {
-    // 지지 영역: i² + j² ≤ limit. 3×3은 제한이 없다.
+    // Support: i² + j² ≤ limit. 3×3 has no limit.
     let limit = match r {
         1 => f64::INFINITY,
         2 => (3.0f64 * 0.84).powi(2),
         3 => (3.0f64 * 1.15).powi(2),
         4 => (3.0f64 * 1.5).powi(2),
         6 => (3.0f64 * 2.0).powi(2),
-        _ => unreachable!("커널 반지름 {r}"),
+        _ => unreachable!("kernel radius {r}"),
     };
     let temp = (-2.0f32 * sigma * sigma) as f64;
     let n = 2 * r + 1;
@@ -137,15 +146,16 @@ fn kernel_of(sigma: f32, r: usize) -> Vec<f32> {
     kernel
 }
 
-/// 반경 σ에 맞는 커널: (반지름, 계수).
+/// Kernel for blur radius σ: (radius, coefficients).
 #[cfg(test)]
 fn kernel(sigma: f32) -> (usize, Vec<f32>) {
     let r = kernel_radius(sigma);
     (r, kernel_of(sigma, r))
 }
 
-/// 하이라이트 보호: 센서 값이 포화(0.95 이상)인 화소 둘레 21화소(5×5에서 네 귀퉁이를 뺀 것)를 0으로,
-/// 나머지를 1로 한 마스크. 센서 전체에서 만든 뒤 출력 영역으로 자른다 (RawTherapee `buildClipMaskBayer`).
+/// Highlight protection: a mask that is 0 on the 21 pixels (5×5 minus the four corners) around each
+/// saturated sensor value (0.95 or more) and 1 elsewhere. Built over the full sensor, then cropped
+/// to the output area (RawTherapee `buildClipMaskBayer`).
 fn highlight_guard(sensor: &Sensor) -> Vec<f32> {
     let (w, h) = (sensor.width, sensor.height);
     let mut guard = vec![1f32; w * h];
@@ -172,15 +182,16 @@ fn highlight_guard(sensor: &Sensor) -> Vec<f32> {
     out
 }
 
-/// 카메라 RGB를 RawTherapee의 단위로 바꾸는 채널별 배율: 화이트밸런스를 곱하고, 배율이 가장 큰 채널의
-/// 포화가 65535가 되게 한다 (RawTherapee `scale_mul`).
+/// Per-channel multipliers that convert camera RGB to RawTherapee units: apply white balance and
+/// scale so the saturation of the channel with the largest multiplier becomes 65535 (RawTherapee
+/// `scale_mul`).
 fn rt_scale(wb: [f32; 3]) -> [f32; 3] {
     let k = 65535.0 / wb.iter().copied().fold(f32::MIN, f32::max);
     wb.map(|c| c * k)
 }
 
-/// 자동 반경: 대각으로 이웃한 초록 화소끼리의 최대 비율 R에서 σ = sqrt(1 / ln R)
-/// (RawTherapee `calcRadiusBayer`). 상한은 2.0.
+/// Auto radius: σ = sqrt(1 / ln R) from the maximum ratio R between diagonally adjacent green
+/// pixels (RawTherapee `calcRadiusBayer`). Capped at 2.0.
 fn auto_radius(sensor: &Sensor, wb: [f32; 3]) -> f32 {
     let (w, h) = (sensor.width, sensor.height);
     let green = rt_scale(wb)[1];
@@ -188,7 +199,8 @@ fn auto_radius(sensor: &Sensor, wb: [f32; 3]) -> f32 {
     let (lower, upper) = (1000f32, green);
     let mut max_ratio = 1f32;
     for row in 4..h.saturating_sub(4) {
-        // 초록 화소가 있는 열부터: 이 행이 초록으로 시작하면 짝수 열(6부터), 아니면 홀수 열(5부터).
+        // Start at the green columns: even columns (from 6) if this row starts with green,
+        // otherwise odd columns (from 5).
         let start = if crate::rcd::colour_at(0, row, sensor.red) == 1 {
             6
         } else {
@@ -205,7 +217,7 @@ fn auto_radius(sensor: &Sensor, wb: [f32; 3]) -> f32 {
             if v1m1 > 0.0 && max0 > lower {
                 let min = v00.min(v1m1);
                 if max0 > max_ratio * min {
-                    // 이웃의 포화한 초록이 끼어든 것인지 본다.
+                    // Check whether a saturated neighboring green is involved.
                     let clipped = if max0 == v00 {
                         raw(row - 1, col - 1).max(raw(row - 1, col + 1)).max(v1p1) >= upper
                     } else {
@@ -242,8 +254,8 @@ fn auto_radius(sensor: &Sensor, wb: [f32; 3]) -> f32 {
     (1.0 / max_ratio.ln()).sqrt().min(MAX_SIGMA)
 }
 
-/// 대비 측정에 쓰는 CIE L*, RawTherapee 단위 (0..32768 = L* × 327.68). 입력은 RawTherapee 단위의 RGB
-/// (`Color::RGB2L`, 밝기 y는 BT.709 가중치).
+/// CIE L* for contrast measurement, in RawTherapee units (0..32768 = L* × 327.68). Input is RGB in
+/// RawTherapee units (`Color::RGB2L`, luminance y with BT.709 weights).
 fn lightness_at(r: f32, g: f32, b: f32) -> f32 {
     let y = 0.212671 * r + 0.715160 * g + 0.072169 * b;
     if y > 65535.0 * 216.0 / 24389.0 {
@@ -258,13 +270,15 @@ fn lightness(rgb: &[[f32; 3]]) -> Vec<f32> {
     rgb.iter().map(|&[r, g, b]| lightness_at(r, g, b)).collect()
 }
 
-/// 대비를 섞는 비율로 바꾸는 시그모이드. 문턱에서 0.5 (RawTherapee `calcBlendFactor`).
+/// Sigmoid that maps contrast to a blend factor. 0.5 at the threshold (RawTherapee
+/// `calcBlendFactor`).
 fn blend_factor(contrast: f32, threshold: f32) -> f32 {
     let x = -16.0 + (16.0 / threshold) * contrast;
     0.5 * (1.0 + x / (1.0 + x * x).sqrt())
 }
 
-/// (j, i) 화소의 국소 대비: 1·2칸 떨어진 위아래·좌우 차이 (RawTherapee `buildBlendMask`의 대비 계산).
+/// Local contrast at pixel (j, i): vertical and horizontal differences at distances 1 and 2
+/// (contrast computation in RawTherapee `buildBlendMask`).
 fn contrast_at(l: &[f32], w: usize, j: usize, i: usize) -> f32 {
     let at = |y: usize, x: usize| l[y * w + x];
     let sq = |a: f32, b: f32| (a - b) * (a - b);
@@ -286,7 +300,7 @@ fn tile_average(l: &[f32], w: usize, y0: usize, x0: usize, size: usize) -> f32 {
     sum / (size * size) as f32
 }
 
-/// 구역의 분산을 평균으로 나눈 값 (RawTherapee `tileVariance`).
+/// A tile's variance divided by its mean (RawTherapee `tileVariance`).
 fn tile_variance(l: &[f32], w: usize, y0: usize, x0: usize, size: usize, average: f32) -> f32 {
     let mut sum = 0f32;
     for y in y0..y0 + size {
@@ -297,7 +311,8 @@ fn tile_variance(l: &[f32], w: usize, y0: usize, x0: usize, size: usize, average
     sum / ((size * size) as f32 * average)
 }
 
-/// 구역의 분산/평균. 너무 어둡거나 밝거나, 너무 고르면(노이즈조차 없으면) 쓰지 않는다 (무한대).
+/// A tile's variance/mean. Tiles that are too dark, too bright, or too uniform (not even noise) are
+/// not used (infinity).
 fn usable_variance(l: &[f32], w: usize, y0: usize, x0: usize, size: usize) -> f32 {
     const MIN_LUMINANCE: f32 = 2000.0;
     const MAX_LUMINANCE: f32 = 20000.0;
@@ -314,7 +329,8 @@ fn usable_variance(l: &[f32], w: usize, y0: usize, x0: usize, size: usize) -> f3
     }
 }
 
-/// 평평한 구역에서, 섞는 비율의 평균이 1% 이하가 되는 가장 작은 문턱 + 0.01 (RawTherapee `calcContrastThreshold`).
+/// In a flat tile, the smallest threshold at which the mean blend factor is 1% or less, plus 0.01
+/// (RawTherapee `calcContrastThreshold`).
 fn contrast_threshold_of_tile(l: &[f32], w: usize, y0: usize, x0: usize, size: usize) -> f32 {
     let mut contrasts = Vec::with_capacity((size - 4) * (size - 4));
     for j in y0 + 2..y0 + size - 2 {
@@ -335,10 +351,12 @@ fn contrast_threshold_of_tile(l: &[f32], w: usize, y0: usize, x0: usize, size: u
     (c + 1) as f32 / 100.0
 }
 
-/// 자동 대비 문턱: 사진에서 가장 평평한(노이즈만 있는) 구역을 찾아, 그 구역이 거의 샤픈되지 않는 문턱을
-/// 구한다. 알맞은 구역이 없으면 0 (RawTherapee `buildBlendMask`의 autoContrast).
+/// Auto contrast threshold: finds the flattest (noise-only) tile in the photo and returns the
+/// threshold at which that tile is barely sharpened. 0 if no suitable tile exists (autoContrast in
+/// RawTherapee `buildBlendMask`).
 fn auto_threshold(l: &[f32], w: usize, h: usize) -> f32 {
-    // 1단계: 80×80 구역을 겹치지 않게 훑는다. 분산/평균이 1 이하인 곳이 있으면 거기서 끝낸다.
+    // Stage 1: scan non-overlapping 80×80 tiles. Stop as soon as one has variance/mean of 1 or
+    // less.
     let mut best = (f32::INFINITY, 0, 0);
     for y in (0..h / 80).map(|i| i * 80) {
         for x in (0..w / 80).map(|j| j * 80) {
@@ -351,7 +369,8 @@ fn auto_threshold(l: &[f32], w: usize, h: usize) -> f32 {
     if best.0 <= 1.0 {
         return contrast_threshold_of_tile(l, w, best.1, best.2, 80);
     }
-    // 2단계: 40×40 구역을 10화소씩 옮기며 훑고, 가장 나은 곳 둘레 ±10화소를 1화소씩 다시 훑는다.
+    // Stage 2: scan 40×40 tiles in 10-pixel steps, then rescan ±10 pixels around the best one in
+    // 1-pixel steps.
     let (tiles_h, tiles_w) = ((h / 10).saturating_sub(3), (w / 10).saturating_sub(3));
     let mut best = (f32::INFINITY, 0, 0);
     for y in (0..tiles_h).map(|i| i * 10) {
@@ -384,9 +403,9 @@ fn auto_threshold(l: &[f32], w: usize, h: usize) -> f32 {
     }
 }
 
-/// 섞을 때 쓰는 마스크 (0..1): 경계가 뚜렷한 곳은 1, 평평한 곳은 0에 가깝고, 하이라이트 보호를 곱한 뒤
-/// σ 2로 흐린다 (RawTherapee `buildBlendMask`). 문턱이 0이면 대비와 상관없이 1이지만, RawTherapee와 달리
-/// 하이라이트 보호는 그대로 곱한다.
+/// Blend mask (0..1): near 1 on distinct edges and near 0 on flat areas, multiplied by highlight
+/// protection and then blurred with σ 2 (RawTherapee `buildBlendMask`). With a threshold of 0 it is
+/// 1 regardless of contrast, but unlike RawTherapee highlight protection is still applied.
 pub fn blend_mask(l: &[f32], guard: &[f32], w: usize, h: usize, threshold: f32) -> Vec<f32> {
     if threshold == 0.0 || w < 5 || h < 5 {
         return gaussian_blur(guard, w, h, 2.0);
@@ -397,7 +416,7 @@ pub fn blend_mask(l: &[f32], guard: &[f32], w: usize, h: usize, threshold: f32) 
             blend[j * w + i] = guard[j * w + i] * blend_factor(contrast_at(l, w, j, i), threshold);
         }
     }
-    // 가장자리 2화소는 안쪽 값을 그대로 쓴다.
+    // The outer 2 pixels copy the adjacent inner values.
     for j in 0..2 {
         for i in 2..w - 2 {
             blend[j * w + i] = blend[2 * w + i];
@@ -414,7 +433,7 @@ pub fn blend_mask(l: &[f32], guard: &[f32], w: usize, h: usize, threshold: f32) 
     gaussian_blur(&blend, w, h, 2.0)
 }
 
-/// 분리형 가우스 흐림 (반경 3σ, 가장자리는 끝 화소를 되풀이).
+/// Separable Gaussian blur (radius 3σ, edges repeat the last pixel).
 fn gaussian_blur(plane: &[f32], w: usize, h: usize, sigma: f32) -> Vec<f32> {
     let r = (3.0 * sigma).ceil() as isize;
     let weights: Vec<f32> = (-r..=r)
@@ -446,30 +465,30 @@ fn gaussian_blur(plane: &[f32], w: usize, h: usize, sigma: f32) -> Vec<f32> {
     out
 }
 
-/// 사진에서 한 번 구해 두는 재료. 캡처 샤픈 값을 바꿔도 다시 구하지 않는다.
+/// Inputs computed once per photo. Not recomputed when the capture sharpening settings change.
 pub struct Prepared {
     pub width: usize,
     pub height: usize,
-    /// 샤픈할 밝기 (RawTherapee 단위, Rec.2020 가중치).
+    /// Luminance to sharpen (RawTherapee units, Rec.2020 weights).
     y: Vec<f32>,
-    /// 대비 측정용 L* (RawTherapee 단위).
+    /// L* for contrast measurement (RawTherapee units).
     l: Vec<f32>,
-    /// 하이라이트 보호 (출력 영역).
+    /// Highlight protection (output area).
     guard: Vec<f32>,
-    /// 사진에서 구한 반경과 대비 문턱 (값을 정하지 않았을 때 쓴다).
+    /// Radius and contrast threshold derived from the photo (used when no value is set).
     pub auto_radius: f32,
     pub auto_threshold: f32,
 }
 
-/// 캡처 샤픈의 재료를 구한다. `cam`은 출력 영역으로 잘린 카메라 RGB, `wb`는 카메라 화이트밸런스,
-/// `sensor`는 같은 사진의 센서 전체 CFA다.
+/// Computes the capture sharpening inputs. `cam` is camera RGB cropped to the output area, `wb` the
+/// camera white balance, and `sensor` the full-sensor CFA of the same photo.
 pub fn prepare(cam: &crate::Image, wb: [f32; 3], sensor: &Sensor) -> Prepared {
     use rayon::prelude::*;
     let (w, h) = (cam.width, cam.height);
     assert_eq!(
         (sensor.crop.2, sensor.crop.3),
         (w, h),
-        "센서의 출력 영역과 그림의 크기"
+        "sensor output area vs. image size"
     );
     let s = rt_scale(wb);
     let (y, l): (Vec<f32>, Vec<f32>) = (0..w * h)
@@ -492,7 +511,8 @@ pub fn prepare(cam: &crate::Image, wb: [f32; 3], sensor: &Sensor) -> Prepared {
     }
 }
 
-/// 캡처 샤픈한 카메라 RGB와, 섞을 때 쓴 마스크(0..1, 샤픈 영역 보기용). 꺼져 있으면 그대로이고 마스크는 0이다.
+/// Capture-sharpened camera RGB and the blend mask used (0..1, for the sharpening area view). When
+/// disabled, the image is unchanged and the mask is 0.
 pub fn sharpen(
     cam: &crate::Image,
     prepared: &Prepared,
@@ -507,7 +527,7 @@ pub fn sharpen(
     let threshold = capture.threshold.unwrap_or(prepared.auto_threshold);
     let blend = blend_mask(&prepared.l, &prepared.guard, w, h, threshold);
     let y_new = deconvolve(&prepared.y, &blend, w, h, radius, capture);
-    // 밝기만 바꾼다: 세 채널에 같은 비율을 곱한다.
+    // Change luminance only: multiply all three channels by the same ratio.
     let factor: Vec<f32> = y_new
         .par_iter()
         .zip(&prepared.y)
@@ -520,8 +540,9 @@ pub fn sharpen(
     (out, blend)
 }
 
-/// 32×32 구역(왼쪽 위 `tile`)의 반경. 모서리 반경 키우기를 반영한다: 그림 가운데에서 멀수록 커져
-/// 귀퉁이에서 `radius + corner`(최대 2.0)가 된다 (RawTherapee CaptureDeconvSharpening).
+/// Radius of the 32×32 tile with top-left `tile`. Includes the corner boost: it grows with distance
+/// from the image center, reaching `radius + corner` (at most 2.0) in the corners (RawTherapee
+/// CaptureDeconvSharpening).
 fn tile_sigma(radius: f32, corner: f32, w: usize, h: usize, (ty, tx): (usize, usize)) -> f32 {
     let corner_radius = (radius + corner).min(MAX_SIGMA);
     let corner_distance = ((w as f32 * 0.5).powi(2) + (h as f32 * 0.5).powi(2)).sqrt();
@@ -531,7 +552,7 @@ fn tile_sigma(radius: f32, corner: f32, w: usize, h: usize, (ty, tx): (usize, us
     radius + factor * ((dy * dy + dx * dx) as f64).sqrt() as f32
 }
 
-/// 커널을 0이 아닌 계수와 그 자리(줄 우선 위치의 차이)로 편 것.
+/// A kernel flattened into its nonzero coefficients and their offsets (in row-major position).
 struct Taps {
     radius: usize,
     taps: Vec<(isize, f32)>,
@@ -560,8 +581,9 @@ impl Taps {
     }
 }
 
-/// Richardson–Lucy 반복으로 밝기의 흐림을 되돌리고 마스크만큼 섞은 새 밝기 (RawTherapee
-/// CaptureDeconvSharpening을 그림 전체로). 그림의 바깥 5~8화소와 마스크가 0.01에 못 미치는 구역은 그대로다.
+/// New luminance with blur undone by Richardson–Lucy iterations and blended by the mask
+/// (RawTherapee CaptureDeconvSharpening applied to the whole image). The outer 5–8 pixels of the
+/// image and tiles whose mask stays below 0.01 are left unchanged.
 fn deconvolve(
     y: &[f32],
     blend: &[f32],
@@ -585,7 +607,8 @@ fn deconvolve(
         return out;
     }
 
-    // 구역마다 커널을 정한다. 반경이 0.4보다 작은 구역(모서리 반경을 줄였을 때)은 되돌리지 않는다.
+    // Choose a kernel per tile. Tiles with a radius below 0.4 (when the corner radius is reduced)
+    // are not deconvolved.
     let rows: Vec<usize> = (border..h - border).step_by(TILE).collect();
     let cols: Vec<usize> = (border..w - border).step_by(TILE).collect();
     let mut kernels: Vec<Taps> = Vec::new();
@@ -632,7 +655,7 @@ fn deconvolve(
     if !active.contains(&true) {
         return out;
     }
-    // 화소마다 그 구역의 커널. 가장자리 띠는 가장 가까운 구역의 것을 쓴다.
+    // Each pixel's tile kernel. The border band uses the nearest tile's kernel.
     let kernel_at = |j: usize, i: usize| -> Option<&Taps> {
         let tr = (j.saturating_sub(border) / TILE).min(rows.len() - 1);
         let tc = (i.saturating_sub(border) / TILE).min(cols.len() - 1);
@@ -643,7 +666,8 @@ fn deconvolve(
         j >= r && j + r < h && i >= r && i + r < w
     };
 
-    // u: 흐림을 되돌린 추정, t: 관측 / (추정을 흐린 것). 커널이 닿지 않는 바깥은 u = 관측, t = 1로 둔다.
+    // u: deblurred estimate, t: observed / (blurred estimate). Outside the kernel's reach,
+    // u = observed and t = 1.
     let mut u = y.to_vec();
     let mut t = vec![1f32; w * h];
     let mut stopped = vec![false; active.len()];
@@ -680,7 +704,8 @@ fn deconvolve(
                 }
             }
         });
-        // 넘침(추정이 관측의 절반 아래로 떨어짐)이 생긴 구역은 이 반복의 값으로 멈춘다.
+        // Tiles that overshoot (estimate falls below half the observed value) stop at this
+        // iteration's values.
         if capture.auto_stop && k + 1 < iterations {
             for tile in 0..active.len() {
                 if !active[tile] || stopped[tile] {
@@ -726,7 +751,8 @@ mod tests {
         }
     }
 
-    /// 세로에서 약간 기운 경계를 오차함수로 σ만큼 흐린 회색 장면. 회색이라 CFA는 장면 값 그대로다.
+    /// A gray scene with a slightly tilted vertical edge blurred by σ using the error function.
+    /// Being gray, the CFA equals the scene values.
     fn slanted_edge(w: usize, h: usize, sigma: f32, dark: f32, bright: f32) -> Vec<f32> {
         let mut out = vec![0f32; w * h];
         for y in 0..h {
@@ -739,7 +765,7 @@ mod tests {
         out
     }
 
-    /// 오차함수 (Abramowitz–Stegun 7.1.26, 오차 1.5e-7).
+    /// Error function (Abramowitz–Stegun 7.1.26, error 1.5e-7).
     fn erf(x: f64) -> f64 {
         let t = 1.0 / (1.0 + 0.3275911 * x.abs());
         let y = 1.0
@@ -752,7 +778,8 @@ mod tests {
 
     #[test]
     fn the_defaults_match_the_camera_jpeg() {
-        // 반복 횟수와 반경(자동)은 RawTherapee의 기본값, 대비 문턱은 측정으로 정한 0.4.
+        // Iterations and radius (auto) are RawTherapee's defaults; the contrast threshold is 0.4,
+        // chosen by measurement.
         let capture = Capture::default();
         assert!(capture.enabled && capture.auto_stop && capture.is_default());
         assert_eq!(capture.iterations, 20);
@@ -776,7 +803,7 @@ mod tests {
                 }
             }
         }
-        // 5×5는 네 귀퉁이가 0이고, (2, 1)은 남는다 (지지 영역 i² + j² ≤ 6.35).
+        // 5×5 has its four corners at 0, and (2, 1) remains (support i² + j² ≤ 6.35).
         let (_, k5) = kernel(0.7);
         assert_eq!(k5[0], 0.0);
         assert!(k5[1] > 0.0);
@@ -790,10 +817,10 @@ mod tests {
         let guard = highlight_guard(&sensor(&cfa, w, h));
         assert_eq!(guard[8 * w + 10], 0.0);
         assert_eq!(guard[6 * w + 10], 0.0, "(0, -2)");
-        assert_eq!(guard[6 * w + 8], 1.0, "(-2, -2) 귀퉁이는 남는다");
-        assert_eq!(guard[8 * w + 13], 1.0, "3칸 떨어진 곳");
+        assert_eq!(guard[6 * w + 8], 1.0, "(-2, -2) corner remains");
+        assert_eq!(guard[8 * w + 13], 1.0, "3 pixels away");
         assert_eq!(guard.iter().filter(|&&v| v == 0.0).count(), 21);
-        // 출력 영역으로 자른다.
+        // Crop to the output area.
         let cropped = Sensor {
             crop: (4, 3, 10, 8),
             ..sensor(&cfa, w, h)
@@ -805,26 +832,28 @@ mod tests {
 
     #[test]
     fn the_automatic_radius_follows_the_formula_on_a_single_bright_green() {
-        // 배경 0.1 위의 초록 화소 하나가 0.4: 대각 초록과의 최대 비율 4 → σ = sqrt(1 / ln 4).
+        // One green pixel at 0.4 on a 0.1 background: max ratio 4 to diagonal greens
+        // → σ = sqrt(1 / ln 4).
         let (w, h) = (32, 24);
         let mut cfa = vec![0.1f32; w * h];
-        cfa[10 * w + 11] = 0.4; // RGGB에서 (짝수 행, 홀수 열)은 초록
+        cfa[10 * w + 11] = 0.4; // In RGGB, (even row, odd column) is green
         let found = auto_radius(&sensor(&cfa, w, h), [1.0; 3]);
         assert!((found - (1.0 / 4f32.ln()).sqrt()).abs() < 1e-4, "{found}");
-        // 평평하면 비율이 1 → 상한 2.0
+        // Flat means ratio 1 → capped at 2.0
         let flat = vec![0.1f32; w * h];
         assert_eq!(auto_radius(&sensor(&flat, w, h), [1.0; 3]), 2.0);
-        // 포화한 띠의 경계에서 생기는 큰 비율은 쓰지 않는다: RawTherapee는 밝은 쪽 화소의
-        // "다른" 대각 초록이 포화했는지 보는데, 띠의 경계에서는 늘 그렇다.
+        // Large ratios at the edge of a saturated band are not used: RawTherapee checks whether
+        // the bright pixel's "other" diagonal green is saturated, which is always true at the band
+        // edge.
         let (w, h) = (40, 32);
         let mut band = vec![0.1f32; w * h];
         band[8 * w..16 * w].fill(1.0);
         assert_eq!(auto_radius(&sensor(&band, w, h), [1.0; 3]), 2.0);
-        band[24 * w + 25] = 0.4; // 띠에서 떨어진 곳의 밝은 초록 하나
+        band[24 * w + 25] = 0.4; // One bright green away from the band
         let found = auto_radius(&sensor(&band, w, h), [1.0; 3]);
         assert!((found - (1.0 / 4f32.ln()).sqrt()).abs() < 1e-4, "{found}");
-        // 원본 그대로의 한계: 포화한 덩어리의 귀퉁이에서는 밝은 화소의 다른 대각 이웃이 모두 밖이라
-        // 그 비율(10)이 쓰인다.
+        // A limitation kept from the original: at the corner of a saturated block, the bright
+        // pixel's other diagonal neighbors are all outside it, so that ratio (10) is used.
         let mut block = vec![0.1f32; w * h];
         for y in 8..16 {
             block[y * w + 8..y * w + 16].fill(1.0);
@@ -835,8 +864,9 @@ mod tests {
 
     #[test]
     fn the_automatic_radius_grows_with_the_blur() {
-        // RawTherapee의 방식은 근사라 값이 σ와 같지는 않다
-        // (2026-11-20 파이썬 모의 실험: σ 0.6/0.8/1.1/1.5 → 0.72/0.80/0.91/1.05). 커지는 순서와 범위만 본다.
+        // RawTherapee's method is an approximation, so the values don't equal σ
+        // (2026-11-20 Python simulation: σ 0.6/0.8/1.1/1.5 → 0.72/0.80/0.91/1.05). Only the
+        // increasing order and the range are checked.
         let found: Vec<f32> = [0.6f32, 0.8, 1.1, 1.5]
             .iter()
             .map(|&sigma| {
@@ -847,8 +877,9 @@ mod tests {
         assert!(found.windows(2).all(|p| p[0] < p[1]), "{found:?}");
         assert!(found.iter().all(|r| (0.5..1.3).contains(r)), "{found:?}");
     }
-    /// RawTherapee 단위의 L: 왼쪽 절반은 L 10000 둘레에 표준편차 약 80의 노이즈
-    /// (구역의 분산/평균이 0.5~1이 되어 자동 문턱이 0이 되지 않게), 오른쪽 절반은 폭 6화소의 줄무늬.
+    /// L in RawTherapee units: the left half is noise with a standard deviation of about 80 around
+    /// L 10000 (so tile variance/mean is 0.5–1 and the auto threshold is not 0), the right half is
+    /// stripes 6 pixels wide.
     fn striped_with_noise(w: usize, h: usize) -> Vec<f32> {
         let mut state = 12345u32;
         let mut uniform = move || {
@@ -859,7 +890,7 @@ mod tests {
         for y in 0..h {
             for x in 0..w {
                 l[y * w + x] = if x < w / 2 {
-                    // 균등 분포 12개의 합 − 6 ≈ 표준 정규 분포
+                    // Sum of 12 uniform samples − 6 ≈ standard normal
                     let normal: f32 = (0..12).map(|_| uniform()).sum::<f32>() - 6.0;
                     10000.0 + 80.0 * normal
                 } else if (x / 6) % 2 == 0 {
@@ -881,7 +912,8 @@ mod tests {
 
     #[test]
     fn lightness_follows_cie_l_in_rawtherapee_units() {
-        // 흰색(y = 65535)은 L* 100 → 32768, 검정은 0, 아주 어두운 곳은 직선 구간.
+        // White (y = 65535) is L* 100 → 32768, black is 0, and very dark values are on the linear
+        // segment.
         let l = lightness(&[[65535.0, 65535.0, 65535.0], [0.0; 3], [100.0; 3]]);
         assert!((l[0] - 32768.0).abs() < 0.5, "{}", l[0]);
         assert_eq!(l[1], 0.0);
@@ -912,12 +944,12 @@ mod tests {
         };
         assert!(
             mean(10, w / 2 - 10) < 0.05,
-            "평평한 곳 {}",
+            "flat area {}",
             mean(10, w / 2 - 10)
         );
         assert!(
             mean(w / 2 + 10, w - 10) > 0.5,
-            "줄무늬 {}",
+            "stripes {}",
             mean(w / 2 + 10, w - 10)
         );
     }
@@ -937,7 +969,7 @@ mod tests {
 
     #[test]
     fn a_photo_without_a_suitable_flat_area_gets_threshold_zero() {
-        // 너무 어둡거나(L < 2000) 너무 밝은(L > 20000) 곳뿐이면 자동 문턱은 0이다.
+        // If everything is too dark (L < 2000) or too bright (L > 20000), the auto threshold is 0.
         let (w, h) = (200, 160);
         assert_eq!(auto_threshold(&vec![1000.0; w * h], w, h), 0.0);
         assert_eq!(auto_threshold(&vec![25000.0; w * h], w, h), 0.0);
@@ -950,12 +982,12 @@ mod tests {
         }
     }
 
-    /// 포화가 없는 0.3짜리 센서 (출력 영역 = 센서 전체).
+    /// A sensor at 0.3 with no saturation (output area = full sensor).
     fn flat_sensor(w: usize, h: usize) -> Vec<f32> {
         vec![0.3; w * h]
     }
 
-    /// 세로 경계를 σ만큼 흐린 회색 그림 (어두운 쪽 `dark`, 밝은 쪽 `bright`).
+    /// A gray image with a vertical edge blurred by σ (dark side `dark`, bright side `bright`).
     fn edge_image(w: usize, h: usize, sigma: f32, dark: f32, bright: f32) -> crate::Image {
         let mut plane = vec![0f32; w * h];
         for y in 0..h {
@@ -976,7 +1008,7 @@ mod tests {
         edge_image(w, h, sigma, 0.1, 0.5)
     }
 
-    /// 빨강이 더 강한 색 있는 흐린 경계.
+    /// A blurred colored edge with stronger red.
     fn coloured_blurred_edge(w: usize, h: usize) -> crate::Image {
         let mut image = blurred_edge(w, h, 1.0);
         image.planes[0].iter_mut().for_each(|v| *v *= 1.6);
@@ -984,7 +1016,8 @@ mod tests {
         image
     }
 
-    /// 자동 멈춤이 실제로 걸리는 장면: 아주 어두운 쪽과 밝은 쪽 사이의 거의 날카로운 경계.
+    /// A scene that actually triggers auto-stop: a nearly sharp edge between a very dark side and a
+    /// bright side.
     fn hard_edge_with_slight_blur(w: usize, h: usize) -> crate::Image {
         edge_image(w, h, 0.5, 0.02, 0.8)
     }
@@ -999,7 +1032,7 @@ mod tests {
             .collect()
     }
 
-    /// 가운데 줄의 초록에서 이웃 화소 사이의 가장 큰 차이.
+    /// Largest difference between neighboring pixels in the green of the middle row.
     fn edge_slope(image: &crate::Image, row: usize) -> f32 {
         let w = image.width;
         (1..w)
@@ -1007,7 +1040,7 @@ mod tests {
             .fold(0.0, f32::max)
     }
 
-    /// 가장자리 8화소를 뺀 안쪽에서 어두운 쪽(0.02)보다 얼마나 더 내려갔는가.
+    /// How far below the dark side (0.02) values dip, excluding the outer 8 pixels.
     fn undershoot(image: &crate::Image) -> f32 {
         let (w, h) = (image.width, image.height);
         let mut min = f32::MAX;
@@ -1040,7 +1073,7 @@ mod tests {
             max_abs_diff(&out, &flat)
         );
 
-        // 꺼져 있으면 그대로이고, 보여 줄 마스크는 0이다.
+        // When disabled, the image is unchanged and the mask to display is 0.
         let edge = blurred_edge(64, 48, 1.0);
         let prepared = prepare(&edge, [1.0; 3], &sensor(&cfa, 64, 48));
         let (out, mask) = sharpen(
@@ -1054,7 +1087,7 @@ mod tests {
         assert!(mask.iter().all(|&m| m == 0.0));
         assert_eq!(max_abs_diff(&out, &edge), 0.0);
 
-        // 섞는 마스크가 0이면 밝기도 그대로다.
+        // With a zero blend mask, luminance is unchanged too.
         let y = luminance_of(&edge);
         let out = deconvolve(&y, &vec![0.0; 64 * 48], 64, 48, 1.0, &Capture::default());
         assert_eq!(out, y);
@@ -1094,7 +1127,7 @@ mod tests {
                 ..Capture::default()
             },
         );
-        assert!(max_abs_diff(&out, &edge) > 1e-3, "샤픈이 되기는 해야 한다");
+        assert!(max_abs_diff(&out, &edge) > 1e-3, "must sharpen at all");
         for i in (0..64 * 48).step_by(17) {
             let before = edge.planes[0][i] / edge.planes[1][i];
             let after = out.planes[0][i] / out.planes[1][i];
@@ -1137,11 +1170,11 @@ mod tests {
         assert_eq!(sigma(0.0, (0, 0)), 1.0);
         assert!(
             sigma(0.5, (0, 0)) > sigma(0.5, (224, 304)),
-            "귀퉁이 > 가운데"
+            "corner > center"
         );
         assert!((sigma(0.5, (224, 304)) - 1.0).abs() < 1e-6);
         assert!(sigma(-0.5, (0, 0)) < 1.0);
-        // 모서리 키우기를 쓰면 귀퉁이 쪽이 더 많이 바뀐다.
+        // With the corner boost, the corner side changes more.
         let edge = blurred_edge(160, 128, 1.0);
         let cfa = flat_sensor(160, 128);
         let prepared = prepare(&edge, [1.0; 3], &sensor(&cfa, 160, 128));
@@ -1159,7 +1192,7 @@ mod tests {
         let (b, _) = sharpen(&edge, &prepared, &boosted);
         assert!(
             edge_slope(&b, 12) > edge_slope(&a, 12) * 1.02,
-            "귀퉁이 쪽 줄"
+            "corner-side row"
         );
     }
 

@@ -1,10 +1,10 @@
-//! 화면에 보여 줄 이미지: 썸네일과 미리보기.
+//! Images to show on screen: thumbnails and previews.
 
 use crate::{Image, Result, raw};
 use rayon::prelude::*;
 use std::path::Path;
 
-/// 화면에 그릴 8bit RGBA 이미지.
+/// An 8-bit RGBA image to draw on screen.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Pixels {
     pub width: usize,
@@ -13,7 +13,7 @@ pub struct Pixels {
 }
 
 impl Pixels {
-    /// 긴 변이 `max_side`를 넘으면 그 안에 들어오도록 줄인 사본을 돌려준다. 넘지 않으면 None.
+    /// If the long side exceeds `max_side`, returns a copy shrunk to fit within it. Otherwise None.
     pub fn fit_within(&self, max_side: usize) -> Option<Pixels> {
         let (w, h) = (self.width, self.height);
         let long = w.max(h);
@@ -52,8 +52,9 @@ impl Pixels {
     }
 }
 
-/// 긴 변이 `max_side`를 넘으면 그 안에 들어오도록 줄인 이미지를 돌려준다 (넓이 평균). 넘지 않으면 None.
-/// 보정을 빠르게 미리 보기 위한 작은 사본을 만드는 데 쓴다.
+/// If the long side exceeds `max_side`, returns the image shrunk to fit within it (area average).
+/// Otherwise None.
+/// Used to make a small copy for previewing adjustments quickly.
 pub fn downscale(image: &Image, max_side: usize) -> Option<Image> {
     let (w, h) = (image.width, image.height);
     let long = w.max(h);
@@ -89,7 +90,7 @@ pub fn downscale(image: &Image, max_side: usize) -> Option<Image> {
     })
 }
 
-/// 긴 변이 `max_side` 이하가 되도록 줄인다 (넓이 평균). 이미 작으면 크기를 바꾸지 않는다.
+/// Shrinks so the long side is at most `max_side` (area average). Leaves small images as they are.
 pub fn shrink(image: &Image, max_side: usize) -> Pixels {
     let (w, h) = (image.width, image.height);
     let long = w.max(h).max(1);
@@ -102,7 +103,7 @@ pub fn shrink(image: &Image, max_side: usize) -> Pixels {
     rgba.par_chunks_mut(out_w * 4)
         .enumerate()
         .for_each(|(oy, row)| {
-            // 출력 화소 하나가 덮는 원본 영역
+            // The source area one output pixel covers
             let (y0, y1) = (
                 oy * h / out_h,
                 ((oy + 1) * h / out_h).max(oy * h / out_h + 1),
@@ -128,7 +129,7 @@ pub fn shrink(image: &Image, max_side: usize) -> Pixels {
     }
 }
 
-/// RAW 파일 안에 들어 있는 작은 JPEG로 썸네일을 만든다. 바로 세운 상태로 돌려준다. 없으면 None.
+/// Makes a thumbnail from the small JPEG in the RAW file, returned upright. None if there is none.
 pub fn thumbnail(path: &Path, max_side: usize) -> Result<Option<Pixels>> {
     let Some(jpeg) = raw::embedded_preview(path)? else {
         return Ok(None);
@@ -195,7 +196,7 @@ mod tests {
 
     #[test]
     fn pixels_larger_than_the_limit_are_reduced_by_averaging() {
-        // 빨강 0·100 | 200·200 (녹색과 파랑은 0)
+        // Red 0·100 | 200·200 (green and blue are 0)
         let px = |r: u8| [r, 0, 0, 255];
         let pixels = Pixels {
             width: 4,
@@ -234,7 +235,7 @@ mod tests {
         assert_eq!(small.planes[1], [0.5, 0.2]);
         assert!(
             downscale(&src, 4).is_none() && downscale(&src, 99).is_none(),
-            "작으면 그대로 쓴다"
+            "used as is when small"
         );
     }
 
@@ -245,7 +246,7 @@ mod tests {
         };
         let thumb = thumbnail(&path, 160)
             .unwrap()
-            .expect("A900 ARW에는 미리보기 JPEG가 들어 있다");
+            .expect("an A900 ARW contains a preview JPEG");
         assert_eq!(thumb.height, 160);
         assert!(
             thumb.width < thumb.height,

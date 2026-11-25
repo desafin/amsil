@@ -1,7 +1,9 @@
-//! AI 마스크: 사진에서 누른 자리의 물체를 골라내어, 그 영역에만 보정을 더한다 (SAM 2.1).
+//! AI masks: picks out the object at the clicked spot in a photo and adds adjustments only to that
+//! area (SAM 2.1).
 //!
-//! 인코더는 사진마다 한 번 돌려 결과(`Embedding`)를 두고 쓰고, 디코더는 누를 때마다 돌린다.
-//! 디코더가 내는 마스크는 256×256 격자라서, 그림의 윤곽을 따라가며 원래 크기로 키운다.
+//! The encoder runs once per photo and its result (`Embedding`) kept; the decoder runs per click.
+//! The decoder's mask is a 256×256 grid, so it is scaled up to the original size following the
+//! image's edges.
 
 use crate::edit::Params;
 use crate::lang::{Text, text};
@@ -13,20 +15,20 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-/// 모델 폴더 안에서 마스크 모델(인코더와 디코더)이 든 폴더.
+/// Folder holding the mask model (encoder and decoder) inside the model folder.
 pub const MODEL: &str = "mask-object-sam21-small";
 
-/// 인코더 입력의 한 변 (화소). 넣는 그림의 긴 변은 이 값 이하여야 한다.
+/// One side of the encoder input (pixels). The long side of the image fed in must not exceed this.
 pub const INPUT: usize = 1024;
-/// 디코더가 내는 마스크 격자의 한 변. 입력의 4분의 1이다.
+/// One side of the mask grid the decoder outputs. A quarter of the input.
 const GRID: usize = 256;
 
-/// 사진에서 누른 자리. 바로 세운 사진의 왼쪽 위가 (0, 0), 오른쪽 아래가 (1, 1)이다.
+/// A clicked spot in the photo. Top left of the upright photo is (0, 0), bottom right is (1, 1).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Point {
     pub x: f32,
     pub y: f32,
-    /// 이 자리를 고르는지(참), 빼는지(거짓).
+    /// Whether this spot selects (true) or excludes (false).
     #[serde(default = "yes", skip_serializing_if = "is_true")]
     pub include: bool,
 }
@@ -39,27 +41,28 @@ fn is_true(value: &bool) -> bool {
     *value
 }
 
-/// 마스크 하나: 누른 자리들로 고른 영역과, 그 영역에만 더할 보정.
+/// One mask: the area selected by the clicked spots, and the adjustments added only to it.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Mask {
     pub points: Vec<Point>,
-    /// 고른 영역의 바깥에 보정을 더한다.
+    /// Adds the adjustments outside the selected area.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub invert: bool,
     #[serde(skip_serializing_if = "Params::is_neutral")]
     pub adjust: Params,
 }
 
-/// 인코더에 넣을 입력을 만든다: 그림을 왼쪽 위에 놓고 ImageNet 평균·표준편차로 정규화한다 (채널 우선).
-/// 남는 자리는 0이다. 그림의 크기도 함께 돌려준다.
+/// Builds the encoder input: places the image at the top left and normalizes with the ImageNet mean
+/// and standard deviation (channel-first).
+/// The remaining area is 0. Also returns the image size.
 fn preprocess(picture: &Pixels) -> (Vec<f32>, (usize, usize)) {
     const MEAN: [f32; 3] = [123.675, 116.28, 103.53];
     const STD: [f32; 3] = [58.395, 57.12, 57.375];
     let (w, h) = (picture.width, picture.height);
     assert!(
         w <= INPUT && h <= INPUT,
-        "마스크 모델에는 긴 변 {INPUT} 이하의 그림을 넣는다"
+        "the mask model takes images with a long side of at most {INPUT}"
     );
     let mut input = vec![0.0; 3 * INPUT * INPUT];
     for (c, plane) in input.chunks_exact_mut(INPUT * INPUT).enumerate() {
@@ -73,16 +76,17 @@ fn preprocess(picture: &Pixels) -> (Vec<f32>, (usize, usize)) {
     (input, (w, h))
 }
 
-/// 사진 한 장의 인코더 출력 (약 17MB). 누를 때마다 다시 쓴다.
+/// The encoder output for one photo (about 17MB). Reused on every click.
 pub struct Embedding {
     embed: Vec<f32>,
     feats0: Vec<f32>,
     feats1: Vec<f32>,
-    /// 인코더에 넣은 그림의 크기.
+    /// Size of the image fed to the encoder.
     size: (usize, usize),
 }
 
-/// 디코더가 낸 저해상도 마스크에서 사진이 차지하는 부분. 값은 로짓이다 (0보다 크면 고른 영역).
+/// The part of the decoder's low-resolution mask covered by the photo. Values are logits (above 0
+/// is selected).
 #[derive(Clone)]
 pub struct Low {
     pub width: usize,
@@ -90,14 +94,15 @@ pub struct Low {
     pub logits: Vec<f32>,
 }
 
-/// 누른 자리의 물체를 골라내는 모델 (SAM 2.1 Hiera Small).
+/// A model that picks out the object at the clicked spot (SAM 2.1 Hiera Small).
 pub struct Segmenter {
     encoder: Session,
     decoder: Session,
 }
 
 impl Segmenter {
-    // ponytail: CPU로만 돌린다 (인코더가 사진당 1~2초). 누르고 기다리는 시간이 거슬리면 GPU로 옮긴다.
+    // ponytail: runs on CPU only (the encoder takes 1–2 s per photo). Move to the GPU if the wait
+    // after clicking becomes annoying.
     pub fn load(dir: &Path) -> Result<Self> {
         Ok(Self {
             encoder: crate::gpu::cpu_session(&dir.join("encoder.onnx"))?,
@@ -105,7 +110,8 @@ impl Segmenter {
         })
     }
 
-    /// 사진을 인코더에 넣는다. `picture`는 보정하지 않은 사진을 긴 변 1024 이하로 줄인 것이다.
+    /// Feeds the photo to the encoder. `picture` is the unadjusted photo shrunk to a long side of
+    /// at most 1024.
     pub fn embed(&mut self, picture: &Pixels) -> Result<Embedding> {
         let (input, size) = preprocess(picture);
         let input = TensorRef::from_array_view(([1, 3, INPUT, INPUT], input.as_slice()))?;
@@ -121,8 +127,9 @@ impl Segmenter {
         })
     }
 
-    /// 누른 자리들로 영역을 고른다. 디코더가 내는 후보 가운데 모델이 가장 믿는 것을 쓴다.
-    // ponytail: 누른 자리를 한꺼번에 넣고 한 번만 돌린다. 앞선 결과를 되먹여 다듬는 방식은 쓰지 않는다.
+    /// Selects an area from the clicked spots. Uses the decoder candidate the model trusts most.
+    // ponytail: feeds all clicked spots at once and runs once. Does not feed back earlier results
+    // to refine them.
     pub fn select(&mut self, embedding: &Embedding, points: &[Point]) -> Result<Low> {
         let (w, h) = embedding.size;
         let (width, height) = (w.div_ceil(INPUT / GRID), h.div_ceil(INPUT / GRID));
@@ -133,7 +140,7 @@ impl Segmenter {
                 logits: vec![-10.0; width * height],
             });
         }
-        // 모델은 맨 끝에 (0, 0)에 레이블 -1인 채움 점을 하나 붙여 받는다.
+        // The model expects one padding point at (0, 0) with label -1 appended at the end.
         let coords: Vec<f32> = points
             .iter()
             .flat_map(|point| [point.x * w as f32, point.y * h as f32])
@@ -173,7 +180,7 @@ impl Segmenter {
                     "Unexpected mask model output size",
                 )
             })?;
-        // 격자에서 사진이 차지하는 왼쪽 위 부분만 남긴다.
+        // Keep only the top-left part of the grid covered by the photo.
         let logits = grid
             .chunks_exact(GRID)
             .take(height)
@@ -188,7 +195,7 @@ impl Segmenter {
     }
 }
 
-/// 모델 폴더에서 마스크 모델을 읽는다. 모델 파일이 없으면 받는 방법을 알려 준다.
+/// Loads the mask model from the model folder. If the files are missing, says how to get them.
 pub fn load_segmenter() -> Result<Segmenter> {
     match missing() {
         Some(problem) => Err(problem.into()),
@@ -196,7 +203,7 @@ pub fn load_segmenter() -> Result<Segmenter> {
     }
 }
 
-/// 마스크 모델이 없으면 그 사실과 받는 방법을 알리는 문구. 있으면 None.
+/// If the mask model is missing, a message saying so and how to get it. None if present.
 pub fn missing() -> Option<Text> {
     let dir = crate::gpu::model_dir().join(MODEL);
     if dir.join("encoder.onnx").exists() && dir.join("decoder.onnx").exists() {
@@ -213,16 +220,17 @@ pub fn missing() -> Option<Text> {
     ))
 }
 
-/// 저해상도 마스크를 `guide`의 크기로 키운다. 결과는 0~1이고, `invert`면 뒤집는다.
-/// 둘레 네 격자점을 섞을 때 밝기가 비슷한 쪽을 더 따르게 해서, 경계가 그림의 윤곽에 붙는다.
+/// Scales a low-resolution mask up to the size of `guide`. The result is 0–1, inverted if `invert`.
+/// When blending the four surrounding grid points, it follows those of similar lightness more, so
+/// the boundary sticks to the image's edges.
 pub fn upscale(low: &Low, guide: &Image, invert: bool) -> Vec<f32> {
-    /// 밝기 차이가 이쯤 나면 다른 물체로 본다.
+    /// A lightness difference about this large counts as a different object.
     const SIGMA: f32 = 0.1;
     let (w, h) = (guide.width, guide.height);
     let luma = |i: usize| {
         0.2126 * guide.planes[0][i] + 0.7152 * guide.planes[1][i] + 0.0722 * guide.planes[2][i]
     };
-    // 그림의 한 화소가 격자에서 얼마만큼인지 (양 끝을 서로 맞춘다)
+    // How much of the grid one image pixel spans (the two ends aligned with each other)
     let step = |low: usize, full: usize| {
         if full > 1 {
             (low - 1) as f32 / (full - 1) as f32
@@ -231,7 +239,7 @@ pub fn upscale(low: &Low, guide: &Image, invert: bool) -> Vec<f32> {
         }
     };
     let (step_x, step_y) = (step(low.width, w), step(low.height, h));
-    // 격자점이 그림에서 놓이는 자리
+    // Where the grid points fall in the image
     let back = |cell: usize, step: f32, full: usize| {
         if step > 0.0 {
             ((cell as f32 / step).round() as usize).min(full - 1)
@@ -265,7 +273,7 @@ pub fn upscale(low: &Low, guide: &Image, invert: bool) -> Vec<f32> {
                 total += weight * alike;
                 plain += value * weight;
             }
-            // 네 점이 모두 전혀 다른 밝기면 밝기를 따지지 않고 섞는다.
+            // If all four points differ entirely in lightness, blend without regard to lightness.
             let logit = if total > 1e-6 { sum / total } else { plain };
             let inside = 1.0 / (1.0 + (-logit).exp());
             *out = if invert { 1.0 - inside } else { inside };
@@ -274,7 +282,7 @@ pub fn upscale(low: &Low, guide: &Image, invert: bool) -> Vec<f32> {
     alpha
 }
 
-/// `base`를 `alpha`만큼 `other` 쪽으로 옮긴다 (화소마다).
+/// Moves `base` toward `other` by `alpha` (per pixel).
 pub fn blend(base: &mut Image, other: &Image, alpha: &[f32]) {
     for (to, from) in base.planes.iter_mut().zip(&other.planes) {
         to.par_iter_mut()
@@ -284,9 +292,9 @@ pub fn blend(base: &mut Image, other: &Image, alpha: &[f32]) {
     }
 }
 
-/// 고른 영역을 눈에 띄게 붉게 물들인다 (화면에서 영역을 확인할 때).
+/// Tints the selected area a noticeable red (for checking the area on screen).
 pub fn tint(image: &mut Image, alpha: &[f32]) {
-    /// 가장 진한 곳에서 붉은색이 차지하는 정도.
+    /// How much red takes up at the strongest spot.
     const STRENGTH: f32 = 0.45;
     for (plane, red) in image.planes.iter_mut().zip([1.0, 0.1, 0.1]) {
         plane
@@ -308,7 +316,8 @@ mod tests {
         }
     }
 
-    /// 왼쪽 `split`열까지는 `left`, 그 오른쪽은 `right`인 그림 (세 채널 같은 값).
+    /// An image that is `left` up to column `split` and `right` beyond it (same value in all three
+    /// channels).
     fn halves(width: usize, height: usize, split: usize, left: f32, right: f32) -> Image {
         let plane: Vec<f32> = (0..width * height)
             .map(|i| if i % width < split { left } else { right })
@@ -325,42 +334,42 @@ mod tests {
         let (input, size) = preprocess(&flat(1024, 512, 128));
         assert_eq!(size, (1024, 512));
         assert_eq!(input.len(), 3 * INPUT * INPUT);
-        // ImageNet 평균과 표준편차: (128 - 123.675) / 58.395
+        // ImageNet mean and standard deviation: (128 - 123.675) / 58.395
         assert!((input[0] - 0.074_064).abs() < 1e-4, "{}", input[0]);
         assert!((input[INPUT * INPUT] - 0.205_182).abs() < 1e-4);
         assert!((input[2 * INPUT * INPUT] - 0.426_492).abs() < 1e-4);
         assert!(
             (input[511 * INPUT + 1023] - 0.074_064).abs() < 1e-4,
-            "그림의 마지막 화소"
+            "the image's last pixel"
         );
-        assert_eq!(input[512 * INPUT], 0.0, "그림 아래는 0으로 둔다");
+        assert_eq!(input[512 * INPUT], 0.0, "below the image is left at 0");
     }
 
     #[test]
     fn a_picture_larger_than_the_input_is_refused() {
-        // 넣기 전에 긴 변을 1024 이하로 줄이는 것은 부르는 쪽의 일이다.
+        // Shrinking the long side to at most 1024 before feeding it in is the caller's job.
         let result = std::panic::catch_unwind(|| preprocess(&flat(2000, 100, 0)));
         assert!(result.is_err());
     }
 
     #[test]
     fn upscaling_follows_the_edges_of_the_picture() {
-        // 저해상도 마스크: 왼쪽 절반이 고른 영역. 경계는 가운데(5열)쯤에 있다.
+        // Low-resolution mask: the left half is selected. The boundary is mid-way (column 5).
         let low = Low {
             width: 2,
             height: 2,
             logits: vec![8.0, -8.0, 8.0, -8.0],
         };
-        // 밝기가 고른 그림에서는 경계가 가운데에서 부드럽게 넘어간다.
+        // In an image of even lightness, the boundary transitions smoothly at the middle.
         let smooth = upscale(&low, &halves(10, 4, 10, 0.5, 0.5), false);
         assert_eq!(smooth.len(), 40);
         assert!(smooth[0] > 0.99 && smooth[9] < 0.01);
         assert!(smooth[4] > 0.5 && smooth[5] < 0.5, "{smooth:?}");
 
-        // 그림의 윤곽이 7열에 있으면, 마스크의 경계도 거기에 붙는다.
+        // If the image has an edge at column 7, the mask boundary sticks to it too.
         let snapped = upscale(&low, &halves(10, 4, 7, 0.9, 0.1), false);
-        assert!(snapped[6] > 0.9, "윤곽 안쪽은 고른 영역: {snapped:?}");
-        assert!(snapped[7] < 0.1, "윤곽 바깥은 아니다: {snapped:?}");
+        assert!(snapped[6] > 0.9, "inside the edge is selected: {snapped:?}");
+        assert!(snapped[7] < 0.1, "outside the edge is not: {snapped:?}");
 
         let inverted = upscale(&low, &halves(10, 4, 10, 0.5, 0.5), true);
         assert!(inverted[0] < 0.01 && inverted[9] > 0.99);
@@ -398,7 +407,7 @@ mod tests {
             },
         };
         let text = toml::to_string(&mask).unwrap();
-        assert!(!text.contains("invert"), "기본값은 적지 않는다: {text}");
+        assert!(!text.contains("invert"), "defaults are not written: {text}");
         assert!(!text.contains("include = true"), "{text}");
         assert!(
             text.contains("include = false") && text.contains("exposure = 0.5"),
@@ -409,24 +418,24 @@ mod tests {
 
     #[test]
     fn a_click_on_a_real_photo_selects_the_thing_under_it() {
-        // 모델과 샘플 사진이 있을 때만 돈다.
+        // Runs only when the model and sample photos are present.
         let photo =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("DCIM/10361110/DSC04551.ARW");
         let Ok(mut segmenter) = load_segmenter() else {
-            eprintln!("마스크 모델이 없어 건너뜀");
+            eprintln!("no mask model, skipping");
             return;
         };
         if !photo.exists() {
-            eprintln!("샘플 사진이 없어 건너뜀");
+            eprintln!("no sample photos, skipping");
             return;
         }
         let picture = crate::preview::thumbnail(&photo, INPUT)
             .unwrap()
-            .expect("미리보기가 없다");
+            .expect("no preview");
         let started = std::time::Instant::now();
         let embedding = segmenter.embed(&picture).unwrap();
         let embedded = started.elapsed();
-        // 가운데 유리 건물을 누른다.
+        // Click the glass building in the middle.
         let tower = Point {
             x: 0.48,
             y: 0.35,
@@ -434,7 +443,7 @@ mod tests {
         };
         let started = std::time::Instant::now();
         let low = segmenter.select(&embedding, &[tower]).unwrap();
-        eprintln!("인코더 {embedded:.2?}, 디코더 {:.2?}", started.elapsed());
+        eprintln!("encoder {embedded:.2?}, decoder {:.2?}", started.elapsed());
         assert_eq!(
             (low.width, low.height),
             (picture.width.div_ceil(4), picture.height.div_ceil(4))
@@ -446,14 +455,17 @@ mod tests {
             );
             low.logits[row * low.width + col]
         };
-        assert!(at(0.48, 0.35) > 0.0, "누른 자리는 고른 영역 안이다");
-        assert!(at(0.1, 0.1) < 0.0, "하늘은 아니다");
-        assert!(at(0.5, 0.95) < 0.0, "잔디밭도 아니다");
+        assert!(
+            at(0.48, 0.35) > 0.0,
+            "the clicked spot is inside the selected area"
+        );
+        assert!(at(0.1, 0.1) < 0.0, "the sky is not");
+        assert!(at(0.5, 0.95) < 0.0, "nor the lawn");
         let share =
             low.logits.iter().filter(|&&v| v > 0.0).count() as f32 / low.logits.len() as f32;
-        assert!((0.03..0.3).contains(&share), "고른 넓이 {share}");
+        assert!((0.03..0.3).contains(&share), "selected area {share}");
 
-        // 누른 자리가 없으면 아무것도 고르지 않는다.
+        // With no clicked spots, nothing is selected.
         let nothing = segmenter.select(&embedding, &[]).unwrap();
         assert!(nothing.logits.iter().all(|&v| v < 0.0));
     }

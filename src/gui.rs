@@ -1,4 +1,5 @@
-//! 창을 띄우고 `App`(상태), `ui`(그리기), `Workers`(백그라운드 작업)를 잇는다.
+//! Opens the window and wires together `App` (state), `ui` (drawing), and `Workers` (background
+//! jobs).
 
 use crate::app::{Action, App, Effect};
 use crate::lang::t;
@@ -27,7 +28,8 @@ pub fn run() -> crate::Result<()> {
     .map_err(|e| e.to_string().into())
 }
 
-/// 미리보기 한 장의 긴 변 상한. 6,000만 화소 사진도 여기까지 줄여서 올린다 (RGBA로 약 200MB).
+/// Upper limit on a preview's long side. Even a 60-megapixel photo is scaled down to this before
+/// upload (about 200 MB as RGBA).
 const MAX_PREVIEW_SIDE: usize = 8192;
 
 struct Gui {
@@ -59,12 +61,12 @@ impl Gui {
 
 impl eframe::App for Gui {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // 미리보기는 GPU가 한 장으로 받을 수 있는 크기까지 원본에 가깝게 만든다 (확대해서 보기 위해).
+        // Make the preview as close to the original as one GPU texture allows (for zooming in).
         let texture_side = ui.ctx().input(|input| input.max_texture_side);
         self.workers
             .set_preview_side(texture_side.min(MAX_PREVIEW_SIDE));
 
-        // 백그라운드 작업이 보낸 결과를 먼저 반영하고, 그 상태를 그린 뒤, 사용자가 한 일을 처리한다.
+        // Apply results from background jobs first, draw that state, then handle what the user did.
         let mut actions: Vec<Action> = self.events.try_iter().collect();
         actions.extend(ui::draw(ui, &self.app, &mut self.view, &mut self.env));
         if !actions.is_empty() {
@@ -78,7 +80,7 @@ impl eframe::App for Gui {
     }
 }
 
-/// 실제 파일 대화 상자와 화면 갈무리.
+/// Real file dialogs and screen capture.
 struct Dialogs {
     send: Arc<dyn Fn(Action) + Send + Sync>,
 }
@@ -110,13 +112,13 @@ impl Env for Dialogs {
             .pick_file()
     }
 
-    // ponytail: Linux의 xdg-open으로 연다. Windows를 지원할 때 그쪽 명령을 더한다.
+    // ponytail: opens with xdg-open on Linux. Add the Windows command when Windows is supported.
     fn open_log(&mut self) -> String {
         let path = crate::log::path();
         let shown = path.display();
         match std::process::Command::new("xdg-open").arg(&path).spawn() {
             Ok(mut viewer) => {
-                // 끝난 프로세스가 남지 않게 기다려 준다.
+                // Wait on it so the finished process does not linger.
                 std::thread::spawn(move || viewer.wait());
                 t(format!("로그 파일: {shown}"), format!("Log file: {shown}"))
             }

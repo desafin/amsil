@@ -1,4 +1,4 @@
-//! 명령행 도구.
+//! Command-line tool.
 
 use crate::capture::Capture;
 use crate::edit::Params;
@@ -13,38 +13,38 @@ use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
-/// 명령행 인자.
+/// Command-line arguments.
 #[derive(Debug, PartialEq)]
 pub struct Args {
     input: PathBuf,
     output: PathBuf,
-    /// 노이즈 제거 강도. 0이면 끈다.
+    /// Denoise strength. 0 turns it off.
     denoise: f32,
-    /// 이미 있는 출력 파일도 다시 만든다 (폴더 모드).
+    /// Recreate output files that already exist (folder mode).
     overwrite: bool,
-    /// 동시에 처리할 장수. 없으면 CPU 코어 수.
+    /// Number of photos processed at once. Defaults to the CPU core count.
     jobs: Option<usize>,
-    /// 메모리 한도(GB). 없으면 남은 메모리의 70%.
+    /// Memory limit (GB). Defaults to 70% of free memory.
     memory_gb: Option<f64>,
-    /// 프리셋의 식별자.
+    /// Preset identifier.
     preset: Option<String>,
-    /// 프리셋의 강도 (0~1.5).
+    /// Preset strength (0–1.5).
     strength: f32,
-    /// 마지막에 입힐 LUT 파일.
+    /// LUT file applied last.
     lut: Option<PathBuf>,
-    /// LUT의 강도 (0~1).
+    /// LUT strength (0–1).
     lut_strength: f32,
-    /// 사진에 두를 프레임.
+    /// Frame drawn around the photo.
     frame: Option<Frame>,
-    /// 피부 보정의 세기 (0~1). 0이면 끈다.
+    /// Skin smoothing strength (0–1). 0 turns it off.
     skin: f32,
-    /// 출력 품질.
+    /// Output quality.
     quality: u8,
-    /// 캡처 샤픈.
+    /// Capture sharpening.
     pub capture: Capture,
 }
 
-/// 사용법 안내.
+/// Usage text.
 pub fn usage() -> &'static str {
     t(
         "사용법: amsil [옵션] <입력 RAW> <출력.heic>
@@ -271,17 +271,18 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> std::result::Resu
     }
 }
 
-/// 고를 수 있는 프리셋: 기본 프리셋 뒤에 사용자가 만든 것 (화면과 같은 목록).
+/// Selectable presets: the built-in ones followed by user-made ones (same list as the GUI).
 fn presets() -> Vec<preset::Preset> {
     let mut presets = preset::builtin();
     presets.extend(preset::load_dir(&crate::project::Config::path().with_file_name("presets")).0);
     presets
 }
 
-/// `--preset`에 이 이름을 주면 사진마다 내용에 맞는 프리셋을 고른다.
+/// Passing this name to `--preset` picks a preset per photo based on its content.
 const AUTO: &str = "auto";
 
-/// 사진마다의 보정 값. `--preset=auto`면 사진을 분류해 맞는 프리셋을 고르고, 아니면 모두 같은 값이다.
+/// Per-photo adjustments. With `--preset=auto` each photo is classified and gets a matching
+/// preset; otherwise every photo gets the same values.
 fn params_for(args: &Args, inputs: &[PathBuf]) -> Result<Vec<Params>> {
     if args.preset.as_deref() == Some(AUTO) {
         auto_params(args, inputs)
@@ -290,15 +291,18 @@ fn params_for(args: &Args, inputs: &[PathBuf]) -> Result<Vec<Params>> {
     }
 }
 
-/// 사진을 분류해 사진마다 맞는 프리셋의 보정 값을 정한다. 맞는 것이 없는 사진은 보정하지 않는다.
+/// Classifies the photos and picks the matching preset's adjustments for each. Photos with no
+/// match are left unadjusted.
 fn auto_params(args: &Args, inputs: &[PathBuf]) -> Result<Vec<Params>> {
     let presets = presets();
     let mut classifier = crate::recommend::load_classifier()?;
-    // ponytail: 한 장씩 차례로 분류한다 (장당 0.1초쯤). 수천 장이면 여러 스레드로 나눈다.
+    // ponytail: classifies one photo at a time (about 0.1 s each). Split across threads for
+    // thousands of photos.
     Ok(inputs
         .iter()
         .map(|input| {
-            // 읽을 수 없는 사진은 분류하지 않고 넘어간다. 변환할 때 그 사진만 이유와 함께 실패로 남는다.
+            // Unreadable photos are skipped here. Conversion then fails just that photo, with
+            // the reason.
             let guess = crate::preview::thumbnail(input, 448)
                 .ok()
                 .flatten()
@@ -314,7 +318,7 @@ fn auto_params(args: &Args, inputs: &[PathBuf]) -> Result<Vec<Params>> {
         .collect())
 }
 
-/// 명령행에서 고른 프리셋과 강도로 보정 값을 정한다.
+/// Builds the adjustments from the preset and strength chosen on the command line.
 fn params(args: &Args) -> Result<Params> {
     let presets = presets();
     if let Some(id) = &args.preset
@@ -336,7 +340,7 @@ fn params(args: &Args) -> Result<Params> {
     ))
 }
 
-/// 노이즈 제거를 쓸 때만 모델을 읽는다. CPU로 돌게 되면 경고를 출력한다.
+/// Loads the model only when denoising is on. Prints a warning if it falls back to the CPU.
 fn load_denoiser(needed: bool) -> Result<Option<Mutex<crate::gpu::Denoiser>>> {
     if !needed {
         return Ok(None);
@@ -348,7 +352,7 @@ fn load_denoiser(needed: bool) -> Result<Option<Mutex<crate::gpu::Denoiser>>> {
     Ok(Some(Mutex::new(denoiser)))
 }
 
-/// 피부 보정을 쓸 때만 피부를 찾는 모델을 읽는다.
+/// Loads the skin detection model only when skin smoothing is on.
 fn load_skin_finder(needed: bool) -> Result<Option<Mutex<crate::skin::SkinFinder>>> {
     if !needed {
         return Ok(None);
@@ -356,7 +360,7 @@ fn load_skin_finder(needed: bool) -> Result<Option<Mutex<crate::skin::SkinFinder
     Ok(Some(Mutex::new(crate::skin::load_finder()?)))
 }
 
-/// 폴더 전체를 변환한다. 진행 상황은 `report`로 알린다.
+/// Converts a whole folder. Progress is reported through `report`.
 fn run_folder(
     args: &Args,
     report: impl FnMut(&Report),
@@ -401,7 +405,7 @@ fn run_folder(
     )
 }
 
-/// 진행 상황 한 줄.
+/// One line of progress.
 fn status_line(r: &Report) -> String {
     let total = r.status.total.max(1) as f64;
     let filled = (r.status.progress / total * 20.0) as usize;
@@ -455,7 +459,8 @@ pub fn run(args: &Args) -> Result<()> {
         return Ok(());
     }
 
-    // 터미널이면 한 줄을 계속 고쳐 쓰고, 아니면(파일로 보낼 때) 5초에 한 줄씩 쓴다.
+    // On a terminal, keep rewriting one line; otherwise (redirected to a file) write a line
+    // every 5 s.
     let terminal = std::io::stderr().is_terminal();
     let mut printed = Instant::now() - std::time::Duration::from_secs(60);
     let (outcome, warnings) = run_folder(args, |report| {
@@ -632,7 +637,7 @@ mod tests {
         assert_eq!(
             (again.done, again.skipped),
             (0, 2),
-            "이미 만든 파일은 건너뛴다"
+            "files already made are skipped"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -752,17 +757,17 @@ mod tests {
         );
         assert!(
             args(&["--frame-black", "in", "out"]).is_err(),
-            "색만 주고 모양을 주지 않으면 알린다"
+            "colour without a shape is reported"
         );
         assert!(usage().contains("--frame="));
     }
 
     #[test]
     fn auto_preset_picks_by_what_each_photo_shows() {
-        // 분류 모델과 샘플 사진이 있을 때만 돈다.
+        // Runs only when the classifier model and the sample photo are present.
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("DCIM/10361110");
         if !dir.exists() || crate::recommend::load_classifier().is_err() {
-            eprintln!("분류 모델이나 샘플 사진이 없어 건너뜀");
+            eprintln!("Classifier model or sample photo missing, skipping");
             return;
         }
         let args = args(&["--preset=auto", "--strength=0.5", "in", "out"]).unwrap();
@@ -801,9 +806,9 @@ mod tests {
 
     #[test]
     fn auto_preset_does_not_stop_the_batch_for_an_unreadable_photo() {
-        // 분류 모델이 있을 때만 돈다.
+        // Runs only when the classifier model is present.
         if crate::recommend::load_classifier().is_err() {
-            eprintln!("분류 모델이 없어 건너뜀");
+            eprintln!("Classifier model missing, skipping");
             return;
         }
         let dir = std::env::temp_dir().join(format!("amsil-auto-broken-{}", std::process::id()));
@@ -811,7 +816,8 @@ mod tests {
         let broken = dir.join("broken.ARW");
         std::fs::write(&broken, [0x5a; 4096]).unwrap();
         let args = args(&["--preset=auto", "in", "out"]).unwrap();
-        // 분류하지 못한 사진은 보정 없이 둔다. 변환 단계에서 그 사진만 이유와 함께 실패로 남는다.
+        // Photos that could not be classified are left unadjusted. Conversion then fails just that
+        // photo, with the reason.
         let chosen = auto_params(&args, std::slice::from_ref(&broken));
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(chosen.unwrap()[0].is_neutral());

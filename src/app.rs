@@ -1,8 +1,8 @@
-//! 화면과 무관한 프로그램 상태.
+//! Program state, independent of the UI.
 //!
-//! 사용자가 한 일과 백그라운드 작업의 결과는 모두 `Action`으로 들어온다. `App::handle`이 상태를 바꾸고,
-//! 화면 밖에서 해야 할 일(썸네일 만들기, 내보내기 등)을 `Effect`로 돌려준다. 화면 코드는 상태를 읽어
-//! 그리기만 한다.
+//! Everything the user does and every result of a background job comes in as an `Action`.
+//! `App::handle` changes the state and returns the work to do outside the UI (making thumbnails,
+//! exporting, and so on) as `Effect`s. UI code only reads the state and draws it.
 
 use crate::capture::{self, Capture, CaptureView};
 use crate::edit::Params;
@@ -22,89 +22,95 @@ use std::path::{Path, PathBuf};
 pub struct App {
     config_path: PathBuf,
     pub config: Config,
-    /// 열려 있는 프로젝트. 없으면 시작 화면이다.
+    /// The open project. None means the start screen.
     pub open: Option<Open>,
-    /// 상태 줄에 보여 줄 알림 (오류 포함).
+    /// Notice to show in the status bar (errors included).
     pub notice: Option<String>,
-    /// AI 모델이 어디서 도는지.
+    /// Where the AI models run.
     pub backend: Backend,
-    /// 고를 수 있는 프리셋: 기본 프리셋 뒤에 사용자가 만든 것.
+    /// Presets to choose from: the built-in ones followed by the user's own.
     pub presets: Vec<Preset>,
-    /// 프리셋 추천(사진 분류)을 쓸 수 없는 이유. 쓸 수 있으면 None.
+    /// Why preset recommendation (photo classification) is unavailable. None if available.
     pub recommend_problem: Option<Text>,
-    /// 마스크를 쓸 수 없는 이유. 쓸 수 있으면 None.
+    /// Why masks are unavailable. None if available.
     pub mask_problem: Option<Text>,
-    /// 피부 보정을 쓸 수 없는 이유. 쓸 수 있으면 None.
+    /// Why skin retouching is unavailable. None if available.
     pub skin_problem: Option<Text>,
 }
 
-/// AI 모델(노이즈 제거)의 실행 환경.
+/// Where the AI model (denoising) runs.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Backend {
-    /// 아직 확인 중.
+    /// Still checking.
     Unknown,
     Gpu,
-    /// GPU를 못 써서 CPU로 돈다. 느리다는 안내와 해결 방법.
+    /// The GPU is unavailable, so it runs on the CPU. A note that it is slow, and how to fix it.
     Cpu(Text),
-    /// 모델을 쓸 수 없다 (파일이 없는 경우 등). 이유와 해결 방법.
+    /// The model cannot be used (for example, the file is missing). The reason and how to fix it.
     Unavailable(Text),
 }
 
-/// 열려 있는 프로젝트의 작업 상태.
+/// Working state of the open project.
 pub struct Open {
-    /// 프로젝트 파일의 위치.
+    /// Location of the project file.
     pub path: PathBuf,
     pub project: Project,
-    /// 가져온 모든 폴더의 사진.
+    /// Photos from all imported folders.
     pub photos: Vec<Photo>,
     pub selected: BTreeSet<usize>,
-    /// 미리보기에 띄운 사진.
+    /// The photo shown in the preview.
     pub current: Option<usize>,
-    /// 노이즈 제거 슬라이더의 값. [적용]을 눌러야 사진에 반영된다.
+    /// Value of the denoise slider. It reaches the photo only when [Apply] is pressed.
     pub denoise_level: f32,
     pub preview: Option<Preview>,
-    /// 지금 보는 사진에서 고쳐 쓰는 중인 마스크의 번호. 미리보기를 누르면 이 마스크에 자리가 더해진다.
+    /// Index of the mask being edited on the current photo. Clicking the preview adds a point to
+    /// this mask.
     pub mask: Option<usize>,
-    /// 고쳐 쓰는 마스크가 고른 영역을 미리보기에 붉게 표시할지.
+    /// Whether to tint the area selected by the edited mask red in the preview.
     pub show_mask: bool,
-    /// 전후 비교를 켰는가. 켜면 미리보기를 보정 전과 보정 후 두 칸으로 나눈다.
+    /// Whether before/after comparison is on. When on, the preview is split into a before pane and
+    /// an after pane.
     pub compare: bool,
-    /// 비교할 때 보여 줄 보정 전 그림 (한 장만 둔다).
+    /// The before image shown while comparing (only one is kept).
     pub original: Option<Original>,
-    /// 마지막으로 요청한 보정 전 그림이 카메라 JPEG인가.
+    /// Whether the last requested before image is the camera JPEG.
     original_jpeg: bool,
-    /// (사진 번호, 그 사진의 카메라 JPEG). 보정 전 그림을 요청할 때 지금 사진에 대해 찾아 둔다.
+    /// (photo index, that photo's camera JPEG). Looked up for the current photo when the before
+    /// image is requested.
     pub sidecar: Option<(usize, Option<PathBuf>)>,
-    /// 사진에서 구한 캡처 샤픈의 (사진 번호, 반경, 대비 문턱). 가장 최근에 읽은 사진의 것만 둔다.
+    /// Capture sharpening (photo index, radius, contrast threshold) derived from the photo. Only
+    /// the most recently read photo's is kept.
     pub capture_auto: Option<(usize, f32, f32)>,
-    /// 샤픈 영역 보기 (저장하지 않는다).
+    /// Sharpening area view (not saved).
     pub capture_view: Option<CaptureView>,
     pub export: ExportState,
-    /// 미리보기 요청 번호. 늦게 도착한 옛 결과를 버리는 데 쓴다.
+    /// Preview request number. Used to drop stale results that arrive late.
     generation: u64,
     preview_serial: u64,
-    /// 보정 전 그림의 요청 번호. 늦게 도착한 옛 결과를 버리는 데 쓴다.
+    /// Request number of the before image. Used to drop stale results that arrive late.
     original_generation: u64,
 }
 
 pub struct Photo {
-    /// `project.folders`에서의 위치.
+    /// Position in `project.folders`.
     pub folder: usize,
-    /// 폴더 기준 상대 경로.
+    /// Path relative to the folder.
     pub relative: String,
     pub thumbnail: Option<Pixels>,
-    /// 사진이 무엇을 찍은 것인지에 대한 짐작. 아직 분류하지 않았으면 None.
+    /// A guess at what the photo shows. None if not yet classified.
     pub guess: Option<Guess>,
 }
 
 pub struct Preview {
     pub index: usize,
-    /// 그림이 바뀔 때마다 달라지는 번호. 화면 쪽에서 텍스처를 다시 올릴지 아는 데 쓴다.
+    /// A number that changes whenever the image changes. The UI uses it to know whether to
+    /// re-upload the texture.
     pub serial: u64,
     pub pixels: Pixels,
 }
 
-/// 같은 폴더에 같은 이름으로 있는 카메라 JPEG (`.jpg`, `.jpeg`, 대소문자 무관). 없으면 None.
+/// The camera JPEG with the same name in the same folder (`.jpg`, `.jpeg`, any case). None if there
+/// is none.
 pub fn sidecar_jpeg(raw: &Path) -> Option<PathBuf> {
     let (dir, stem) = (raw.parent()?, raw.file_stem()?);
     let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
@@ -122,21 +128,22 @@ pub fn sidecar_jpeg(raw: &Path) -> Option<PathBuf> {
     found.into_iter().next()
 }
 
-/// 아무 보정도 하지 않은 사진 (전후 비교의 보정 전 칸). 카메라 JPEG일 수도 있다.
+/// The photo with no adjustments (the before pane of the comparison). May be the camera JPEG.
 pub struct Original {
     pub index: usize,
-    /// 카메라 JPEG를 읽은 것인가.
+    /// Whether it was read from the camera JPEG.
     pub jpeg: bool,
-    /// 그림이 바뀔 때마다 달라지는 번호. 화면 쪽에서 텍스처를 다시 올릴지 아는 데 쓴다.
+    /// A number that changes whenever the image changes. The UI uses it to know whether to
+    /// re-upload the texture.
     pub serial: u64,
-    /// 만들지 못했으면 그 이유.
+    /// The reason, if it could not be made.
     pub pixels: std::result::Result<Pixels, Text>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExportState {
     Idle,
-    /// 이미 있는 출력 파일을 어떻게 할지 묻는 중.
+    /// Asking what to do with output files that already exist.
     Confirm {
         photos: Vec<export::Photo>,
         existing: usize,
@@ -152,7 +159,7 @@ pub enum ExportState {
     Failed(String),
 }
 
-/// `Report`에서 화면에 필요한 것 (비교할 수 있게 따로 둔다).
+/// What the UI needs from a `Report` (kept separate so it can be compared).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ReportView {
     pub finished: usize,
@@ -167,117 +174,123 @@ pub struct ReportView {
     pub low_memory: bool,
 }
 
-/// 사용자가 한 일, 또는 백그라운드 작업이 알려 온 결과.
+/// Something the user did, or a result reported by a background job.
 pub enum Action {
     NewProject(PathBuf),
     OpenProject(PathBuf),
     CloseProject,
     ImportFolder(PathBuf),
-    /// `extend`가 참이면 지금 선택에 더한다.
+    /// If `extend` is true, adds to the current selection.
     Select {
         index: usize,
         extend: bool,
     },
     SelectAll,
     SetDenoiseLevel(f32),
-    /// 슬라이더의 레벨을 선택한 사진들에 적용한다.
+    /// Applies the slider's level to the selected photos.
     ApplyDenoise,
-    /// 선택한 사진들의 프리셋을 정한다 (None이면 없앤다).
+    /// Sets the preset of the selected photos (None removes it).
     SetPreset(Option<String>),
-    /// 선택한 사진마다 그 내용에 맞는 프리셋을 적용한다. 맞는 것이 없으면 프리셋을 없앤다.
+    /// Applies to each selected photo the preset that fits its content. Removes the preset if none
+    /// fits.
     ApplyRecommended,
-    /// 프리셋의 강도. 슬라이더를 끄는 동안에는 `commit`이 거짓이고, 놓을 때 참으로 한 번 온다 (그때 저장한다).
+    /// Preset strength. `commit` is false while the slider is dragged and comes once as true on
+    /// release (that is when it is saved).
     SetStrength {
         value: f32,
         commit: bool,
     },
-    /// 수동 조정.
+    /// Manual adjustments.
     SetAdjust {
         params: Params,
         commit: bool,
     },
-    /// 선택한 사진들에 입힐 LUT 파일을 정한다 (None이면 없앤다).
+    /// Sets the LUT file applied to the selected photos (None removes it).
     SetLut(Option<PathBuf>),
-    /// LUT의 강도.
+    /// LUT strength.
     SetLutStrength {
         value: f32,
         commit: bool,
     },
-    /// 선택한 사진들에 두를 프레임을 정한다 (None이면 없앤다).
+    /// Sets the frame around the selected photos (None removes it).
     SetFrame(Option<Frame>),
-    /// 지금 보는 사진에 새 마스크를 만들고 고쳐 쓰기 시작한다.
+    /// Creates a new mask on the current photo and starts editing it.
     AddMask,
-    /// 고쳐 쓸 마스크를 고른다 (None이면 고쳐 쓰기를 마친다).
+    /// Picks the mask to edit (None ends editing).
     SelectMask(Option<usize>),
-    /// 고쳐 쓰는 마스크를 지운다.
+    /// Deletes the mask being edited.
     RemoveMask,
-    /// 고쳐 쓰는 마스크에 누른 자리를 더한다. 좌표는 사진의 왼쪽 위가 (0, 0), 오른쪽 아래가 (1, 1)이다.
+    /// Adds a clicked point to the mask being edited. Coordinates run from (0, 0) at the photo's
+    /// top left to (1, 1) at its bottom right.
     AddMaskPoint {
         x: f32,
         y: f32,
         include: bool,
     },
-    /// 마지막으로 누른 자리를 없앤다.
+    /// Removes the last clicked point.
     UndoMaskPoint,
     SetMaskInvert(bool),
-    /// 고쳐 쓰는 마스크의 영역에만 더할 보정.
+    /// Adjustments added only within the area of the mask being edited.
     SetMaskAdjust {
         params: Params,
         commit: bool,
     },
-    /// 고른 영역을 미리보기에 표시할지.
+    /// Whether to show the selected area in the preview.
     ShowMask(bool),
-    /// 전후 비교를 켜거나 끈다.
+    /// Turns before/after comparison on or off.
     SetCompare(bool),
-    /// 선택한 사진들의 피부 보정 세기 (0~1).
+    /// Skin retouching strength of the selected photos (0 to 1).
     SetSkin {
         value: f32,
         commit: bool,
     },
-    /// 선택한 사진들의 캡처 샤픈 값. 범위를 벗어난 값은 범위 안으로 들인다.
+    /// Capture sharpening values of the selected photos. Out-of-range values are clamped into
+    /// range.
     SetCapture {
         value: Capture,
         commit: bool,
     },
-    /// 샤픈 영역 보기를 바꾼다 (None이면 끈다).
+    /// Changes the sharpening area view (None turns it off).
     SetCaptureView(Option<CaptureView>),
-    /// 전후 비교의 보정 전 칸에 보여 줄 것 (설정 파일에 저장한다).
+    /// What to show in the before pane of the comparison (saved to the config file).
     SetCompareBefore(Before),
-    /// 워커가 사진을 읽으며 구한 캡처 샤픈의 반경과 대비 문턱 (값을 정하지 않았을 때 쓰는 것).
+    /// Capture sharpening radius and contrast threshold the worker derived while reading the photo
+    /// (used when no value is set).
     CaptureAuto {
         index: usize,
         radius: f32,
         threshold: f32,
     },
-    /// 프리셋, 수동 조정, LUT, 피부 보정을 지운다 (노이즈 제거, 프레임, 마스크는 그대로).
+    /// Clears the preset, manual adjustments, LUT, and skin retouching (denoise, frame, and masks
+    /// stay).
     ResetLook,
     SetExportFolder(PathBuf),
     SetQuality(u8),
     Export {
         only_selected: bool,
     },
-    /// 이미 있는 파일을 덮어쓸지(true) 건너뛸지(false).
+    /// Whether to overwrite (true) or skip (false) files that already exist.
     ConfirmExport {
         overwrite: bool,
     },
     CancelExport,
-    /// 내보내기 결과 표시를 닫는다.
+    /// Closes the export result display.
     DismissExport,
-    /// 화면 갈무리를 저장한다.
+    /// Saves a screenshot.
     SaveScreenshot(Pixels),
-    /// 화면과 메시지의 언어를 바꾼다.
+    /// Changes the language of the UI and messages.
     SetLanguage(Lang),
-    /// 화면 쪽에서 알릴 것이 생겼다 (상태 줄에 보여 준다).
+    /// The UI has something to report (shown in the status bar).
     Notify(String),
-    /// 화면을 밝게 또는 어둡게.
+    /// Light or dark UI.
     SetTheme(Theme),
-    /// 전후 비교에서 미리보기를 나누는 방향을 정한다 (설정에 저장한다).
+    /// Sets the direction the preview is split for before/after comparison (saved to the config).
     SetCompareSplit(Split),
 
     Thumbnail {
         index: usize,
         pixels: Option<Pixels>,
-        /// 사진의 종류에 대한 짐작 (분류 모델이 있을 때).
+        /// A guess at the kind of photo (when the classification model is available).
         guess: Option<Guess>,
     },
     PreviewReady {
@@ -293,45 +306,45 @@ pub enum Action {
     ExportProgress(Report),
     ExportFinished(std::result::Result<(Outcome, export::Warnings), Text>),
     Backend(Backend),
-    /// 프리셋 추천을 쓸 수 있는지. 쓸 수 없으면 그 이유.
+    /// Whether preset recommendation is available. If not, the reason.
     Recommender(Option<Text>),
-    /// 마스크를 쓸 수 있는지. 쓸 수 없으면 그 이유.
+    /// Whether masks are available. If not, the reason.
     Segmenter(Option<Text>),
-    /// 피부 보정을 쓸 수 있는지. 쓸 수 없으면 그 이유.
+    /// Whether skin retouching is available. If not, the reason.
     SkinModel(Option<Text>),
 }
 
-/// 화면 밖에서 해야 할 일.
+/// Work to do outside the UI.
 #[derive(Debug, PartialEq)]
-// 효과는 동작 하나에 몇 개만 만든다. 변형마다 크기가 달라도 상관없다.
+// Only a few effects are made per action, so differing variant sizes do not matter.
 #[allow(clippy::large_enum_variant)]
 pub enum Effect {
-    /// (사진 번호, 파일 경로)들의 썸네일을 만든다.
+    /// Makes thumbnails for the (photo index, file path) pairs.
     Thumbnails(Vec<(usize, PathBuf)>),
     Preview {
         generation: u64,
         index: usize,
         path: PathBuf,
         denoise: f32,
-        /// 보정 값 (프리셋 × 강도 + 수동 조정).
+        /// Adjustment values (preset × strength + manual adjustments).
         params: Params,
-        /// 마지막에 입힐 LUT 파일과 강도.
+        /// LUT file and strength, applied last.
         lut: Option<(PathBuf, f32)>,
-        /// 사진에 두를 프레임.
+        /// Frame around the photo.
         frame: Option<Frame>,
-        /// 부분 보정 마스크.
+        /// Local adjustment masks.
         masks: Vec<Mask>,
-        /// 이 번호의 마스크가 고른 영역을 붉게 표시한다.
+        /// Tints the area selected by the mask with this index red.
         overlay: Option<usize>,
-        /// 피부 보정의 세기.
+        /// Skin retouching strength.
         skin: f32,
-        /// 캡처 샤픈 (RAW 단계).
+        /// Capture sharpening (RAW stage).
         capture: Capture,
-        /// 캡처 샤픈이 걸리는 곳을 보여 줄지.
+        /// Whether to show where capture sharpening applies.
         capture_view: Option<CaptureView>,
     },
-    /// 아무 보정도 하지 않은 사진을 만든다 (전후 비교의 보정 전 칸). `jpeg`가 있으면 그 카메라 JPEG를 읽는다.
-    /// 결과는 `Action::OriginalReady`로 온다.
+    /// Makes the photo with no adjustments (the before pane of the comparison). If `jpeg` is set,
+    /// reads that camera JPEG instead. The result arrives as `Action::OriginalReady`.
     Original {
         generation: u64,
         index: usize,
@@ -343,14 +356,14 @@ pub enum Effect {
         settings: export::Settings,
     },
     CancelExport,
-    /// AI를 GPU로 돌릴 수 있는지 (다시) 알아본다. 결과는 `Action::Backend`로 온다.
+    /// Checks (again) whether the AI can run on the GPU. The result arrives as `Action::Backend`.
     ProbeBackend,
 }
 
 impl App {
-    /// `config_path`의 설정을 읽어 시작 화면 상태로 만든다.
+    /// Reads the config at `config_path` and starts at the start screen.
     pub fn new(config_path: PathBuf) -> Self {
-        // 사용자 프리셋은 설정 파일 옆의 presets 폴더에 둔다.
+        // User presets live in the presets folder next to the config file.
         let (user, problems) = preset::load_dir(&config_path.with_file_name("presets"));
         let mut presets = preset::builtin();
         presets.extend(user);
@@ -371,7 +384,8 @@ impl App {
         match self.try_handle(action) {
             Ok(effects) => effects,
             Err(error) => {
-                // 화면에 띄운 오류는 로그에도 남긴다 (알림은 다음 알림에 덮여 사라진다).
+                // Errors shown on screen are also logged (a notice disappears when the next one
+                // replaces it).
                 log::error(&error);
                 self.notice = Some(error.to_string());
                 Vec::new()
@@ -380,7 +394,7 @@ impl App {
     }
 
     fn try_handle(&mut self, action: Action) -> crate::Result<Vec<Effect>> {
-        // 프로젝트가 없어도 되는 동작들
+        // Actions that do not need a project
         match action {
             Action::NewProject(path) => {
                 let path = path.with_extension("amsil");
@@ -448,7 +462,8 @@ impl App {
                 lang::set(chosen);
                 self.config.lang = Some(chosen);
                 self.config.save(&self.config_path)?;
-                // 앞서 받아 둔 AI 안내 문구는 옛 언어로 되어 있다. 새 언어로 다시 받는다.
+                // The AI notes received earlier are in the old language. Fetch them again in the
+                // new one.
                 return Ok(vec![Effect::ProbeBackend]);
             }
             _ => {}
@@ -522,7 +537,7 @@ impl App {
                 }
                 open.selected.insert(index);
                 open.current = Some(index);
-                // 마스크는 사진마다 따로다. 다른 사진으로 가면 고쳐 쓰기를 마친다.
+                // Masks are per photo. Moving to another photo ends editing.
                 open.mask = None;
                 open.denoise_level = open.edit(index).denoise;
                 effects.push(open.request_preview(index, &self.presets));
@@ -553,7 +568,7 @@ impl App {
             }
             Action::ApplyRecommended => {
                 for index in open.selected.clone() {
-                    // 아직 분류하지 않은 사진은 건드리지 않는다.
+                    // Photos not yet classified are left alone.
                     let Some(guess) = open.photos[index].guess else {
                         continue;
                     };
@@ -655,7 +670,7 @@ impl App {
             }
             Action::SetCompare(on) => {
                 open.compare = on;
-                // 비교하는 동안에는 프레임을 빼므로 보정 후 그림을 다시 받는다.
+                // The frame is dropped while comparing, so request the after image again.
                 if let Some(current) = open.current {
                     effects.push(open.request_preview(current, &self.presets));
                 }
@@ -802,7 +817,7 @@ impl App {
                 index,
                 result,
             } => {
-                // 그 사이에 다른 사진을 골랐다면 버린다.
+                // Drop it if another photo was picked in the meantime.
                 if generation == open.generation {
                     open.preview_serial += 1;
                     open.preview = Some(Preview {
@@ -817,7 +832,7 @@ impl App {
                 index,
                 result,
             } => {
-                // 그 사이에 다른 사진을 골랐다면 버린다.
+                // Drop it if another photo was picked in the meantime.
                 if generation == open.original_generation {
                     if let Err(error) = &result {
                         log::error(error);
@@ -857,7 +872,7 @@ impl App {
         Ok(effects)
     }
 
-    /// 프로젝트를 열어 작업 화면으로 들어간다. 폴더를 다시 훑어 사진 목록을 만든다.
+    /// Opens a project and enters the work screen. Rescans the folders to build the photo list.
     fn enter(&mut self, path: PathBuf, project: Project) -> crate::Result<Vec<Effect>> {
         let mut open = Open {
             path: path.clone(),
@@ -883,7 +898,8 @@ impl App {
         let mut wanted = Vec::new();
         let mut missing = Vec::new();
         for folder in 0..open.project.folders.len() {
-            // ponytail: 여기서 폴더를 직접 훑는다. 느린 디스크의 큰 폴더라면 화면이 잠깐 멈출 수 있다.
+            // ponytail: scans the folders right here. A large folder on a slow disk can briefly
+            // freeze the UI.
             match crate::job::scan(&open.project.folders[folder].path) {
                 Ok(files) => {
                     if let Effect::Thumbnails(list) = open.add_photos(folder, files) {
@@ -910,7 +926,8 @@ impl App {
         })
     }
 
-    /// 화면 갈무리를 PNG로 저장한다. 프로젝트가 열려 있으면 그 옆의 `스크린샷` 폴더에, 아니면 설정 폴더에 둔다.
+    /// Saves a screenshot as PNG, in a screenshots folder next to the project if one is open (named
+    /// `스크린샷` in Korean), otherwise in the config folder.
     fn save_screenshot(&self, pixels: &Pixels) -> crate::Result<PathBuf> {
         let base = match &self.open {
             Some(open) => open.path.parent().unwrap_or(Path::new(".")).to_owned(),
@@ -939,7 +956,7 @@ impl App {
 }
 
 impl Open {
-    /// 사진 파일의 전체 경로.
+    /// Full path of the photo file.
     pub fn photo_path(&self, index: usize) -> PathBuf {
         let photo = &self.photos[index];
         self.project.folders[photo.folder]
@@ -947,23 +964,25 @@ impl Open {
             .join(&photo.relative)
     }
 
-    /// 가장 최근에 요청한 미리보기의 번호.
+    /// Number of the most recently requested preview.
     #[cfg(test)]
     pub fn preview_generation(&self) -> u64 {
         self.generation
     }
 
-    /// 가장 최근에 요청한 보정 전 그림의 번호.
+    /// Number of the most recently requested before image.
     #[cfg(test)]
     pub fn original_generation(&self) -> u64 {
         self.original_generation
     }
 
-    /// 비교 중이면 지금 사진의 보정 전 그림을 요청한다. 이미 들고 있으면 (만들지 못한 경우는 빼고) 하지 않는다.
-    /// `before`가 카메라 JPEG인데 그 사진의 JPEG가 없으면 보정 전 RAW를 요청한다.
+    /// While comparing, requests the before image of the current photo. Does nothing if it is
+    /// already held (unless it could not be made). If `before` is the camera JPEG but the photo has
+    /// none, requests the unadjusted RAW.
     fn request_original(&mut self, before: Before) -> Option<Effect> {
         let current = self.current.filter(|_| self.compare)?;
-        // 사진 폴더에 파일이 나중에 생길 수도 있으니 요청할 때마다 다시 찾는다 (폴더를 한 번 훑는다).
+        // A file may appear in the photo folder later, so look again on every request (one folder
+        // scan).
         self.sidecar = Some((current, sidecar_jpeg(&self.photo_path(current))));
         let jpeg = match before {
             Before::Jpeg => self.sidecar.as_ref().and_then(|(_, jpeg)| jpeg.clone()),
@@ -984,7 +1003,7 @@ impl Open {
         })
     }
 
-    /// 사진에 저장된 편집 내용.
+    /// Edits saved for the photo.
     pub fn edit(&self, index: usize) -> Edit {
         let photo = &self.photos[index];
         self.project.edit(photo.folder, &photo.relative)
@@ -994,7 +1013,7 @@ impl Open {
         self.project.save(&self.path)
     }
 
-    /// 폴더의 사진들을 목록 끝에 붙이고, 썸네일을 만들어 달라는 요청을 돌려준다.
+    /// Appends the folder's photos to the list and returns requests to make their thumbnails.
     fn add_photos(&mut self, folder: usize, files: Vec<PathBuf>) -> Effect {
         let first = self.photos.len();
         self.photos.extend(files.iter().map(|file| Photo {
@@ -1010,13 +1029,13 @@ impl Open {
         )
     }
 
-    /// 사진에 최종으로 적용할 보정 값.
+    /// Final adjustment values to apply to the photo.
     pub fn params(&self, index: usize, presets: &[Preset]) -> Params {
         let edit = self.edit(index);
         preset::resolve(presets, edit.preset.as_deref(), edit.strength, &edit.adjust)
     }
 
-    /// 사진에 입힐 LUT 파일과 강도.
+    /// LUT file and strength to apply to the photo.
     fn lut(&self, index: usize) -> Option<(PathBuf, f32)> {
         self.edit(index).lut.map(|lut| (lut.file, lut.strength))
     }
@@ -1024,8 +1043,8 @@ impl Open {
     fn request_preview(&mut self, index: usize, presets: &[Preset]) -> Effect {
         self.generation += 1;
         let edit = self.edit(index);
-        // 마스크를 고쳐 쓰는 동안과 전후를 비교하는 동안에는 프레임 없이 보여 준다
-        // (누른 자리가 어긋나지 않게, 두 칸의 크기가 같게).
+        // While editing a mask or comparing before/after, show it without the frame (so clicks line
+        // up and both panes are the same size).
         let editing = self.mask.filter(|_| self.current == Some(index));
         Effect::Preview {
             generation: self.generation,
@@ -1034,7 +1053,8 @@ impl Open {
             denoise: edit.denoise,
             params: self.params(index, presets),
             lut: self.lut(index),
-            // 영역(마스크, 샤픈)을 보는 동안에는 프레임을 뺀다 (표시가 사진과 어긋나지 않게).
+            // Drop the frame while viewing an area (mask, sharpening) so the overlay lines up with
+            // the photo.
             frame: edit
                 .frame
                 .filter(|_| editing.is_none() && !self.compare && self.capture_view.is_none()),
@@ -1046,7 +1066,8 @@ impl Open {
         }
     }
 
-    /// 지금 보는 사진의 마스크 목록을 바꾸고 미리보기를 다시 요청한다. `commit`이면 파일에도 저장한다.
+    /// Changes the current photo's mask list and requests the preview again. With `commit`, also
+    /// saves to the file.
     fn change_masks(
         &mut self,
         commit: bool,
@@ -1071,7 +1092,7 @@ impl Open {
         Ok(())
     }
 
-    /// 고쳐 쓰는 중인 마스크를 바꾼다. 고쳐 쓰는 마스크가 없으면 아무 일도 하지 않는다.
+    /// Changes the mask being edited. Does nothing if no mask is being edited.
     fn change_mask(
         &mut self,
         commit: bool,
@@ -1089,7 +1110,8 @@ impl Open {
         })
     }
 
-    /// 선택한 사진들의 편집 내용을 바꾸고 미리보기를 다시 요청한다. `commit`이면 파일에도 저장한다.
+    /// Changes the edits of the selected photos and requests the preview again. With `commit`, also
+    /// saves to the file.
     fn change_look(
         &mut self,
         commit: bool,
@@ -1121,7 +1143,7 @@ impl Open {
             report: None,
         };
         let settings = export::Settings {
-            // 손으로 고친 프로젝트 파일에 범위 밖의 값이 있을 수 있다.
+            // A hand-edited project file may contain out-of-range values.
             quality: self
                 .project
                 .export
@@ -1138,7 +1160,7 @@ impl Open {
 mod tests {
     use super::*;
 
-    /// 임시 폴더: 설정 파일, 프로젝트 파일, 가짜 RAW 파일이 든 사진 폴더.
+    /// Temporary folder: config file, project file, and a photo folder with fake RAW files.
     struct Fixture {
         dir: PathBuf,
         app: App,
@@ -1162,7 +1184,7 @@ mod tests {
             Self { dir, app }
         }
 
-        /// 프로젝트를 만들고 사진 폴더를 가져온 상태.
+        /// State with a project created and the photo folder imported.
         fn with_photos(name: &str) -> Self {
             let mut fx = Self::new(name);
             fx.app.handle(Action::NewProject(fx.dir.join("여행.amsil")));
@@ -1206,7 +1228,7 @@ mod tests {
         assert_eq!(
             Project::load(&path).unwrap().name,
             "가을 여행",
-            "만들자마자 파일로 저장된다"
+            "saved to a file as soon as it is created"
         );
         assert_eq!(fx.app.config.recent, std::slice::from_ref(&path));
         assert_eq!(
@@ -1247,7 +1269,7 @@ mod tests {
         assert_eq!(
             Project::load(&fx.open().path).unwrap().folders[0].path,
             photos,
-            "가져온 폴더가 저장된다"
+            "the imported folder is saved"
         );
     }
 
@@ -1309,7 +1331,7 @@ mod tests {
         assert_eq!(
             Config::load(&fx.dir.join("config/config.toml")).compare_split,
             Split::Side,
-            "프로젝트를 열지 않아도 저장된다"
+            "saved even without an open project"
         );
     }
 
@@ -1351,7 +1373,7 @@ mod tests {
         assert_eq!(
             fx.open().selected.iter().copied().collect::<Vec<_>>(),
             [1],
-            "그냥 누르면 그 사진만 선택된다"
+            "a plain click selects only that photo"
         );
         fx.app.handle(Action::SelectAll);
         assert_eq!(fx.open().selected.len(), 3);
@@ -1372,7 +1394,7 @@ mod tests {
             [Effect::Preview { generation, .. }] => *generation,
             other => panic!("{other:?}"),
         };
-        // 먼저 요청한 사진의 결과가 늦게 도착해도 버린다.
+        // A result for an earlier-requested photo is dropped even if it arrives late.
         fx.app.handle(Action::PreviewReady {
             generation: generation(&first),
             index: 0,
@@ -1387,7 +1409,7 @@ mod tests {
         assert_eq!(fx.open().preview.as_ref().unwrap().index, 1);
     }
 
-    /// 효과 가운데 보정 전 그림 요청의 (요청 번호, 사진 번호).
+    /// (request number, photo index) of the before-image requests among the effects.
     fn original_requests(effects: &[Effect]) -> Vec<(u64, usize)> {
         effects
             .iter()
@@ -1435,7 +1457,7 @@ mod tests {
             extend: false,
         });
         fx.app.handle(Action::SetCompare(true));
-        // 사진 a 옆에 카메라 JPEG를 둔다. b에는 없다.
+        // Put a camera JPEG next to photo a. b has none.
         let a = fx.open().photo_path(0);
         let jpeg = a.with_extension("JPG");
         std::fs::write(&jpeg, b"").unwrap();
@@ -1447,7 +1469,7 @@ mod tests {
                 .any(|e| matches!(e, Effect::Original { index: 0, jpeg: Some(path), .. } if *path == jpeg)),
             "{effects:?}"
         );
-        // JPEG가 없는 사진은 보정 전 RAW를 보여 준다.
+        // A photo without a JPEG shows the unadjusted RAW.
         let effects = fx.app.handle(Action::Select {
             index: 1,
             extend: false,
@@ -1463,7 +1485,7 @@ mod tests {
             )),
             "{effects:?}"
         );
-        // 고른 것을 되돌리면 a의 보정 전도 RAW로 다시 요청한다.
+        // Reverting the choice requests a's before image as RAW again.
         fx.app.handle(Action::Select {
             index: 0,
             extend: false,
@@ -1491,7 +1513,7 @@ mod tests {
         });
         assert!(
             original_requests(&effects).is_empty(),
-            "비교를 켜기 전에는 요청하지 않는다"
+            "not requested before comparison is on"
         );
 
         let effects = fx.app.handle(Action::SetCompare(true));
@@ -1514,7 +1536,7 @@ mod tests {
         });
         assert_eq!(fx.open().original.as_ref().unwrap().index, 0);
 
-        // 보정을 바꾸거나 비교를 껐다 켜도 다시 만들지 않는다.
+        // Changing adjustments or toggling comparison does not make it again.
         let effects = fx.app.handle(Action::SetStrength {
             value: 0.5,
             commit: true,
@@ -1524,7 +1546,7 @@ mod tests {
         let effects = fx.app.handle(Action::SetCompare(true));
         assert!(original_requests(&effects).is_empty());
 
-        // 다른 사진으로 가면 그 사진의 것을 요청한다.
+        // Moving to another photo requests that photo's.
         let effects = fx.app.handle(Action::Select {
             index: 2,
             extend: false,
@@ -1554,14 +1576,14 @@ mod tests {
         assert_eq!(
             shown_frame(&effects),
             Some(None),
-            "비교하는 동안에는 두 칸의 크기가 같도록 프레임을 뺀다"
+            "the frame is dropped while comparing so both panes are the same size"
         );
         let effects = fx.app.handle(Action::SetCompare(false));
         assert_eq!(shown_frame(&effects), Some(Some(frame)));
         assert_eq!(
             fx.open().edit(0).frame,
             Some(frame),
-            "저장된 프레임은 그대로"
+            "the saved frame is unchanged"
         );
     }
 
@@ -1583,7 +1605,7 @@ mod tests {
             index: 0,
             result: Ok(pixels()),
         });
-        assert!(fx.open().original.is_none(), "옛 사진의 결과는 버린다");
+        assert!(fx.open().original.is_none(), "stale photo result dropped");
 
         fx.app.handle(Action::OriginalReady {
             generation: second,
@@ -1593,7 +1615,7 @@ mod tests {
         let original = fx.open().original.as_ref().unwrap();
         assert_eq!(original.index, 1);
         assert_eq!(original.pixels, Err(Text::of("broken")));
-        // 만들지 못한 사진은 다시 고르면 다시 요청한다.
+        // A photo that could not be made is requested again when picked again.
         let effects = fx.app.handle(Action::Select {
             index: 1,
             extend: false,
@@ -1616,7 +1638,7 @@ mod tests {
         assert_eq!(
             fx.open().edit(0).denoise,
             0.0,
-            "슬라이더만 움직여서는 사진이 바뀌지 않는다"
+            "moving the slider alone does not change the photo"
         );
 
         let effects = fx.app.handle(Action::ApplyDenoise);
@@ -1698,7 +1720,7 @@ mod tests {
         else {
             panic!("{effects:?}")
         };
-        assert_eq!(*params, food, "미리보기는 프리셋을 적용한 값으로 만든다");
+        assert_eq!(*params, food, "preview uses the preset-applied values");
         assert_eq!(
             Project::load(&fx.open().path)
                 .unwrap()
@@ -1729,7 +1751,7 @@ mod tests {
             .params;
         let on_disk = |fx: &Fixture| Project::load(&fx.open().path).unwrap().edit(0, "a.ARW");
 
-        // 끄는 중: 화면에는 바로 반영되고 파일은 그대로
+        // While dragging: shown on screen at once, file unchanged
         let effects = fx.app.handle(Action::SetStrength {
             value: 0.5,
             commit: false,
@@ -1741,7 +1763,7 @@ mod tests {
         };
         assert_eq!(params.temp, food.temp * 0.5);
 
-        // 놓으면 저장
+        // Saved on release
         fx.app.handle(Action::SetStrength {
             value: 0.6,
             commit: true,
@@ -1817,7 +1839,7 @@ mod tests {
             matches!(&effects[..], [Effect::Preview { capture, .. }] if *capture == value),
             "{effects:?}"
         );
-        // 범위를 벗어난 값은 범위 안으로 들인다.
+        // Out-of-range values are clamped into range.
         fx.app.handle(Action::SetCapture {
             value: Capture {
                 iterations: 500,
@@ -2012,7 +2034,7 @@ mod tests {
         );
         assert!(
             app.notice.as_ref().unwrap().contains("bad"),
-            "읽지 못한 프리셋은 알린다"
+            "presets that fail to load are reported"
         );
     }
 
@@ -2030,7 +2052,7 @@ mod tests {
             index: 99,
             pixels: Some(pixels()),
             guess: None,
-        }); // 범위 밖은 무시
+        }); // Out of range is ignored
     }
 
     #[test]
@@ -2145,7 +2167,7 @@ mod tests {
         let effects = fx.app.handle(Action::Export {
             only_selected: false,
         });
-        assert!(effects.is_empty(), "물어보기 전에는 시작하지 않는다");
+        assert!(effects.is_empty(), "does not start before asking");
         assert!(
             matches!(&fx.open().export, ExportState::Confirm { existing: 1, photos } if photos.len() == 3)
         );
@@ -2174,7 +2196,7 @@ mod tests {
                     only_selected: false
                 })
                 .is_empty(),
-            "도는 중에는 또 시작하지 않는다"
+            "does not start again while running"
         );
 
         let report = Report {
@@ -2271,12 +2293,12 @@ mod tests {
     fn choosing_a_language_saves_it_and_later_messages_use_it() {
         use crate::lang::{self, Lang};
         let mut fx = Fixture::new("lang");
-        // 프로젝트를 열기 전(시작 화면)에도 바꿀 수 있다.
+        // Can be changed before a project is opened (start screen) too.
         let effects = fx.app.handle(Action::SetLanguage(Lang::En));
         assert_eq!(
             effects,
             [Effect::ProbeBackend],
-            "받아 둔 AI 안내 문구도 새 언어로 다시 만든다"
+            "stored AI notes are remade in the new language too"
         );
         assert_eq!(lang::current(), Lang::En);
         assert_eq!(
@@ -2313,7 +2335,7 @@ mod tests {
         });
         let effects = fx.app.handle(Action::SetFrame(Some(frame)));
         assert_eq!(fx.open().edit(0).frame, Some(frame));
-        assert_eq!(fx.open().edit(1).frame, None, "고르지 않은 사진은 그대로");
+        assert_eq!(fx.open().edit(1).frame, None, "other photos unchanged");
         let [Effect::Preview { frame: shown, .. }] = &effects[..] else {
             panic!("{effects:?}")
         };
@@ -2326,7 +2348,7 @@ mod tests {
             Some(frame)
         );
 
-        // 보정 초기화는 색 보정만 지운다. 프레임은 남는다.
+        // Resetting adjustments clears only color adjustments. The frame stays.
         fx.app.handle(Action::ResetLook);
         assert_eq!(fx.open().edit(0).frame, Some(frame));
 
@@ -2351,7 +2373,7 @@ mod tests {
         let mut fx = Fixture::with_photos("recommend");
         let guesses = [
             (0, Category::Food, 0.9),
-            (1, Category::Landscape, 0.4), // 확신이 낮다
+            (1, Category::Landscape, 0.4), // Low confidence
         ];
         for (index, category, confidence) in guesses {
             fx.app.handle(Action::Thumbnail {
@@ -2367,17 +2389,17 @@ mod tests {
             fx.open().photos[0].guess.map(|guess| guess.category),
             Some(Category::Food)
         );
-        // 세 장 모두 흑백으로 해 두고, 추천을 적용한다. 2번 사진은 아직 분류되지 않았다.
+        // Set all three to mono, then apply recommendations. Photo 2 is not yet classified.
         fx.app.handle(Action::SelectAll);
         fx.app.handle(Action::SetPreset(Some("mono".into())));
         fx.app.handle(Action::ApplyRecommended);
         let preset = |index: usize| fx.open().edit(index).preset;
         assert_eq!(preset(0).as_deref(), Some("food"));
-        assert_eq!(preset(1), None, "확신이 낮으면 프리셋 없이 둔다");
+        assert_eq!(preset(1), None, "low confidence leaves no preset");
         assert_eq!(
             preset(2).as_deref(),
             Some("mono"),
-            "분류되지 않은 사진은 건드리지 않는다"
+            "unclassified photos are left alone"
         );
         let saved = Project::load(&fx.open().path).unwrap();
         assert_eq!(saved.edit(0, "a.ARW").preset.as_deref(), Some("food"));
@@ -2394,7 +2416,8 @@ mod tests {
         assert_eq!(fx.app.recommend_problem, None);
     }
 
-    /// 마지막 동작이 요청한 미리보기에서 마스크와 관련된 것만 꺼낸다: (마스크 수, 영역 표시, 프레임 유무).
+    /// Extracts the mask-related parts of the preview requested by the last action: (mask count,
+    /// area shown, frame present).
     fn mask_preview(effects: &[Effect]) -> (usize, Option<usize>, bool) {
         let [
             Effect::Preview {
@@ -2415,7 +2438,7 @@ mod tests {
         use crate::frame::{Frame, Layout};
         use crate::mask::Point;
         let mut fx = Fixture::with_photos("mask");
-        // 사진을 고르기 전에는 만들 곳이 없다.
+        // Before a photo is picked, there is nowhere to make one.
         assert!(fx.app.handle(Action::AddMask).is_empty());
         fx.app.handle(Action::Select {
             index: 0,
@@ -2434,15 +2457,16 @@ mod tests {
         assert_eq!(
             fx.open().mask,
             Some(0),
-            "새 마스크가 바로 고쳐 쓸 대상이 된다"
+            "the new mask becomes the one being edited"
         );
         assert_eq!(
             fx.open().edit(1).masks.len(),
             1,
-            "지금 보는 사진에만 생긴다"
+            "created only on the current photo"
         );
         assert_eq!(fx.open().edit(0).masks.len(), 0);
-        // 마스크를 고치는 동안에는 누른 자리가 어긋나지 않게 프레임 없이 보여 주고, 고른 영역을 표시한다.
+        // While editing a mask, show it without the frame so clicks line up, and show the selected
+        // area.
         assert_eq!(mask_preview(&effects), (1, Some(0), false));
 
         fx.app.handle(Action::AddMaskPoint {
@@ -2470,7 +2494,7 @@ mod tests {
                     include: false
                 },
             ],
-            "사진 밖의 좌표는 가장자리로 당긴다"
+            "coordinates outside the photo are clamped to the edge"
         );
         fx.app.handle(Action::UndoMaskPoint);
         assert_eq!(fx.open().edit(1).masks[0].points.len(), 1);
@@ -2491,19 +2515,19 @@ mod tests {
         assert_eq!(saved.len(), 1);
         assert!(saved[0].invert && saved[0].adjust == adjust && saved[0].points.len() == 1);
 
-        // 영역 표시를 끄면 보정된 결과만 보인다.
+        // Turning off the area display shows only the adjusted result.
         let effects = fx.app.handle(Action::ShowMask(false));
         assert_eq!(mask_preview(&effects), (1, None, false));
-        // 고쳐 쓰기를 마치면 프레임이 다시 보인다.
+        // Ending editing shows the frame again.
         let effects = fx.app.handle(Action::SelectMask(None));
         assert_eq!(fx.open().mask, None);
         assert_eq!(mask_preview(&effects), (1, None, true));
 
-        // 보정 초기화는 마스크를 지우지 않는다.
+        // Resetting adjustments does not delete masks.
         fx.app.handle(Action::ResetLook);
         assert_eq!(fx.open().edit(1).masks.len(), 1);
 
-        // 내보낼 때 마스크도 함께 간다.
+        // Masks go along on export.
         fx.app.handle(Action::SetExportFolder(fx.dir.join("결과")));
         let effects = fx.app.handle(Action::Export {
             only_selected: false,
@@ -2540,7 +2564,7 @@ mod tests {
             extend: false,
         });
         assert_eq!(fx.open().mask, None);
-        // 고쳐 쓰는 마스크가 없으면 점을 찍어도 아무 일도 없다.
+        // With no mask being edited, clicking a point does nothing.
         assert!(
             fx.app
                 .handle(Action::AddMaskPoint {
@@ -2550,7 +2574,7 @@ mod tests {
                 })
                 .is_empty()
         );
-        // 없는 번호는 고를 수 없다.
+        // A nonexistent index cannot be picked.
         fx.app.handle(Action::SelectMask(Some(7)));
         assert_eq!(fx.open().mask, None);
     }
@@ -2599,7 +2623,8 @@ mod tests {
         assert_eq!((photos[0].skin, photos[1].skin), (0.6, 0.0));
         fx.app.handle(Action::CancelExport);
 
-        // 범위를 벗어난 값은 끝으로 당긴다. 보정 초기화는 피부 보정도 지운다.
+        // Out-of-range values are clamped to the ends. Resetting adjustments also clears skin
+        // retouching.
         fx.app.handle(Action::SetSkin {
             value: 3.0,
             commit: true,
@@ -2624,7 +2649,7 @@ mod tests {
         let mut fx = Fixture::with_photos("quality-range");
         let quality = |fx: &Fixture| fx.open().project.export.quality;
         fx.app.handle(Action::SetQuality(100));
-        assert_eq!(quality(&fx), 100, "끝까지 올릴 수 있다");
+        assert_eq!(quality(&fx), 100, "can go all the way up");
         fx.app.handle(Action::SetQuality(200));
         assert_eq!(quality(&fx), 100);
         fx.app.handle(Action::SetQuality(3));
@@ -2643,7 +2668,7 @@ mod tests {
     fn choosing_light_or_dark_mode_is_saved() {
         use crate::project::Theme;
         let mut fx = Fixture::new("theme");
-        // 프로젝트를 열기 전(시작 화면)에도 바꿀 수 있다.
+        // Can be changed before a project is opened (start screen) too.
         assert!(fx.app.handle(Action::SetTheme(Theme::Light)).is_empty());
         assert_eq!(fx.app.config.theme, Some(Theme::Light));
         assert_eq!(
