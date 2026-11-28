@@ -1,7 +1,13 @@
 DCIM/
 target/
 models/
-# Design docs and working notes are kept out of the public repository
-docs/
+# Keep internal design docs out; publish only localized user-facing Markdown.
+docs/*
+!docs/ko/
+!docs/en/
+docs/ko/*
+!docs/ko/*.md
+docs/en/*
+!docs/en/*.md
 dist/
 __pycache__/
